@@ -44,15 +44,15 @@ meson setup builddir \
 
 ninja -C builddir
 
-# Verify the driver was built
-test -f builddir/src/panvk/libvulkan_panvk.so
+# Verify the driver was built (PanVK in Mesa 24.3 is libvulkan_panfrost.so)
+test -f builddir/src/panfrost/vulkan/libvulkan_panfrost.so
 
 # Create output structure
 mkdir -p "$WORK/out/usr/lib"
 mkdir -p "$WORK/out/usr/share/vulkan/icd.d"
 
 # Copy the driver
-cp builddir/src/panvk/libvulkan_panvk.so "$WORK/out/usr/lib/"
+cp builddir/src/panfrost/vulkan/libvulkan_panfrost.so "$WORK/out/usr/lib/libvulkan_panvk.so"
 strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
 # Generate ICD manifest (absolute path for the session)
