@@ -82,10 +82,6 @@ META
 
 # Package as .tzst
 cd "$WORK/out"
-tar --use-compress-program="zstd -19" -cf ../panvk-linux-"$VERSION".tzst usr meta.json
-sha256sum ../panvk-linux-"$VERSION".tzst > ../panvk-linux-"$VERSION".tzst.sha256
-ls -l ../panvk-linux-"$VERSION".tzst*
-
-# Copy results out
-cp ../panvk-linux-"$VERSION".tzst "$WORK/"
-cp ../panvk-linux-"$VERSION".tzst.sha256 "$WORK/"
+tar --use-compress-program="zstd -19" -cf "$WORK/panvk-linux-$VERSION.tzst" usr meta.json
+sha256sum "$WORK/panvk-linux-$VERSION.tzst" > "$WORK/panvk-linux-$VERSION.tzst.sha256"
+ls -l "$WORK/panvk-linux-$VERSION.tzst"*
