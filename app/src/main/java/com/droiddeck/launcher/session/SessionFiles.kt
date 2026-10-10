@@ -129,13 +129,19 @@ object SessionFiles {
         val fexPreloads = listOf("x86_64", "i386").flatMap { arch ->
             listOf("libblsession.so", "libfakeinput.so").map { "$arch/$it" to "usr/local/lib/droiddeck-fex/$arch/$it" }
         } + listOf("libfaultreport.so", "libthunkaudit.so", "libvulkan-thunk.so").map { "x86_64/$it" to "usr/local/lib/droiddeck-fex/x86_64/$it" }
+        // PanVK ICD for Mali GPUs - must be staged so the runtime uses PanVK instead of freedreno
+        val panvkIcd = listOf(
+            "usr/share/vulkan/icd.d/panvk_icd.aarch64.json" to "usr/share/vulkan/icd.d/panvk_icd.aarch64.json",
+            "usr/lib/libvulkan_panvk.so" to "usr/lib/libvulkan_panvk.so"
+        )
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + fexPreloads).filter { (asset, _) ->
-            val dir = asset.substringBeforeLast('/')
-            runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
+        ) + mangoapp + msitools.map { it to it } + fexPreloads + panvkIcd).filter { (asset, _) ->
+            val exists = runCatching { context.assets.open("linuxfs/$asset").close(); true }.getOrDefault(false)
+            if (asset.contains("panvk")) Log.i(TAG, "PanVK staging: asset=$asset exists=$exists")
+            exists
         }
         val all = (if (DesktopCatalog.desktopInstalled(root)) files + desktop else files) + optional
         for ((asset, relative) in all) {
