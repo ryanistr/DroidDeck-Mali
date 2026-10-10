@@ -100,6 +100,7 @@ object DriverPairs {
         Family.A6XX -> BANNER
         // KGSL gave no model: Android 16 arrived with the 8xx, so a device that new is taken as one.
         Family.ADRENO_UNKNOWN -> if (android.os.Build.VERSION.SDK_INT >= 36) WN_BALANCED else BANNER
+        Family.MALI_VALHALL, Family.MALI_BIFROST, Family.MALI_MIDGARD, Family.MALI_UNKNOWN -> null
     }
 
     /** The complete DD-Turnip pair with the highest version, or null when none is listed. */

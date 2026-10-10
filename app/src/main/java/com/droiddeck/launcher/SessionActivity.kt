@@ -983,16 +983,16 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
 
+        val panvk = if (isMali) PanvkDriver(this) else null
+        val turnip = if (!isMali) TurnipDriver(this) else null
         val driverId: String?
         if (isMali) {
             // Mali: use system Mali Vulkan driver or imported PanVK
-            val panvk = PanvkDriver(this)
-            driverId = if (CompositorHost.isStarted) null else panvk.install()
+            driverId = if (CompositorHost.isStarted) null else panvk!!.install()
         } else {
             // Adreno: use Turnip (not the system Adreno driver: importing the dma-bufs gamescope
             // commits needs VK_EXT_image_drm_format_modifier, which the system driver does not implement)
-            val turnip = TurnipDriver(this)
-            driverId = if (CompositorHost.isStarted) null else turnip.install()
+            driverId = if (CompositorHost.isStarted) null else turnip!!.install()
         }
 
         // The output size belongs to the session, not to the Surface: gamescope's display is
@@ -1061,7 +1061,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         CompositorHost.startOrAttach(
             holder.surface, runtimeDir.path,
-            driverId?.let { turnip.driverPath(it) }, driverId?.let { turnip.libraryName(it) },
+            driverId?.let { if (isMali) panvk!!.driverPath(it) else turnip!!.driverPath(it) },
+            driverId?.let { if (isMali) panvk!!.libraryName(it) else turnip!!.libraryName(it) },
             applicationInfo.nativeLibraryDir, size.first, size.second, refreshHz(), SessionState.fpsLimit,
         )
         if (SessionState.running && size != previous) {
