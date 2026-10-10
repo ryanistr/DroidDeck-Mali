@@ -43,6 +43,7 @@ import com.droiddeck.launcher.gpu.FrameGen
 import com.droiddeck.launcher.gpu.ScreenEffectLooks
 import com.droiddeck.launcher.gpu.ScreenEffects
 import com.droiddeck.launcher.gpu.Lossless
+import com.droiddeck.launcher.gpu.PanvkDriver
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.input.EvdevKeys
 import com.droiddeck.launcher.input.InputSpace
@@ -975,10 +976,24 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         // the evdev codes we inject.
         FileUtils.copyAsset(this, "wayland/keymap.xkb", File(runtimeDir, "keymap.xkb"))
 
-        // Turnip, not the system Adreno driver: importing the dma-bufs gamescope commits needs
-        // VK_EXT_image_drm_format_modifier, which the system driver does not implement.
-        val turnip = TurnipDriver(this)
-        val driverId = if (CompositorHost.isStarted) null else turnip.install()
+        // Detect GPU to pick the right compositor driver
+        val gpuInfo = com.droiddeck.launcher.gpu.GpuInfo.detect()
+        val isMali = gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
+
+        val driverId: String?
+        if (isMali) {
+            // Mali: use system Mali Vulkan driver or imported PanVK
+            val panvk = PanvkDriver(this)
+            driverId = if (CompositorHost.isStarted) null else panvk.install()
+        } else {
+            // Adreno: use Turnip (not the system Adreno driver: importing the dma-bufs gamescope
+            // commits needs VK_EXT_image_drm_format_modifier, which the system driver does not implement)
+            val turnip = TurnipDriver(this)
+            driverId = if (CompositorHost.isStarted) null else turnip.install()
+        }
 
         // The output size belongs to the session, not to the Surface: gamescope's display is
         // sized once when the session starts and cannot change. A foldable recreates the Surface

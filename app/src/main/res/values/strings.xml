@@ -1096,9 +1096,9 @@
     <string name="main_wadb_unavailable">Wireless debugging is unavailable</string>
     <string name="main_adb_copied">ADB command copied</string>
     <string name="main_pick_roms">Choose the ROMs folder</string>
-    <string name="main_non_adreno_title">Not an Adreno GPU</string>
+    <string name="main_non_adreno_title">GPU may not be supported</string>
     <!-- %1$s is the GPU's name, %2$.0f the download size in MB -->
-    <string name="main_non_adreno_text">Turnip supports Adreno GPUs. On %1$s, Steam may show a black screen. Download: %2$.0f MB.</string>
+    <string name="main_non_adreno_text">DroidDeck uses Turnip (Adreno) or PanVK (Mali Valhall/Bifrost). On %1$s, Steam may show a black screen. Download: %2$.0f MB.</string>
     <string name="main_install_anyway">Install anyway</string>
     <string name="main_remove_runtime_title">Remove Linux runtime</string>
     <string name="main_remove_runtime_text">This deletes the runtime, the Steam client inside it, and every game installed there.</string>
@@ -1816,7 +1816,9 @@
     <string name="gpuinfo_supported">Supported</string>
     <string name="gpuinfo_experimental">Experimental: its drivers are test builds</string>
     <string name="gpuinfo_below_tested">Below tested hardware (Adreno 725 and newer): it may not run</string>
-    <string name="gpuinfo_unsupported">Not supported: DroidDeck needs an Adreno (Snapdragon) GPU</string>
+    <string name="gpuinfo_mali_experimental">Experimental: Mali/PanVK support is early</string>
+    <string name="gpuinfo_mali_midgard_unsupported">Not supported: Mali Midgard lacks Vulkan</string>
+    <string name="gpuinfo_unsupported">Not supported: DroidDeck needs an Adreno (Snapdragon) GPU or Mali Valhall/Bifrost</string>
 
     <!-- Driver downloads and imports -->
     <string name="turnip_rate_limited">GitHub\'s rate limit was hit - try again later</string>

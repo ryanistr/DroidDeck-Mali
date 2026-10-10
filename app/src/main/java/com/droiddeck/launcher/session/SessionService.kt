@@ -588,19 +588,40 @@ class SessionService : Service() {
         guest.add("WAYLAND_DISPLAY=wayland-0")
         guest.add("BL_ANDROID_CLIPBOARD=" + File(filesDir, "session/android-clipboard").path)
         guest.add("GAMESCOPE_FORCE_GENERAL_QUEUE=1")
-        // Steam's CEF needs GL and the rootfs ships no native GL driver: route it through Zink.
-        guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
-        guest.add("GALLIUM_DRIVER=zink")
-        guest.add("LIBGL_KOPPER_DRI2=true")
+        // Detect GPU to pick the right Mesa driver stack
+        val gpuInfo = com.droiddeck.launcher.gpu.GpuInfo.detect()
+        val isMali = gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
+                     gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
+
+        if (isMali) {
+            // Mali: use PanVK for Vulkan, Panfrost for OpenGL
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=panvk")
+            guest.add("GALLIUM_DRIVER=panfrost")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+            Log.i(TAG, "GPU: Mali detected (${gpuInfo.family.label}), using PanVK/Panfrost")
+        } else {
+            // Adreno: use Zink + Turnip
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
+            guest.add("GALLIUM_DRIVER=zink")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+            Log.i(TAG, "GPU: Adreno detected (${gpuInfo.family.label}), using Zink/Turnip")
+        }
         LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
-        // An imported glibc Turnip, when one is set (by the user, or by Auto): the session script
-        // checks the manifest and its library from inside and points the loader at it with
+        // An imported glibc driver (Turnip for Adreno, PanVK for Mali), when one is set: the session
+        // script checks the manifest and its library from inside and points the loader at it with
         // VK_DRIVER_FILES, so the runtime's own driver above stays untouched and is what a bad
         // import falls back to. One driver for every session: the driver's shader cache is keyed on
         // its build, and with one per mode every emulator compiled its shaders twice.
         val linuxDriverId = SessionPrefs.linuxDriver(this)
-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
-            ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+        if (isMali) {
+            com.droiddeck.launcher.gpu.LinuxPanvkDriver.resolveIcdPath(this, linuxDriverId)
+                ?.let { guest.add(com.droiddeck.launcher.gpu.LinuxPanvkDriver.ENV + "=" + it) }
+        } else {
+            LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+                ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+        }
         // Turnip's own debug switches, for the runtime's driver and everything on it. The file in
         // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an
         // imported driver from the A710/A720/A722 legs gets "sysmem" on its own, which is what both

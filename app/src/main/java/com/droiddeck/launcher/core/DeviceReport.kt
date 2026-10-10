@@ -6,8 +6,11 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.util.Log
+import com.droiddeck.launcher.gpu.LinuxPanvkDriver
+import com.droiddeck.launcher.gpu.LinuxPanvkDriverManager
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
+import com.droiddeck.launcher.gpu.PanvkDriver
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.runtime.DesktopCatalog
 import com.droiddeck.launcher.runtime.LinuxRuntime
@@ -118,23 +121,46 @@ object DeviceReport {
 
         h("Drivers")
         val gpu = com.droiddeck.launcher.gpu.GpuInfo.detect()
+        val isMali = gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
+                     gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
+                     gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
+                     gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
         k("GPU", "${gpu.name} · ${gpu.family.label} · ${gpu.supportText}" + if (gpu.oneUi8Gen2) " · One UI 8 Gen 2" else "")
         k("Driver mode", SessionPrefs.gpuDriverMode(context) +
             (com.droiddeck.launcher.gpu.DriverPairs.recommendedKey(gpu, com.droiddeck.launcher.gpu.DriverPairs.from(
                 com.droiddeck.launcher.gpu.TurnipReleases.cached(context)))?.let { " (recommended pair: $it)" } ?: ""))
-        val turnip = TurnipDriver(context)
-        val androidChoice = SessionPrefs.androidDriver(context)
-        k("Display driver (chosen)", if (androidChoice.isEmpty()) "Auto -> ${turnip.autoId()}" else androidChoice)
-        k("  name / version", "${turnip.displayName(if (androidChoice.isEmpty()) turnip.autoId() else androidChoice)} ${turnip.driverVersion(if (androidChoice.isEmpty()) turnip.autoId() else androidChoice)}".trim())
-        k("  imported available", turnip.enumerateImported().ifEmpty { listOf("none") }.joinToString(", "))
-        val lm = LinuxVulkanDriverManager(context)
-        run {
-            val id = SessionPrefs.linuxDriver(context)
-            val label = if (id.isEmpty()) "runtime default (the Turnip built into the runtime)"
-            else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
-                lm.getMinGlibc(id).let { if (it.isEmpty()) "" else " (glibc $it+)" } +
-                if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
-            k("Linux driver", label)
+
+        if (isMali) {
+            val panvk = PanvkDriver(context)
+            val androidChoice = SessionPrefs.androidDriver(context)
+            k("Display driver (chosen)", if (androidChoice.isEmpty()) "Auto -> ${panvk.autoId()}" else androidChoice)
+            k("  name / version", "${panvk.displayName(if (androidChoice.isEmpty()) panvk.autoId() else androidChoice)} ${panvk.driverVersion(if (androidChoice.isEmpty()) panvk.autoId() else androidChoice)}".trim())
+            k("  imported available", panvk.enumerateImported().ifEmpty { listOf("none") }.joinToString(", "))
+
+            val lm = LinuxPanvkDriverManager(context)
+            run {
+                val id = SessionPrefs.linuxDriver(context)
+                val label = if (id.isEmpty()) "runtime default (the PanVK built into the runtime)"
+                else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
+                    lm.getMinGlibc(id).let { if (it.isEmpty()) "" else " (glibc $it+)" } +
+                    if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
+                k("Linux driver (PanVK)", label)
+            }
+        } else {
+            val turnip = TurnipDriver(context)
+            val androidChoice = SessionPrefs.androidDriver(context)
+            k("Display driver (chosen)", if (androidChoice.isEmpty()) "Auto -> ${turnip.autoId()}" else androidChoice)
+            k("  name / version", "${turnip.displayName(if (androidChoice.isEmpty()) turnip.autoId() else androidChoice)} ${turnip.driverVersion(if (androidChoice.isEmpty()) turnip.autoId() else androidChoice)}".trim())
+            k("  imported available", turnip.enumerateImported().ifEmpty { listOf("none") }.joinToString(", "))
+            val lm = LinuxVulkanDriverManager(context)
+            run {
+                val id = SessionPrefs.linuxDriver(context)
+                val label = if (id.isEmpty()) "runtime default (the Turnip built into the runtime)"
+                else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
+                    lm.getMinGlibc(id).let { if (it.isEmpty()) "" else " (glibc $it+)" } +
+                    if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
+                k("Linux driver (Turnip)", label)
+            }
         }
         k("Runtime's own ICD", LinuxRuntime.vulkanIcd(context)?.path)
 

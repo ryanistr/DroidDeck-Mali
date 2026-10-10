@@ -1958,6 +1958,7 @@ libvulkan_freedreno.so
 libvulkan.so
 libvulkan.so.1
 libvulkan.so.1.4.357
+libvulkan_panvk.so
 libwacom.so
 libwacom.so.9
 libwacom.so.9.0.0

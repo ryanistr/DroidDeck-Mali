@@ -14,8 +14,11 @@ import androidx.compose.runtime.mutableIntStateOf
 import com.droiddeck.launcher.gpu.DriverBundle
 import com.droiddeck.launcher.gpu.DriverPairs
 import com.droiddeck.launcher.gpu.GpuInfo
+import com.droiddeck.launcher.gpu.LinuxPanvkDriver
+import com.droiddeck.launcher.gpu.LinuxPanvkDriverManager
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
+import com.droiddeck.launcher.gpu.PanvkDriver
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.gpu.TurnipReleases
 import com.droiddeck.launcher.session.SessionService

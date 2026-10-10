@@ -1,0 +1,48 @@
+name: Build PanVK (Mesa)
+
+# The runtime PanVK driver (glibc) built from Mesa, in the droiddeck-local-cross Docker image on an amd64 runner,
+# then published as a release asset the apk build fetches (tools/panvk/release.env names the tag and sha).
+# The hosted runtime image is never changed: the apk stages the driver into the linuxfs.
+on:
+  push:
+    paths:
+      - 'tools/panvk/**'
+      - '.github/workflows/build-panvk.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish as (e.g. panvk-linux-24.3.0-p1); empty = artifact only'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build PanVK in cross-compiler Docker image
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+              -v "$PWD:/work" -w /work droiddeck-local-cross:24.04-v3 bash tools/panvk/build-panvk.sh
+          sudo chown -R "$(id -u):$(id -g)" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panvk-linux
+          path: |
+            panvk-linux-*.tzst
+            panvk-linux-*.tzst.sha256
+      - name: Publish
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "Mesa PanVK (panvk + panfrost) for arm64 glibc; staged by the apk into the Linux runtime. sha256 $(cut -d' ' -f1 panvk-linux-*.tzst.sha256)" panvk-linux-*.tzst panvk-linux-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" panvk-linux-*.tzst panvk-linux-*.tzst.sha256 --clobber
+          # A component the apk fetches by tag, never something users install: it must not
+          # become the repo's Latest release or appear as a pre-release, also when re-uploaded.
+          gh release edit "${{ inputs.tag }}" --latest=false --prerelease=false
