@@ -35,6 +35,8 @@ jobs:
             libglvnd-dev libegl-dev libgles-dev \
             python3-mako python3-ply python3-yaml \
             llvm-17-dev clang-17 lld-17 \
+            libelf-dev libwayland-egl-backend-dev \
+            bison flex \
             zstd >/dev/null
       - name: Build PanVK
         env:
