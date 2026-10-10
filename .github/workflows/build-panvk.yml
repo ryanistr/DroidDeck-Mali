@@ -36,7 +36,7 @@ jobs:
             python3-mako python3-ply python3-yaml \
             llvm-17-dev clang-17 lld-17 \
             libelf-dev libwayland-egl-backend-dev \
-            libxfixes-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-keysyms1-dev libx11-xcb-dev \
+            libxfixes-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-keysyms1-dev libx11-xcb-dev libxrandr-dev \
             bison flex \
             zstd >/dev/null
       - name: Build PanVK
