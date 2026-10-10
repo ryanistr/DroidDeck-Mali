@@ -140,5 +140,5 @@ ls -l ../panvk-android-'"$VERSION"'.tzst*
 '
 
 # Copy results out
-cp /work/panvk-android-"$VERSION".tzst .
-cp /work/panvk-android-"$VERSION".tzst.sha256 .
+# cp /work/panvk-android-"$VERSION".tzst .
+# cp /work/panvk-android-"$VERSION".tzst.sha256 .
