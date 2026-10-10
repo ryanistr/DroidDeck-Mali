@@ -55,6 +55,15 @@ mkdir -p "$WORK/out/usr/share/vulkan/icd.d"
 cp builddir/src/panfrost/vulkan/libvulkan_panfrost.so "$WORK/out/usr/lib/libvulkan_panvk.so"
 strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
+# The Mesa patch makes the driver dlopen() "libpanvk_kbase_jm.so" for GPUs whose kernel exposes
+# kbase (MT6893) instead of panfrost/panthor. Without it beside the driver, CreateInstance falls
+# through to VK_ERROR_INCOMPATIBLE_DRIVER and gamescope reports "failed to find physical device".
+cargo build --manifest-path "$WORK/app/src/main/rust/panvk-kbase-jm/Cargo.toml" \
+    --release --locked --target aarch64-unknown-linux-gnu
+cp "$WORK/app/src/main/rust/panvk-kbase-jm/target/aarch64-unknown-linux-gnu/release/libpanvk_kbase_jm.so" \
+    "$WORK/out/usr/lib/libpanvk_kbase_jm.so"
+strip --strip-unneeded "$WORK/out/usr/lib/libpanvk_kbase_jm.so"
+
 # Generate ICD manifest (absolute path for the session)
 cat > "$WORK/out/usr/share/vulkan/icd.d/panvk_icd.aarch64.json" <<ICD
 {

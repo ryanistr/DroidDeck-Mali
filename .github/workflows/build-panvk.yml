@@ -39,6 +39,13 @@ jobs:
             libxfixes-dev libxcb-glx0-dev libxcb-shm0-dev libxcb-keysyms1-dev libx11-xcb-dev libxrandr-dev \
             bison flex \
             zstd >/dev/null
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          # The kbase Job Manager backend is a Rust cdylib the driver dlopen()s; nothing else
+          # on the runner provides a new enough toolchain.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build PanVK
         env:
           MESA_VERSION: 24.3.0
