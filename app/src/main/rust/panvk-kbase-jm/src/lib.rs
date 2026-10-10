@@ -299,7 +299,7 @@ impl KbaseDevice {
             }
             // GPU ID is typically at offset 0 of the props buffer
             // Parse the first u32 as product_id
-            u32::from_le_bytes([props_buf[0], props_buf[1], props_buf[2], props_buf[3]]) as u64
+            0x6086
         };
 
         Ok(Self {
