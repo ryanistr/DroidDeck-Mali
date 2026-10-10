@@ -1,5 +1,6 @@
 #!/usr/bin/bash
 # Builds Mesa with panvk + panfrost for arm64 glibc, natively on arm64 runner.
+# Dependencies are installed in the "Install dependencies" workflow step.
 # Outputs: panvk-linux-<VERSION>.tzst + .sha256
 set -euxo pipefail
 
@@ -8,19 +9,6 @@ VERSION=${MESA_VERSION:-24.3.0}
 # Use the repository directory as working directory
 WORK="${GITHUB_WORKSPACE:-$PWD}"
 cd "$WORK"
-
-# Native arm64 build (runner is already arm64)
-# Install build dependencies
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
-    git meson ninja-build pkg-config \
-    libwayland-dev libdrm-dev libx11-dev libxext-dev \
-    libxcb1-dev libxcb-dri3-dev libxcb-present-dev \
-    libxcb-sync-dev libxshmfence-dev libxxf86vm-dev \
-    libglvnd-dev libegl-dev libgles-dev \
-    python3-mako python3-ply python3-yaml \
-    llvm-17-dev clang-17 lld-17 \
-    zstd >/dev/null
 
 # Clone Mesa
 git clone -q --depth 1 --branch mesa-"$VERSION" https://gitlab.freedesktop.org/mesa/mesa.git mesa
