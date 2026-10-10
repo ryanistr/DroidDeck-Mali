@@ -4,7 +4,9 @@
 set -euxo pipefail
 
 VERSION=${MESA_VERSION:-24.3.0}
-WORK=/work
+
+# Use the repository directory as working directory
+WORK="${GITHUB_WORKSPACE:-$PWD}"
 cd "$WORK"
 
 # Native arm64 build (runner is already arm64)
@@ -25,8 +27,8 @@ git clone -q --depth 1 --branch mesa-"$VERSION" https://gitlab.freedesktop.org/m
 cd mesa
 
 # Apply any patches
-if [ -d /work/tools/panvk/mesa-patches ]; then
-    for p in /work/tools/panvk/mesa-patches/*.patch; do
+if [ -d "$WORK/tools/panvk/mesa-patches" ]; then
+    for p in "$WORK/tools/panvk/mesa-patches"/*.patch; do
         [ -f "$p" ] && patch -p1 --no-backup-if-mismatch < "$p"
     done
 fi
@@ -60,15 +62,15 @@ ninja -C builddir
 test -f builddir/src/panvk/libvulkan_panvk.so
 
 # Create output structure
-mkdir -p /work/out/usr/lib
-mkdir -p /work/out/usr/share/vulkan/icd.d
+mkdir -p "$WORK/out/usr/lib"
+mkdir -p "$WORK/out/usr/share/vulkan/icd.d"
 
 # Copy the driver
-cp builddir/src/panvk/libvulkan_panvk.so /work/out/usr/lib/
-strip --strip-unneeded /work/out/usr/lib/libvulkan_panvk.so
+cp builddir/src/panvk/libvulkan_panvk.so "$WORK/out/usr/lib/"
+strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
 # Generate ICD manifest (absolute path for the session)
-cat > /work/out/usr/share/vulkan/icd.d/panvk_icd.aarch64.json <<ICD
+cat > "$WORK/out/usr/share/vulkan/icd.d/panvk_icd.aarch64.json" <<ICD
 {
     "file_format_version": "1.0.0",
     "ICD": {
@@ -79,7 +81,7 @@ cat > /work/out/usr/share/vulkan/icd.d/panvk_icd.aarch64.json <<ICD
 ICD
 
 # Create meta.json for the zip
-cat > /work/out/meta.json <<META
+cat > "$WORK/out/meta.json" <<META
 {
     "schemaVersion": 1,
     "kind": "linux-vulkan-icd",
@@ -93,11 +95,11 @@ cat > /work/out/meta.json <<META
 META
 
 # Package as .tzst
-cd /work/out
+cd "$WORK/out"
 tar --use-compress-program="zstd -19" -cf ../panvk-linux-"$VERSION".tzst usr meta.json
 sha256sum ../panvk-linux-"$VERSION".tzst > ../panvk-linux-"$VERSION".tzst.sha256
 ls -l ../panvk-linux-"$VERSION".tzst*
 
 # Copy results out
-cp /work/panvk-linux-"$VERSION".tzst .
-cp /work/panvk-linux-"$VERSION".tzst.sha256 .
+cp ../panvk-linux-"$VERSION".tzst "$WORK/"
+cp ../panvk-linux-"$VERSION".tzst.sha256 "$WORK/"
