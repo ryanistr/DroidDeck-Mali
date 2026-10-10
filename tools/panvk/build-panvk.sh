@@ -30,17 +30,17 @@ meson setup builddir \
     -Dprefix=/usr \
     -Dlibdir=lib \
     -Dshared-glapi=enabled \
-    -Degl=enabled \
-    -Dgles1=enabled \
-    -Dgles2=enabled \
+    -Degl=true \
+    -Dgles1=true \
+    -Dgles2=true \
     -Dopengl=true \
-    -Dgbm=enabled \
-    -Ddri3=enabled \
-    -Dllvm=enabled \
-    -Dshared-llvm=enabled \
-    -Dvalgrind=disabled \
-    -Dlibunwind=disabled \
-    -Dselinux=disabled \
+    -Dgbm=true \
+    -Ddri3=true \
+    -Dllvm=true \
+    -Dshared-llvm=true \
+    -Dvalgrind=false \
+    -Dlibunwind=false \
+    -Dselinux=false \
     -Dglx=dri \
     -Dvulkan-beta=true
 
