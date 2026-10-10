@@ -1,0 +1,290 @@
+diff --git a/src/panfrost/lib/kmod/meson.build b/src/panfrost/lib/kmod/meson.build
+index 68b94cc..d828444 100644
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -5,6 +5,7 @@ libpankmod_lib_files = files(
+   'pan_kmod.c',
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
++  'pan_kbase.c',
+ )
+ 
+ libpankmod_lib = static_library(
+diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
+new file mode 100644
+index 0000000..102be85
+--- /dev/null
++++ b/src/panfrost/lib/kmod/pan_kbase.c
+@@ -0,0 +1,154 @@
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <xf86drm.h>
++
++#include "pan_kmod.h"
++#include "util/os_mman.h"
++
++struct pan_kbase_dev {
++   struct pan_kmod_dev base;
++   void *rust_dev;
++   void *rust_lib;
++   
++   void *(*open_fn)(void);
++   void (*close_fn)(void *);
++   void *(*alloc_bo_fn)(void *, uint64_t, uint32_t);
++   void (*free_bo_fn)(void *, void *);
++   uint64_t (*bo_gpu_va_fn)(void *);
++   uint64_t (*bo_size_fn)(void *);
++   uint64_t (*get_gpu_id_fn)(void *);
++};
++
++struct pan_kbase_bo {
++   struct pan_kmod_bo base;
++   void *rust_bo;
++};
++
++static void
++pan_kbase_dev_destroy(struct pan_kmod_dev *dev)
++{
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   if (kdev->rust_dev && kdev->close_fn) {
++      kdev->close_fn(kdev->rust_dev);
++   }
++   if (kdev->rust_lib) {
++      dlclose(kdev->rust_lib);
++   }
++   util_sparse_array_finish(&dev->handle_to_bo.array);
++   simple_mtx_destroy(&dev->handle_to_bo.lock);
++   dev->allocator->free(dev->allocator, kdev);
++}
++
++static void
++pan_kbase_dev_query_props(const struct pan_kmod_dev *dev,
++                          struct pan_kmod_dev_props *props)
++{
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   memset(props, 0, sizeof(*props));
++   if (kdev->get_gpu_id_fn) {
++      props->gpu_prod_id = kdev->get_gpu_id_fn(kdev->rust_dev);
++   }
++}
++
++static uint32_t next_handle = 1;
++
++static struct pan_kmod_bo *
++pan_kbase_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
++                   size_t size, uint32_t flags)
++{
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   
++   void *rust_bo = kdev->alloc_bo_fn(kdev->rust_dev, size, flags);
++   if (!rust_bo) return NULL;
++   
++   struct pan_kbase_bo *kbo = dev->allocator->zalloc(dev->allocator, sizeof(*kbo), false);
++   if (!kbo) {
++      kdev->free_bo_fn(kdev->rust_dev, rust_bo);
++      return NULL;
++   }
++   
++   kbo->rust_bo = rust_bo;
++   kbo->base.dev = dev;
++   kbo->base.size = kdev->bo_size_fn(rust_bo);
++   kbo->base.handle = __sync_fetch_and_add(&next_handle, 1);
++   kbo->base.flags = flags;
++   kbo->base.exclusive_vm = exclusive_vm;
++   return &kbo->base;
++}
++
++static void
++pan_kbase_bo_free(struct pan_kmod_bo *bo)
++{
++   struct pan_kbase_bo *kbo = (struct pan_kbase_bo *)bo;
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)bo->dev;
++   
++   kdev->free_bo_fn(kdev->rust_dev, kbo->rust_bo);
++   bo->dev->allocator->free(bo->dev->allocator, kbo);
++}
++
++static off_t
++pan_kbase_bo_get_mmap_offset(struct pan_kmod_bo *bo)
++{
++   return 0; // Not supported / not used?
++}
++
++static bool
++pan_kbase_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
++                  bool for_read_only_access)
++{
++   return true; // No-op
++}
++
++const struct pan_kmod_ops pan_kbase_ops = {
++   .dev_destroy = pan_kbase_dev_destroy,
++   .dev_query_props = pan_kbase_dev_query_props,
++   .bo_alloc = pan_kbase_bo_alloc,
++   .bo_free = pan_kbase_bo_free,
++   .bo_get_mmap_offset = pan_kbase_bo_get_mmap_offset,
++   .bo_wait = pan_kbase_bo_wait,
++};
++
++struct pan_kmod_dev *
++pan_kbase_kmod_dev_create(const struct pan_kmod_allocator *allocator)
++{
++   void *lib = dlopen("libpanvk_kbase_jm.so", RTLD_NOW | RTLD_LOCAL);
++   if (!lib) return NULL;
++   
++   void *(*open_fn)(void) = dlsym(lib, "panvk_kbase_open");
++   if (!open_fn) { dlclose(lib); return NULL; }
++   
++   void *rust_dev = open_fn();
++   if (!rust_dev) { dlclose(lib); return NULL; }
++   
++   struct pan_kbase_dev *kdev = allocator->zalloc(allocator, sizeof(*kdev), true);
++   if (!kdev) { dlclose(lib); return NULL; }
++   
++   kdev->rust_lib = lib;
++   kdev->rust_dev = rust_dev;
++   kdev->open_fn = open_fn;
++   kdev->close_fn = dlsym(lib, "panvk_kbase_close");
++   kdev->alloc_bo_fn = dlsym(lib, "panvk_kbase_alloc_bo");
++   kdev->free_bo_fn = dlsym(lib, "panvk_kbase_free_bo");
++   kdev->bo_gpu_va_fn = dlsym(lib, "panvk_kbase_bo_gpu_va");
++   kdev->bo_size_fn = dlsym(lib, "panvk_kbase_bo_size");
++   kdev->get_gpu_id_fn = dlsym(lib, "panvk_kbase_get_gpu_id");
++   
++   kdev->base.fd = -1; // Dummy FD
++   kdev->base.ops = &pan_kbase_ops;
++   kdev->base.allocator = allocator;
++   
++   simple_mtx_init(&kdev->base.handle_to_bo.lock, mtx_plain);
++   util_sparse_array_init(&kdev->base.handle_to_bo.array, sizeof(struct pan_kmod_bo *), 64);
++   
++   return &kdev->base;
++}
++
++int pan_kbase_jm_submit(struct pan_kmod_dev *dev, const void *submit_void)
++{
++   const struct drm_panfrost_submit *submit = submit_void;
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   int (*submit_fn)(void *, const struct drm_panfrost_submit *) = dlsym(kdev->rust_lib, "panvk_kbase_submit");
++   if (!submit_fn) return -1;
++   return submit_fn(kdev->rust_dev, submit);
++}
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index f75b009..4e24e53 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -483,6 +483,9 @@ pan_kmod_dev_create(int fd, uint32_t flags,
+ 
+ void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
+ 
++struct pan_kmod_dev * pan_kbase_kmod_dev_create(const struct pan_kmod_allocator *allocator);
++int pan_kbase_jm_submit(struct pan_kmod_dev *dev, const void *submit);
++
+ static inline void
+ pan_kmod_dev_query_props(const struct pan_kmod_dev *dev,
+                          struct pan_kmod_dev_props *props)
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_queue.c b/src/panfrost/vulkan/jm/panvk_vX_queue.c
+index 8b59eb4..aedc8a3 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_queue.c
+@@ -69,7 +69,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+          .jc = batch->vtc_jc.first_job,
+       };
+ 
+-      ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++      if (dev->vk.drm_fd == -1) {
++         ret = pan_kbase_jm_submit(dev->kmod.dev, &submit);
++      } else {
++         ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++      }
+       assert(!ret);
+ 
+       if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
+@@ -108,7 +112,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+          submit.in_sync_count = nr_in_fences;
+       }
+ 
+-      ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++      if (dev->vk.drm_fd == -1) {
++         ret = pan_kbase_jm_submit(dev->kmod.dev, &submit);
++      } else {
++         ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++      }
+       assert(!ret);
+       if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
+          ret = drmSyncobjWait(dev->vk.drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 7a01f23..97d5410 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -14,6 +14,7 @@
+ 
+ #include "vk_alloc.h"
+ #include "vk_log.h"
++#include <dlfcn.h>
+ 
+ #include "panvk_entrypoints.h"
+ #include "panvk_instance.h"
+@@ -104,6 +105,35 @@ panvk_physical_device_try_create(struct vk_instance *vk_instance,
+    return VK_SUCCESS;
+ }
+ 
++extern struct pan_kmod_dev *pan_kbase_kmod_dev_create(const struct pan_kmod_allocator *allocator);
++
++static VkResult
++panvk_physical_device_enumerate(struct vk_instance *vk_instance)
++{
++   struct panvk_instance *instance =
++      container_of(vk_instance, struct panvk_instance, vk);
++
++   struct pan_kmod_dev *kdev = pan_kbase_kmod_dev_create(&instance->kmod.allocator);
++   if (kdev) {
++      struct panvk_physical_device *device =
++         vk_zalloc(&instance->vk.alloc, sizeof(*device), 8,
++                   VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++      if (!device) {
++         pan_kmod_dev_destroy(kdev);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++      device->kmod.dev = kdev;
++      VkResult result = panvk_physical_device_init(device, instance, NULL);
++      if (result != VK_SUCCESS) {
++         vk_free(&instance->vk.alloc, device);
++         return result;
++      }
++      list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
++      return VK_SUCCESS;
++   }
++   return VK_ERROR_INCOMPATIBLE_DRIVER;
++}
++
+ static void
+ panvk_destroy_physical_device(struct vk_physical_device *device)
+ {
+@@ -185,6 +214,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+       .priv = &instance->vk.alloc,
+    };
+ 
++   instance->vk.physical_devices.enumerate = panvk_physical_device_enumerate;
+    instance->vk.physical_devices.try_create_for_drm =
+       panvk_physical_device_try_create;
+    instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 0d8413c..42ac48b 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -803,7 +803,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+ {
+    VkResult result;
+ 
+-   result = create_kmod_dev(device, instance, drm_device);
++   if (!device->kmod.dev) {
++      result = create_kmod_dev(device, instance, drm_device);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++   result = VK_SUCCESS;
+    if (result != VK_SUCCESS)
+       return result;
+ 

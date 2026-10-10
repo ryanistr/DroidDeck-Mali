@@ -265,6 +265,31 @@ def buildRustStores = tasks.register('buildRustStores', Exec) {
 if (!skipRust) android.sourceSets.main.jniLibs.srcDir(rustJniLibsDir)
 tasks.named('preBuild').configure { dependsOn(buildRustStores) }
 
+// PanVK kbase JM backend (libpanvk_kbase_jm.so) - separate crate for kbase Job Manager support
+def panvkKbaseJmCrateDir = layout.projectDirectory.dir('src/main/rust/panvk-kbase-jm')
+def panvkKbaseJmJniLibsDir = layout.buildDirectory.dir('panvkKbaseJmJniLibs')
+def buildPanvkKbaseJm = tasks.register('buildPanvkKbaseJm', Exec) {
+    description = 'Cross-compiles the PanVK kbase JM backend (libpanvk_kbase_jm.so) with cargo-ndk.'
+    onlyIf { !skipRust }
+    inputs.dir(panvkKbaseJmCrateDir.dir('src'))
+    inputs.files(panvkKbaseJmCrateDir.file('Cargo.toml'))
+    inputs.property('ndkVersion', android.ndkVersion)
+    outputs.dir(panvkKbaseJmJniLibsDir)
+    workingDir panvkKbaseJmCrateDir
+    def cargoBin = "${System.getProperty('user.home')}/.cargo/bin"
+    environment 'PATH', "${cargoBin}${File.pathSeparator}${System.getenv('PATH')}"
+    environment 'ANDROID_NDK_HOME', android.ndkDirectory.absolutePath
+    environment 'CARGO_TERM_COLOR', 'never'
+    environment 'RUSTC', providers.exec {
+        commandLine 'rustup', 'which', '--toolchain', 'stable', 'rustc'
+    }.standardOutput.asText.get().trim()
+    commandLine 'rustup', 'run', 'stable', 'cargo', 'ndk', '--target', 'arm64-v8a', '--platform', '26',
+        '--output-dir', panvkKbaseJmJniLibsDir.get().asFile.absolutePath,
+        'build', '--release', '--locked'
+}
+if (!skipRust) android.sourceSets.main.jniLibs.srcDir(panvkKbaseJmJniLibsDir)
+tasks.named('preBuild').configure { dependsOn(buildPanvkKbaseJm) }
+
 dependencies {
     // The runtime tarball is a zstd-compressed tar.
     implementation 'com.github.luben:zstd-jni:1.5.2-3@aar'

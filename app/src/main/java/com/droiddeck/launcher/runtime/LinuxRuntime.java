@@ -114,6 +114,11 @@ public final class LinuxRuntime {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
+        // Prefer PanVK ICD for Mali devices
+        for (File manifest : manifests) {
+            if (manifest.getName().contains("panvk")) return manifest;
+        }
+        // Fallback to freedreno for Adreno
         for (File manifest : manifests) {
             if (manifest.getName().contains("freedreno")) return manifest;
         }

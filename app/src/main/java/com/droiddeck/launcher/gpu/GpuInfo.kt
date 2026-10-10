@@ -100,6 +100,7 @@ data class GpuInfo(
         private const val UNNAMED = "this GPU"
 
         fun detect(): GpuInfo {
+            android.util.Log.i("GpuInfo", "=== GpuInfo.detect() START ===")
             // Check for Adreno (KGSL or vendor Vulkan driver)
             val adreno = File("/sys/class/kgsl/kgsl-3d0").exists() || File("/vendor/lib64/hw/vulkan.adreno.so").exists()
             // Check for Mali (devfreq nodes or vendor Vulkan driver)
@@ -107,6 +108,7 @@ data class GpuInfo(
                 val n = f.name.lowercase()
                 n.contains("mali") || n.contains("gpu") && !n.contains("kgsl")
             } == true || File("/vendor/lib64/hw/vulkan.panfrost.so").exists() || File("/vendor/lib64/hw/vulkan.mali.so").exists()
+            android.util.Log.i("GpuInfo", "adreno=$adreno, mali=$mali")
 
             val raw = if (adreno) {
                 listOf("/sys/class/kgsl/kgsl-3d0/gpu_model", "/sys/class/kgsl/kgsl-3d0/gpu_chipid")
@@ -117,9 +119,11 @@ data class GpuInfo(
                     val n = f.name.lowercase()
                     n.contains("mali") || (n.contains("gpu") && !n.contains("kgsl"))
                 }
-                devfreq?.let { FileUtils.readString(File(it.path, "device/of_node/compatible"))?.trim()?.takeIf(String::isNotEmpty) }
+                val result = devfreq?.let { FileUtils.readString(File(it.path, "device/of_node/compatible"))?.trim()?.takeIf(String::isNotEmpty) }
                     ?: FileUtils.readString(File("/sys/class/mali0/device/of_node/compatible"))?.trim()?.takeIf(String::isNotEmpty)
                     ?: FileUtils.readString(File("/sys/bus/platform/drivers/mali"))?.trim()?.takeIf(String::isNotEmpty)
+                android.util.Log.d("GpuInfo", "Mali raw compatible: $result")
+                result
             } else null
 
             // Where vendors put the chip's model, named when it is known: "Snapdragon 8 Gen 2 (QCS8550)".
@@ -127,12 +131,15 @@ data class GpuInfo(
 
             // Parse model from kernel
             val fromKernel = raw?.let { parseModelFromKernel(it, adreno, mali) } ?: 0
+            android.util.Log.i("GpuInfo", "fromKernel model: $fromKernel, raw: $raw")
 
             // If kernel didn't give a model, try Vulkan driver's name
             val fromVulkan = if (fromKernel > 0) 0 else VulkanInfo.cachedOrNull()?.get("device")?.let { parseModelFromVulkan(it, adreno, mali) } ?: 0
+            android.util.Log.i("GpuInfo", "fromVulkan model: $fromVulkan")
 
             // If still nothing, try platform for Adreno
             val fromPlatform = if (fromKernel > 0 || fromVulkan > 0 || (!adreno && !mali)) 0 else platformModel()
+            android.util.Log.i("GpuInfo", "fromPlatform model: $fromPlatform")
 
             val model = maxOf(fromKernel, fromVulkan, fromPlatform)
             val source = when {
@@ -150,7 +157,17 @@ data class GpuInfo(
             val name = when {
                 isAdreno && model > 0 -> "Adreno $model"
                 isAdreno -> "Adreno"
-                isMali && model > 0 -> "Mali-$model"
+                isMali && model > 0 -> {
+                    // MT6893 (Dimensity 8050) has Mali-G77 MC9 (9 shader cores)
+                    val platform = systemProperty("ro.board.platform").lowercase()
+                    val n = if (platform == "mt6893" || platform == "mt6895" || platform == "mt6897") {
+                        "Mali-G${model} MC9"
+                    } else {
+                        "Mali-$model"
+                    }
+                    android.util.Log.i("GpuInfo", "Mali display name: $n")
+                    n
+                }
                 isMali -> "Mali"
                 else -> Build.HARDWARE.ifBlank { UNNAMED }
             }
@@ -169,6 +186,7 @@ data class GpuInfo(
             }
             if (isMali) {
                 // Mali kernel names: "mali-t860", "mali-g76", "mali-g78", "mali-g715", "arm,mali-g78"
+                // Also "mali-g77-mc9" or similar for core count
                 val m = Regex("""(?i)mali[_-]?(t|g)(\d{2,3})""").find(text)
                 if (m != null) {
                     val prefix = m.groupValues[1] ?: ""
@@ -194,6 +212,16 @@ data class GpuInfo(
 
         private fun threeDigits(text: String): Int = Regex("""(\d{3})""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
+        /** MediaTek platform codes whose GPU is known for certain. */
+        private val MTK_PLATFORMS = mapOf(
+            "mt6893" to 77,   // Dimensity 8050: Mali-G77 MC9
+            "mt6895" to 77,   // Dimensity 8100: Mali-G77 MC9
+            "mt6897" to 77,   // Dimensity 8200: Mali-G77 MC9
+            "mt6983" to 77,   // Dimensity 9000: Mali-G710 MC10 (different, but close)
+            "mt6985" to 77,   // Dimensity 9200: Mali-G715 MC11
+            "mt6989" to 77,   // Dimensity 9300: Mali-G720 MC12
+        )
+
         /** Qualcomm platform code names whose GPU is known for certain. */
         private val PLATFORMS = mapOf(
             "msmnile" to 640, "kona" to 650, "lahaina" to 660, "taro" to 730, "cape" to 730,
@@ -201,7 +229,7 @@ data class GpuInfo(
         )
 
         internal fun platformModel(platform: String = systemProperty("ro.board.platform")): Int =
-            PLATFORMS[platform.lowercase()] ?: PLATFORMS[systemProperty("ro.vendor.qti.soc_name").lowercase()] ?: 0
+            MTK_PLATFORMS[platform.lowercase()] ?: PLATFORMS[platform.lowercase()] ?: PLATFORMS[systemProperty("ro.vendor.qti.soc_name").lowercase()] ?: 0
 
         /** android.os.SystemProperties.get, which apps may read but not call directly. */
         fun systemProperty(name: String): String = try {

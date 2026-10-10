@@ -41,7 +41,8 @@ public final class PanvkDriver {
     /** Bundled drivers the user deleted: hidden from the list, their unpacked copy removed. */
     private static final String PREFS = "graphics_driver_panvk";
     private static final String KEY_HIDDEN = "hiddenBundled";
-
+    /** No bundled PanVK drivers in the APK yet. */
+    public static final List<String> BUNDLED = Collections.emptyList();
     /** Stored choice meaning "pick by GPU" - the default, and what a removed import falls back to. */
     public static final String AUTO = "";
 
@@ -101,17 +102,30 @@ public final class PanvkDriver {
         return library != null && !library.isEmpty() && new File(new File(contentDir, driverId), library).isFile();
     }
 
-    /** Imported drivers only. */
+    /** Imported drivers only - the bundled two are listed by {@link #BUNDLED}. */
     public List<String> enumerateImported() {
         ArrayList<String> ids = new ArrayList<>();
         File[] dirs = contentDir.listFiles();
         if (dirs == null) return ids;
         for (File d : dirs) {
             String id = d.getName();
-            if (d.isDirectory() && !id.startsWith(".") && isInstalled(id)) ids.add(id);
+            if (d.isDirectory() && !BUNDLED.contains(id) && !id.startsWith(".") && isInstalled(id)) ids.add(id);
         }
         Collections.sort(ids);
         return ids;
+    }
+
+    /** The bundled drivers the list shows: {@link #BUNDLED} minus the ones the user deleted. */
+    public List<String> visibleBundled() {
+        java.util.Set<String> hidden = hiddenBundled();
+        ArrayList<String> out = new ArrayList<>();
+        for (String id : BUNDLED) if (!hidden.contains(id)) out.add(id);
+        return out;
+    }
+
+    public java.util.Set<String> hiddenBundled() {
+        return new java.util.HashSet<>(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(KEY_HIDDEN, java.util.Collections.<String>emptySet()));
     }
 
     /** The system driver the GPU would pick on its own, for the "Auto" row's label. */
