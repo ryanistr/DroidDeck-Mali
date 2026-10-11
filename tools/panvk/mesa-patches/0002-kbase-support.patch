@@ -398,7 +398,7 @@ index 7a01f23..8f7812d 100644
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..b6bed0a 100644
+index 0d8413c..e57c1c4 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -18,6 +18,7 @@
@@ -409,12 +409,15 @@ index 0d8413c..b6bed0a 100644
  #include "vk_format.h"
  #include "vk_limits.h"
  #include "vk_log.h"
-@@ -147,10 +148,17 @@ get_device_sync_types(struct panvk_physical_device *device,
+@@ -147,10 +148,23 @@ get_device_sync_types(struct panvk_physical_device *device,
     const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
     uint32_t sync_type_count = 0;
  
 +   if (device->kmod.dev->fd < 0) {
 +      device->sync_types[sync_type_count++] = &vk_sync_dummy_type;
++      device->sync_timeline_type =
++         vk_sync_timeline_get_type(&vk_sync_dummy_type);
++      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
 +      device->sync_types[sync_type_count] = NULL;
 +      return VK_SUCCESS;
 +   }
@@ -424,12 +427,15 @@ index 0d8413c..b6bed0a 100644
 -      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
 -                       "failed to query syncobj features");
 +      device->sync_types[sync_type_count++] = &vk_sync_dummy_type;
++      device->sync_timeline_type =
++         vk_sync_timeline_get_type(&vk_sync_dummy_type);
++      device->sync_types[sync_type_count++] = &device->sync_timeline_type.sync;
 +      device->sync_types[sync_type_count] = NULL;
 +      return VK_SUCCESS;
     }
  
     device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
-@@ -207,9 +215,12 @@ get_device_extensions(const struct panvk_physical_device *device,
+@@ -207,9 +221,12 @@ get_device_extensions(const struct panvk_physical_device *device,
        .KHR_maintenance3 = true,
        .KHR_pipeline_executable_properties = true,
        .KHR_pipeline_library = true,
@@ -442,7 +448,7 @@ index 0d8413c..b6bed0a 100644
        .KHR_shader_expect_assume = true,
        .KHR_storage_buffer_storage_class = true,
  #ifdef PANVK_USE_WSI_PLATFORM
-@@ -229,6 +240,9 @@ get_device_extensions(const struct panvk_physical_device *device,
+@@ -229,6 +246,9 @@ get_device_extensions(const struct panvk_physical_device *device,
        .EXT_pipeline_creation_cache_control = true,
        .EXT_pipeline_creation_feedback = true,
        .EXT_private_data = true,
@@ -452,7 +458,7 @@ index 0d8413c..b6bed0a 100644
        .EXT_shader_module_identifier = true,
        .EXT_vertex_attribute_divisor = true,
        .GOOGLE_decorate_string = true,
-@@ -270,7 +284,7 @@ get_features(const struct panvk_physical_device *device,
+@@ -270,7 +290,7 @@ get_features(const struct panvk_physical_device *device,
        .variablePointersStorageBuffer = true,
        .variablePointers = true,
        .protectedMemory = false,
@@ -461,7 +467,7 @@ index 0d8413c..b6bed0a 100644
        .shaderDrawParameters = false,
  
        /* Vulkan 1.2 */
-@@ -307,7 +321,7 @@ get_features(const struct panvk_physical_device *device,
+@@ -307,7 +327,7 @@ get_features(const struct panvk_physical_device *device,
        .runtimeDescriptorArray = false,
  
        .samplerFilterMinmax = false,
@@ -470,7 +476,7 @@ index 0d8413c..b6bed0a 100644
        .imagelessFramebuffer = false,
        .uniformBufferStandardLayout = false,
        .shaderSubgroupExtendedTypes = false,
-@@ -376,6 +390,17 @@ get_features(const struct panvk_physical_device *device,
+@@ -376,6 +396,17 @@ get_features(const struct panvk_physical_device *device,
  
        /* VK_EXT_shader_module_identifier */
        .shaderModuleIdentifier = true,
@@ -488,7 +494,7 @@ index 0d8413c..b6bed0a 100644
     };
  }
  
-@@ -739,6 +764,10 @@ get_device_properties(const struct panvk_instance *instance,
+@@ -739,6 +770,10 @@ get_device_properties(const struct panvk_instance *instance,
        .maxVertexAttribDivisor = UINT32_MAX,
        .supportsNonZeroFirstInstance = false,
  
@@ -499,7 +505,7 @@ index 0d8413c..b6bed0a 100644
        /* VK_KHR_push_descriptor */
        .maxPushDescriptors = MAX_PUSH_DESCRIPTORS,
     };
-@@ -771,11 +800,19 @@ get_device_properties(const struct panvk_instance *instance,
+@@ -771,11 +806,19 @@ get_device_properties(const struct panvk_instance *instance,
        properties->drmHasPrimary = true;
        properties->drmPrimaryMajor = major(device->drm.primary_rdev);
        properties->drmPrimaryMinor = minor(device->drm.primary_rdev);
@@ -519,7 +525,7 @@ index 0d8413c..b6bed0a 100644
     }
  
     /* VK_EXT_shader_module_identifier */
-@@ -803,7 +840,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -803,7 +846,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  {
     VkResult result;
  
@@ -533,7 +539,7 @@ index 0d8413c..b6bed0a 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -811,6 +853,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -811,6 +859,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  
     device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
                                        device->kmod.props.gpu_variant);
@@ -547,7 +553,7 @@ index 0d8413c..b6bed0a 100644
  
     unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
  
-@@ -826,9 +875,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -826,9 +881,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
        goto fail;
     }
  
@@ -576,7 +582,7 @@ index 0d8413c..b6bed0a 100644
  
     device->formats.all = panfrost_format_table(arch);
     device->formats.blendable = panfrost_blendable_format_table(arch);
-@@ -1026,6 +1091,14 @@ get_format_properties(struct panvk_physical_device *physical_device,
+@@ -1026,6 +1097,14 @@ get_format_properties(struct panvk_physical_device *physical_device,
     if (arch >= 9 && format == VK_FORMAT_D32_SFLOAT_S8_UINT)
        goto end;
  
@@ -591,7 +597,7 @@ index 0d8413c..b6bed0a 100644
     if (pfmt == PIPE_FORMAT_NONE)
        goto end;
  
-@@ -1346,6 +1419,26 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+@@ -1346,6 +1425,26 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
     VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = NULL;
     VkResult result;
  
@@ -618,7 +624,7 @@ index 0d8413c..b6bed0a 100644
     result = get_image_format_properties(physical_device, base_info,
                                          &base_props->imageFormatProperties,
                                          &format_feature_flags);
-@@ -1366,23 +1459,6 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+@@ -1366,23 +1465,6 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
        }
     }
  
@@ -753,3 +759,149 @@ index 60af69b..c932236 100644
        return result;
  
     collect_enabled_features(device, pCreateInfo);
+diff --git a/src/vulkan/runtime/vk_fence.c b/src/vulkan/runtime/vk_fence.c
+index 77cb5a3..278cd7c 100644
+--- a/src/vulkan/runtime/vk_fence.c
++++ b/src/vulkan/runtime/vk_fence.c
+@@ -112,8 +112,10 @@ vk_fence_create(struct vk_device *device,
+    const struct vk_sync_type *sync_type =
+       get_fence_sync_type(device->physical, handle_types);
+    if (sync_type == NULL) {
+-      /* We should always be able to get a fence type for internal */
+-      assert(get_fence_sync_type(device->physical, 0) != NULL);
++      /* Fallback to internal fence type */
++      sync_type = get_fence_sync_type(device->physical, 0);
++   }
++   if (sync_type == NULL) {
+       return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                        "Combination of external handle types is unsupported "
+                        "for VkFence creation.");
+diff --git a/src/vulkan/runtime/vk_semaphore.c b/src/vulkan/runtime/vk_semaphore.c
+index 7044ed9..0e0736b 100644
+--- a/src/vulkan/runtime/vk_semaphore.c
++++ b/src/vulkan/runtime/vk_semaphore.c
+@@ -158,8 +158,10 @@ vk_common_CreateSemaphore(VkDevice _device,
+    const struct vk_sync_type *sync_type =
+       get_semaphore_sync_type(device->physical, semaphore_type, handle_types);
+    if (sync_type == NULL) {
+-      /* We should always be able to get a semaphore type for internal */
+-      assert(get_semaphore_sync_type(device->physical, semaphore_type, 0) != NULL);
++      /* Fallback to internal semaphore type */
++      sync_type = get_semaphore_sync_type(device->physical, semaphore_type, 0);
++   }
++   if (sync_type == NULL) {
+       return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                        "Combination of external handle types is unsupported "
+                        "for VkSemaphore creation.");
+diff --git a/src/vulkan/runtime/vk_sync_dummy.c b/src/vulkan/runtime/vk_sync_dummy.c
+index 1cab72f..e4a5d40 100644
+--- a/src/vulkan/runtime/vk_sync_dummy.c
++++ b/src/vulkan/runtime/vk_sync_dummy.c
+@@ -21,6 +21,8 @@
+  * IN THE SOFTWARE.
+  */
+ 
++#include <sys/eventfd.h>
++#include <unistd.h>
+ #include "vk_sync_dummy.h"
+ 
+ static VkResult
+@@ -36,6 +38,29 @@ vk_sync_dummy_finish(struct vk_device *device,
+                      struct vk_sync *sync)
+ { }
+ 
++static VkResult
++vk_sync_dummy_signal(struct vk_device *device,
++                     struct vk_sync *sync,
++                     uint64_t value)
++{
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_sync_dummy_reset(struct vk_device *device,
++                    struct vk_sync *sync)
++{
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_sync_dummy_move(struct vk_device *device,
++                   struct vk_sync *dst,
++                   struct vk_sync *src)
++{
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ vk_sync_dummy_wait_many(struct vk_device *device,
+                         uint32_t wait_count,
+@@ -46,14 +71,68 @@ vk_sync_dummy_wait_many(struct vk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++vk_sync_dummy_export_sync_file(struct vk_device *device,
++                               struct vk_sync *sync,
++                               int *sync_file)
++{
++   int fd = eventfd(1, EFD_CLOEXEC);
++   if (fd < 0)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   *sync_file = fd;
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_sync_dummy_import_sync_file(struct vk_device *device,
++                               struct vk_sync *sync,
++                               int sync_file)
++{
++   if (sync_file >= 0)
++      close(sync_file);
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_sync_dummy_export_opaque_fd(struct vk_device *device,
++                               struct vk_sync *sync,
++                               int *fd_out)
++{
++   int fd = eventfd(1, EFD_CLOEXEC);
++   if (fd < 0)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   *fd_out = fd;
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_sync_dummy_import_opaque_fd(struct vk_device *device,
++                               struct vk_sync *sync,
++                               int fd)
++{
++   if (fd >= 0)
++      close(fd);
++   return VK_SUCCESS;
++}
++
+ const struct vk_sync_type vk_sync_dummy_type = {
+    .size = sizeof(struct vk_sync),
+    .features = VK_SYNC_FEATURE_BINARY |
+                VK_SYNC_FEATURE_GPU_WAIT |
++               VK_SYNC_FEATURE_GPU_MULTI_WAIT |
+                VK_SYNC_FEATURE_CPU_WAIT |
++               VK_SYNC_FEATURE_CPU_RESET |
++               VK_SYNC_FEATURE_CPU_SIGNAL |
+                VK_SYNC_FEATURE_WAIT_ANY |
+                VK_SYNC_FEATURE_WAIT_PENDING,
+    .init = vk_sync_dummy_init,
+    .finish = vk_sync_dummy_finish,
++   .signal = vk_sync_dummy_signal,
++   .reset = vk_sync_dummy_reset,
++   .move = vk_sync_dummy_move,
+    .wait_many = vk_sync_dummy_wait_many,
++   .export_sync_file = vk_sync_dummy_export_sync_file,
++   .import_sync_file = vk_sync_dummy_import_sync_file,
++   .export_opaque_fd = vk_sync_dummy_export_opaque_fd,
++   .import_opaque_fd = vk_sync_dummy_import_opaque_fd,
+ };
