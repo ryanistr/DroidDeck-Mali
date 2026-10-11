@@ -274,11 +274,79 @@ index 85f2e5a..c184fa2 100644
  }
  
  VkResult panvk_per_arch(queue_init)(struct panvk_device *device,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_event.c b/src/panfrost/vulkan/jm/panvk_vX_event.c
+index 44923ca..feee0e5 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_event.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_event.c
+@@ -21,6 +21,12 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
+    if (!event)
+       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   if (device->vk.drm_fd == -1) {
++      event->syncobj = 0;
++      *pEvent = panvk_event_to_handle(event);
++      return VK_SUCCESS;
++   }
++
+    struct drm_syncobj_create create = {
+       .flags = 0,
+    };
+@@ -45,8 +51,10 @@ panvk_per_arch(DestroyEvent)(VkDevice _device, VkEvent _event,
+    if (!event)
+       return;
+ 
+-   struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
+-   drmIoctl(device->vk.drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
++   if (device->vk.drm_fd != -1) {
++      struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
++      drmIoctl(device->vk.drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
++   }
+ 
+    vk_object_free(&device->vk, pAllocator, event);
+ }
+@@ -58,6 +66,9 @@ panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
+    VK_FROM_HANDLE(panvk_event, event, _event);
+    bool signaled;
+ 
++   if (device->vk.drm_fd == -1)
++      return VK_EVENT_SET;
++
+    struct drm_syncobj_wait wait = {
+       .handles = (uintptr_t)&event->syncobj,
+       .count_handles = 1,
+@@ -85,6 +96,9 @@ panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
+    VK_FROM_HANDLE(panvk_device, device, _device);
+    VK_FROM_HANDLE(panvk_event, event, _event);
+ 
++   if (device->vk.drm_fd == -1)
++      return VK_SUCCESS;
++
+    struct drm_syncobj_array objs = {
+       .handles = (uint64_t)(uintptr_t)&event->syncobj,
+       .count_handles = 1};
+@@ -107,6 +121,9 @@ panvk_per_arch(ResetEvent)(VkDevice _device, VkEvent _event)
+    VK_FROM_HANDLE(panvk_device, device, _device);
+    VK_FROM_HANDLE(panvk_event, event, _event);
+ 
++   if (device->vk.drm_fd == -1)
++      return VK_SUCCESS;
++
+    struct drm_syncobj_array objs = {
+       .handles = (uint64_t)(uintptr_t)&event->syncobj,
+       .count_handles = 1};
 diff --git a/src/panfrost/vulkan/jm/panvk_vX_queue.c b/src/panfrost/vulkan/jm/panvk_vX_queue.c
-index 8b59eb4..c80513e 100644
+index 8b59eb4..aa2d126 100644
 --- a/src/panfrost/vulkan/jm/panvk_vX_queue.c
 +++ b/src/panfrost/vulkan/jm/panvk_vX_queue.c
-@@ -69,7 +69,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+@@ -63,16 +63,20 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+       struct drm_panfrost_submit submit = {
+          .bo_handles = (uintptr_t)bos,
+          .bo_handle_count = nr_bos,
+-         .in_syncs = (uintptr_t)in_fences,
+-         .in_sync_count = nr_in_fences,
++         .in_syncs = (dev->vk.drm_fd == -1) ? 0 : (uintptr_t)in_fences,
++         .in_sync_count = (dev->vk.drm_fd == -1) ? 0 : nr_in_fences,
+          .out_sync = queue->sync,
           .jc = batch->vtc_jc.first_job,
        };
  
@@ -290,9 +358,29 @@ index 8b59eb4..c80513e 100644
 +      }
        assert(!ret);
  
-       if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
-@@ -108,7 +112,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
-          submit.in_sync_count = nr_in_fences;
+-      if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
++      if (dev->vk.drm_fd != -1 && (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC))) {
+          ret = drmSyncobjWait(dev->vk.drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
+                               NULL);
+          assert(!ret);
+@@ -100,17 +104,23 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+          .requirements = PANFROST_JD_REQ_FS,
+       };
+ 
+-      if (batch->vtc_jc.first_job) {
+-         submit.in_syncs = (uintptr_t)(&queue->sync);
+-         submit.in_sync_count = 1;
+-      } else {
+-         submit.in_syncs = (uintptr_t)in_fences;
+-         submit.in_sync_count = nr_in_fences;
++      if (dev->vk.drm_fd != -1) {
++         if (batch->vtc_jc.first_job) {
++            submit.in_syncs = (uintptr_t)(&queue->sync);
++            submit.in_sync_count = 1;
++         } else {
++            submit.in_syncs = (uintptr_t)in_fences;
++            submit.in_sync_count = nr_in_fences;
++         }
        }
  
 -      ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
@@ -302,9 +390,12 @@ index 8b59eb4..c80513e 100644
 +         ret = drmIoctl(dev->vk.drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
 +      }
        assert(!ret);
-       if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
+-      if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
++      if (dev->vk.drm_fd != -1 && (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC))) {
           ret = drmSyncobjWait(dev->vk.drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
-@@ -138,6 +146,8 @@ static void
+                               NULL);
+          assert(!ret);
+@@ -138,6 +148,8 @@ static void
  panvk_queue_transfer_sync(struct panvk_queue *queue, uint32_t syncobj)
  {
     struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -313,7 +404,7 @@ index 8b59eb4..c80513e 100644
     int ret;
  
     struct drm_syncobj_handle handle = {
-@@ -183,6 +193,8 @@ panvk_signal_event_syncobjs(struct panvk_queue *queue,
+@@ -183,6 +195,8 @@ panvk_signal_event_syncobjs(struct panvk_queue *queue,
                              struct panvk_batch *batch)
  {
     struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -322,17 +413,60 @@ index 8b59eb4..c80513e 100644
  
     util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
        switch (op->type) {
-@@ -314,7 +326,8 @@ panvk_per_arch(queue_init)(struct panvk_device *device,
+@@ -221,11 +235,13 @@ panvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+ 
+    semaphores[0] = queue->sync;
+    for (unsigned i = 0; i < submit->wait_count; i++) {
+-      assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
+-      struct vk_drm_syncobj *syncobj =
+-         vk_sync_as_drm_syncobj(submit->waits[i].sync);
+-
+-      semaphores[i + 1] = syncobj->syncobj;
++      if (dev->vk.drm_fd != -1 && vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type)) {
++         struct vk_drm_syncobj *syncobj =
++            vk_sync_as_drm_syncobj(submit->waits[i].sync);
++         semaphores[i + 1] = syncobj ? syncobj->syncobj : 0;
++      } else {
++         semaphores[i + 1] = 0;
++      }
+    }
+ 
+    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+@@ -294,12 +310,16 @@ panvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+    }
+ 
+    /* Transfer the out fence to signal semaphores */
+-   for (unsigned i = 0; i < submit->signal_count; i++) {
+-      assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
+-      struct vk_drm_syncobj *syncobj =
+-         vk_sync_as_drm_syncobj(submit->signals[i].sync);
+-
+-      panvk_queue_transfer_sync(queue, syncobj->syncobj);
++   if (dev->vk.drm_fd != -1) {
++      for (unsigned i = 0; i < submit->signal_count; i++) {
++         if (vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type)) {
++            struct vk_drm_syncobj *syncobj =
++               vk_sync_as_drm_syncobj(submit->signals[i].sync);
++
++            if (syncobj)
++               panvk_queue_transfer_sync(queue, syncobj->syncobj);
++         }
++      }
+    }
+ 
+    return VK_SUCCESS;
+@@ -314,7 +334,9 @@ panvk_per_arch(queue_init)(struct panvk_device *device,
     if (result != VK_SUCCESS)
        return result;
  
 -   int ret = drmSyncobjCreate(device->vk.drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
++   queue->sync = 0;
 +   int ret = (device->vk.drm_fd == -1) ? 0 :
 +             drmSyncobjCreate(device->vk.drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
                                &queue->sync);
     if (ret) {
        vk_queue_finish(&queue->vk);
-@@ -337,7 +350,8 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+@@ -337,7 +359,8 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
     if (vk_device_is_lost(&dev->vk))
        return VK_ERROR_DEVICE_LOST;
  
