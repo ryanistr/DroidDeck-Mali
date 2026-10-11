@@ -22,7 +22,7 @@ if [ -n "${BL_LOG:-}" ] && [ -z "${BL_INSIDE:-}" ]; then
   # A guest looping on an error writes gigabytes in minutes (an Xwayland proot had lost track of
   # managed 9 GB of one line in 19 min): the log keeps its first BL_LOG_CAP bytes and the rest is
   # drained, not refused - a writer that filled it must not die of SIGPIPE.
-  exec > >({ dd of="$BL_LOG" oflag=append conv=notrunc iflag=count_bytes count="${BL_LOG_CAP:-268435456}" bs=65536 status=none; cat >/dev/null; }) 2>&1
+  exec >> "$BL_LOG" 2>&1
   echo "== droiddeck-session $(date) mode=$mode $*"
   echo "== uid=$(id -u) size=${BL_WIDTH:-?}x${BL_HEIGHT:-?} fps=${BL_FPS:-0} icd=${VK_ICD_FILENAMES:-none}"
   echo "== gamescope: $(gamescope --version 2>&1 | head -1) at $(command -v gamescope)"
@@ -277,9 +277,18 @@ if [ -z "${BL_INSIDE:-}" ]; then
     args+=(--mangoapp)
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
+  export PANVK_DEBUG=startup,trace,sync
+  export VK_LOADER_DEBUG=all
+  ulimit -c unlimited 2>/dev/null || true
   export BL_INSIDE=1
-  exec gamescope "${args[@]}" -- "$0" "$mode" "$@"
+  echo "== gamescope launching: gamescope ${args[@]} -- $0 $mode $@"
+  gamescope "${args[@]}" -- "$0" "$mode" "$@"
+  _gs_rc=$?
+  echo "== gamescope exited with code: $_gs_rc"
+  exit $_gs_rc
 fi
+
+echo "== INSIDE GAMESCOPE: mode=$mode DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
 
 # gamescope manages X windows: toolkits go through Xwayland, not gamescope's own Wayland socket.
 # Root-window requests for the game (restore) go to every display gamescope gave us:

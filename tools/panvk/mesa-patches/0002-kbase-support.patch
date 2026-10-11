@@ -12,10 +12,10 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..4703fef
+index 0000000..bbcea0a
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,227 @@
 +#include <dlfcn.h>
 +#include <fcntl.h>
 +#include <unistd.h>
@@ -133,7 +133,8 @@ index 0000000..4703fef
 +{
 +   struct pan_kbase_vm *vm = dev->allocator->zalloc(dev->allocator, sizeof(*vm), false);
 +   if (!vm) return NULL;
-+   pan_kmod_vm_init(&vm->base, dev, 0, flags);
++   /* kbase rejects mmap address hints, so the VA can only come from the BO's cookie mapping. */
++   pan_kmod_vm_init(&vm->base, dev, 0, flags | PAN_KMOD_VM_FLAG_AUTO_VA);
 +   return &vm->base;
 +}
 +

@@ -157,9 +157,16 @@ const BASE_MEM_PROT_CPU_WR: u64 = 1 << 1;
 const BASE_MEM_PROT_GPU_RD: u64 = 1 << 2;
 const BASE_MEM_PROT_GPU_WR: u64 = 1 << 3;
 const BASE_MEM_PROT_GPU_EX: u64 = 1 << 4;
-const BASE_MEM_SAME_VA: u64 = 1 << 9;
-const BASE_MEM_CACHED_CPU: u64 = 1 << 17;
-const BASE_MEM_COHERENT_SYSTEM: u64 = 1 << 5;
+
+// kbase rejects GPU_WR|GPU_EX and GPU_EX without CPU_WR (probed on MT6893, r=-ENOMEM).
+const KBASE_FLAGS_DATA: u64 =
+    BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+const KBASE_FLAGS_EXEC: u64 =
+    BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_EX;
+
+const PAN_KMOD_BO_FLAG_EXECUTABLE: u32 = 1 << 0;
+
+const PAGE_SIZE: u64 = 4096;
 
 // Job slot assignments
 const JS_FRAGMENT: u8 = 0;
@@ -208,6 +215,8 @@ struct KbaseDevice {
     uapi_minor: u16,
 }
 
+/// kbase 64-bit contexts force SAME_VA: MEM_ALLOC returns a one-shot mmap cookie, and the CPU
+/// address of that first mapping becomes the GPU VA. Keeping it mapped keeps the region alive.
 struct KbaseBo {
     gpu_va: u64,
     size: u64,
@@ -311,12 +320,12 @@ impl KbaseDevice {
     }
 
     fn alloc_bo(&self, size: u64, flags: u64) -> Result<KbaseBo, std::io::Error> {
-        let pages = (size + 4095) / 4096;
+        let pages = size.div_ceil(PAGE_SIZE);
         let mut alloc = kbase_ioctl_mem_alloc {
             va_pages: pages,
             commit_pages: pages,
             extension: 0,
-            flags: flags,
+            flags,
         };
 
         unsafe {
@@ -326,22 +335,39 @@ impl KbaseDevice {
             }
         }
 
+        // out.gpu_va overlays in.commit_pages.
+        let cookie = alloc.commit_pages;
+        let map_size = pages * PAGE_SIZE;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_size as size_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.fd.as_raw_fd(),
+                cookie as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            let mut free = kbase_ioctl_mem_free { gpu_addr: cookie };
+            unsafe {
+                libc::ioctl(self.fd.as_raw_fd(), KBASE_IOCTL_MEM_FREE as _, &mut free);
+            }
+            return Err(err);
+        }
+
         Ok(KbaseBo {
-            gpu_va: alloc.commit_pages, // returned in the second u64
-            size,
+            gpu_va: ptr as u64,
+            size: map_size,
         })
     }
 
     fn free_bo(&self, bo: &KbaseBo) -> Result<(), std::io::Error> {
-        let mut free = kbase_ioctl_mem_free {
-            gpu_addr: bo.gpu_va,
-        };
-
-        unsafe {
-            let ret = libc::ioctl(self.fd.as_raw_fd(), KBASE_IOCTL_MEM_FREE as _, &mut free);
-            if ret < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+        // MEM_FREE on a mapped SAME_VA region returns EINVAL here; closing the cookie mapping frees it.
+        let ret = unsafe { libc::munmap(bo.gpu_va as *mut c_void, bo.size as size_t) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
         }
         Ok(())
     }
@@ -385,11 +411,11 @@ pub extern "C" fn panvk_kbase_alloc_bo(
     }
 
     let kbase_dev = unsafe { &*(dev as *const KbaseDevice) };
-    let kbase_flags = (flags as u64)
-        | BASE_MEM_PROT_CPU_RD
-        | BASE_MEM_PROT_CPU_WR
-        | BASE_MEM_PROT_GPU_RD
-        | BASE_MEM_PROT_GPU_WR;
+    let kbase_flags = if flags & PAN_KMOD_BO_FLAG_EXECUTABLE != 0 {
+        KBASE_FLAGS_EXEC
+    } else {
+        KBASE_FLAGS_DATA
+    };
 
     match kbase_dev.alloc_bo(size, kbase_flags) {
         Ok(bo) => {
