@@ -12,10 +12,10 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..a2539bd
+index 0000000..e56c552
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,225 @@
 +#include <dlfcn.h>
 +#include <fcntl.h>
 +#include <unistd.h>
@@ -108,7 +108,11 @@ index 0000000..a2539bd
 +static off_t
 +pan_kbase_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 +{
-+   return 0; // Not supported / not used?
++   struct pan_kbase_bo *kbo = (struct pan_kbase_bo *)bo;
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)bo->dev;
++   if (kdev->bo_gpu_va_fn)
++      return (off_t)kdev->bo_gpu_va_fn(kbo->rust_bo);
++   return 0;
 +}
 +
 +static bool
@@ -118,13 +122,61 @@ index 0000000..a2539bd
 +   return true; // No-op
 +}
 +
++struct pan_kbase_vm {
++   struct pan_kmod_vm base;
++};
++
++static struct pan_kmod_vm *
++pan_kbase_vm_create(struct pan_kmod_dev *dev, uint32_t flags, uint64_t va_start,
++                    uint64_t va_range)
++{
++   struct pan_kbase_vm *vm = dev->allocator->zalloc(dev->allocator, sizeof(*vm), false);
++   if (!vm) return NULL;
++   pan_kmod_vm_init(&vm->base, dev, 0, flags);
++   return &vm->base;
++}
++
++static void
++pan_kbase_vm_destroy(struct pan_kmod_vm *vm)
++{
++   vm->dev->allocator->free(vm->dev->allocator, vm);
++}
++
++static int
++pan_kbase_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
++                  struct pan_kmod_vm_op *ops, uint32_t op_count)
++{
++   for (uint32_t i = 0; i < op_count; i++) {
++      if (ops[i].type == PAN_KMOD_VM_OP_TYPE_MAP) {
++         struct pan_kbase_bo *kbo = (struct pan_kbase_bo *)ops[i].map.bo;
++         struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)kbo->base.dev;
++         if (kdev->bo_gpu_va_fn)
++            ops[i].va.start = kdev->bo_gpu_va_fn(kbo->rust_bo);
++      }
++   }
++   return 0;
++}
++
++static struct pan_kmod_va_range
++pan_kbase_dev_query_user_va_range(const struct pan_kmod_dev *dev)
++{
++   return (struct pan_kmod_va_range){
++      .start = 0x2000000ull,
++      .size = 0xffe000000ull,
++   };
++}
++
 +const struct pan_kmod_ops pan_kbase_ops = {
 +   .dev_destroy = pan_kbase_dev_destroy,
 +   .dev_query_props = pan_kbase_dev_query_props,
++   .dev_query_user_va_range = pan_kbase_dev_query_user_va_range,
 +   .bo_alloc = pan_kbase_bo_alloc,
 +   .bo_free = pan_kbase_bo_free,
 +   .bo_get_mmap_offset = pan_kbase_bo_get_mmap_offset,
 +   .bo_wait = pan_kbase_bo_wait,
++   .vm_create = pan_kbase_vm_create,
++   .vm_destroy = pan_kbase_vm_destroy,
++   .vm_bind = pan_kbase_vm_bind,
 +};
 +
 +struct pan_kmod_dev *
@@ -152,7 +204,8 @@ index 0000000..a2539bd
 +   kdev->bo_size_fn = dlsym(lib, "panvk_kbase_bo_size");
 +   kdev->get_gpu_id_fn = dlsym(lib, "panvk_kbase_get_gpu_id");
 +   
-+   kdev->base.fd = -1; // Dummy FD
++   int (*get_fd_fn)(void *) = dlsym(lib, "panvk_kbase_get_fd");
++   kdev->base.fd = get_fd_fn ? get_fd_fn(rust_dev) : -1;
 +   kdev->base.ops = &pan_kbase_ops;
 +   kdev->base.allocator = allocator;
 +   
@@ -189,13 +242,14 @@ index 0000000..a2539bd
 +   return 0;
 +}
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
-index f75b009..296aca4 100644
+index f75b009..e62f619 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
-@@ -483,6 +483,11 @@ pan_kmod_dev_create(int fd, uint32_t flags,
+@@ -483,6 +483,12 @@ pan_kmod_dev_create(int fd, uint32_t flags,
  
  void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
  
++extern const struct pan_kmod_ops pan_kbase_ops;
 +struct pan_kmod_dev * pan_kbase_kmod_dev_create(const struct pan_kmod_allocator *allocator);
 +int pan_kbase_jm_submit(struct pan_kmod_dev *dev, const void *submit);
 +uint64_t pan_kbase_get_primary_rdev(struct pan_kmod_dev *dev);
@@ -516,6 +570,27 @@ index 096ce4c..6ca0539 100644
  }
  
  VkResult panvk_physical_device_init(struct panvk_physical_device *device,
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 97398a2..6d2e1f3 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -216,9 +216,13 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+       .free = panvk_kmod_free,
+       .priv = &device->vk.alloc,
+    };
+-   device->kmod.dev =
+-      pan_kmod_dev_create(dup(physical_device->kmod.dev->fd),
+-                          PAN_KMOD_DEV_FLAG_OWNS_FD, &device->kmod.allocator);
++   if (physical_device->kmod.dev->ops == &pan_kbase_ops) {
++      device->kmod.dev = pan_kbase_kmod_dev_create(&device->kmod.allocator);
++   } else {
++      device->kmod.dev =
++         pan_kmod_dev_create(dup(physical_device->kmod.dev->fd),
++                             PAN_KMOD_DEV_FLAG_OWNS_FD, &device->kmod.allocator);
++   }
+ 
+    if (!device->kmod.dev) {
+       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
 diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
 index 60af69b..c932236 100644
 --- a/src/vulkan/runtime/vk_device.c

@@ -438,6 +438,15 @@ pub extern "C" fn panvk_kbase_get_gpu_id(dev: *mut c_void) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn panvk_kbase_get_fd(dev: *mut c_void) -> c_int {
+    if dev.is_null() {
+        return -1;
+    }
+    let kbase_dev = unsafe { &*(dev as *const KbaseDevice) };
+    kbase_dev.fd.as_raw_fd()
+}
+
+#[no_mangle]
 pub extern "C" fn panvk_kbase_get_props(
     dev: *mut c_void,
     props: *mut c_void,
