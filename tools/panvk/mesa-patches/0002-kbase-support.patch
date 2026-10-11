@@ -398,7 +398,7 @@ index 7a01f23..8f7812d 100644
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..0a6fd31 100644
+index 0d8413c..b6bed0a 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -18,6 +18,7 @@
@@ -576,6 +576,72 @@ index 0d8413c..0a6fd31 100644
  
     device->formats.all = panfrost_format_table(arch);
     device->formats.blendable = panfrost_blendable_format_table(arch);
+@@ -1026,6 +1091,14 @@ get_format_properties(struct panvk_physical_device *physical_device,
+    if (arch >= 9 && format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+       goto end;
+ 
++   if (format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) {
++      tex = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
++            VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT |
++            VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
++      goto end;
++   }
++
+    if (pfmt == PIPE_FORMAT_NONE)
+       goto end;
+ 
+@@ -1346,6 +1419,26 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+    VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = NULL;
+    VkResult result;
+ 
++   /* Extract output structs first so ycbcr_props is always populated */
++   vk_foreach_struct(s, base_props->pNext) {
++      switch (s->sType) {
++      case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
++         external_props = (void *)s;
++         break;
++      case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
++         cubic_props = (void *)s;
++         break;
++      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
++         ycbcr_props = (void *)s;
++         break;
++      default:
++         break;
++      }
++   }
++
++   if (ycbcr_props)
++      ycbcr_props->combinedImageSamplerDescriptorCount = 1;
++
+    result = get_image_format_properties(physical_device, base_info,
+                                         &base_props->imageFormatProperties,
+                                         &format_feature_flags);
+@@ -1366,23 +1459,6 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+       }
+    }
+ 
+-   /* Extract output structs */
+-   vk_foreach_struct(s, base_props->pNext) {
+-      switch (s->sType) {
+-      case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
+-         external_props = (void *)s;
+-         break;
+-      case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
+-         cubic_props = (void *)s;
+-         break;
+-      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
+-         ycbcr_props = (void *)s;
+-         break;
+-      default:
+-         break;
+-      }
+-   }
+-
+    /* From the Vulkan 1.0.42 spec:
+     *
+     *    If handleType is 0, vkGetPhysicalDeviceImageFormatProperties2 will
 diff --git a/src/panfrost/vulkan/panvk_physical_device.h b/src/panfrost/vulkan/panvk_physical_device.h
 index 096ce4c..6ca0539 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.h
@@ -589,6 +655,60 @@ index 096ce4c..6ca0539 100644
  }
  
  VkResult panvk_physical_device_init(struct panvk_physical_device *device,
+diff --git a/src/panfrost/vulkan/panvk_vX_descriptor_set.c b/src/panfrost/vulkan/panvk_vX_descriptor_set.c
+index 239ce49..a6886c1 100644
+--- a/src/panfrost/vulkan/panvk_vX_descriptor_set.c
++++ b/src/panfrost/vulkan/panvk_vX_descriptor_set.c
+@@ -5,6 +5,7 @@
+ 
+ #include <assert.h>
+ #include <fcntl.h>
++#include <inttypes.h>
+ #include <stdbool.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -260,6 +261,7 @@ panvk_per_arch(CreateDescriptorPool)(
+    if (desc_count) {
+       /* adjust desc_count to account for 1 dummy sampler per descriptor set */
+       desc_count += pool->max_sets;
++      desc_count = MAX2(desc_count * 2, pool->max_sets * 256);
+ 
+       uint64_t pool_size = desc_count * PANVK_DESCRIPTOR_SIZE;
+       VkResult result = panvk_priv_bo_create(device, pool_size, 0,
+@@ -271,7 +273,8 @@ panvk_per_arch(CreateDescriptorPool)(
+       }
+       uint64_t bo_size = pool->desc_bo->bo->size;
+       assert(pool_size <= bo_size);
+-      util_vma_heap_init(&pool->desc_heap, pool->desc_bo->addr.dev, bo_size);
++      uint64_t heap_start = pool->desc_bo->addr.dev ? pool->desc_bo->addr.dev : PANVK_DESCRIPTOR_SIZE;
++      util_vma_heap_init(&pool->desc_heap, heap_start, bo_size);
+    }
+ 
+    *pDescriptorPool = panvk_descriptor_pool_to_handle(pool);
+@@ -341,15 +344,21 @@ panvk_desc_pool_allocate_set(struct panvk_descriptor_pool *pool,
+    uint64_t descs_size = num_descs * PANVK_DESCRIPTOR_SIZE;
+    uint32_t first_free_set =
+       __bitset_ffs(pool->free_sets, BITSET_WORDS(pool->max_sets));
+-   if (first_free_set == 0 || pool->desc_heap.free_size < descs_size)
++   if (first_free_set == 0 || pool->desc_heap.free_size < descs_size) {
++      mesa_loge("panvk: descriptor pool OOM: first_free_set=%u, free_size=%" PRIu64 ", descs_size=%" PRIu64 ", max_sets=%u",
++                first_free_set, pool->desc_heap.free_size, descs_size, pool->max_sets);
+       return panvk_error(pool, VK_ERROR_OUT_OF_POOL_MEMORY);
++   }
+ 
+    uint64_t descs_dev_addr = 0;
+    if (num_descs) {
+       descs_dev_addr = util_vma_heap_alloc(&pool->desc_heap, descs_size,
+                                            PANVK_DESCRIPTOR_SIZE);
+-      if (!descs_dev_addr)
++      if (!descs_dev_addr) {
++         mesa_loge("panvk: descriptor pool fragmented: descs_size=%" PRIu64 ", free_size=%" PRIu64,
++                   descs_size, pool->desc_heap.free_size);
+          return panvk_error(pool, VK_ERROR_FRAGMENTED_POOL);
++      }
+    }
+    struct panvk_descriptor_set *set = &pool->sets[first_free_set - 1];
+ 
 diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
 index 97398a2..dd78dd3 100644
 --- a/src/panfrost/vulkan/panvk_vX_device.c
