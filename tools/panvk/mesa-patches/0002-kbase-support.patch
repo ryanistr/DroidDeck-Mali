@@ -325,7 +325,7 @@ index 7a01f23..8f7812d 100644
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..7089234 100644
+index 0d8413c..0a6fd31 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -18,6 +18,7 @@
@@ -356,16 +356,48 @@ index 0d8413c..7089234 100644
     }
  
     device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
-@@ -229,6 +237,8 @@ get_device_extensions(const struct panvk_physical_device *device,
+@@ -207,9 +215,12 @@ get_device_extensions(const struct panvk_physical_device *device,
+       .KHR_maintenance3 = true,
+       .KHR_pipeline_executable_properties = true,
+       .KHR_pipeline_library = true,
++      .KHR_present_id = true,
++      .KHR_present_wait = true,
+       .KHR_push_descriptor = true,
+       .KHR_relaxed_block_layout = true,
+       .KHR_sampler_mirror_clamp_to_edge = true,
++      .KHR_sampler_ycbcr_conversion = true,
+       .KHR_shader_expect_assume = true,
+       .KHR_storage_buffer_storage_class = true,
+ #ifdef PANVK_USE_WSI_PLATFORM
+@@ -229,6 +240,9 @@ get_device_extensions(const struct panvk_physical_device *device,
        .EXT_pipeline_creation_cache_control = true,
        .EXT_pipeline_creation_feedback = true,
        .EXT_private_data = true,
 +      .EXT_queue_family_foreign = true,
 +      .EXT_robustness2 = true,
++      .EXT_scalar_block_layout = true,
        .EXT_shader_module_identifier = true,
        .EXT_vertex_attribute_divisor = true,
        .GOOGLE_decorate_string = true,
-@@ -376,6 +386,11 @@ get_features(const struct panvk_physical_device *device,
+@@ -270,7 +284,7 @@ get_features(const struct panvk_physical_device *device,
+       .variablePointersStorageBuffer = true,
+       .variablePointers = true,
+       .protectedMemory = false,
+-      .samplerYcbcrConversion = false,
++      .samplerYcbcrConversion = true,
+       .shaderDrawParameters = false,
+ 
+       /* Vulkan 1.2 */
+@@ -307,7 +321,7 @@ get_features(const struct panvk_physical_device *device,
+       .runtimeDescriptorArray = false,
+ 
+       .samplerFilterMinmax = false,
+-      .scalarBlockLayout = false,
++      .scalarBlockLayout = true,
+       .imagelessFramebuffer = false,
+       .uniformBufferStandardLayout = false,
+       .shaderSubgroupExtendedTypes = false,
+@@ -376,6 +390,17 @@ get_features(const struct panvk_physical_device *device,
  
        /* VK_EXT_shader_module_identifier */
        .shaderModuleIdentifier = true,
@@ -374,10 +406,16 @@ index 0d8413c..7089234 100644
 +      .robustBufferAccess2 = true,
 +      .robustImageAccess2 = true,
 +      .nullDescriptor = true,
++
++      /* VK_KHR_present_id */
++      .presentId = true,
++
++      /* VK_KHR_present_wait */
++      .presentWait = true,
     };
  }
  
-@@ -739,6 +754,10 @@ get_device_properties(const struct panvk_instance *instance,
+@@ -739,6 +764,10 @@ get_device_properties(const struct panvk_instance *instance,
        .maxVertexAttribDivisor = UINT32_MAX,
        .supportsNonZeroFirstInstance = false,
  
@@ -388,7 +426,7 @@ index 0d8413c..7089234 100644
        /* VK_KHR_push_descriptor */
        .maxPushDescriptors = MAX_PUSH_DESCRIPTORS,
     };
-@@ -771,11 +790,19 @@ get_device_properties(const struct panvk_instance *instance,
+@@ -771,11 +800,19 @@ get_device_properties(const struct panvk_instance *instance,
        properties->drmHasPrimary = true;
        properties->drmPrimaryMajor = major(device->drm.primary_rdev);
        properties->drmPrimaryMinor = minor(device->drm.primary_rdev);
@@ -408,7 +446,7 @@ index 0d8413c..7089234 100644
     }
  
     /* VK_EXT_shader_module_identifier */
-@@ -803,7 +830,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -803,7 +840,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  {
     VkResult result;
  
@@ -422,7 +460,7 @@ index 0d8413c..7089234 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -811,6 +843,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -811,6 +853,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  
     device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
                                        device->kmod.props.gpu_variant);
@@ -436,7 +474,7 @@ index 0d8413c..7089234 100644
  
     unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
  
-@@ -826,9 +865,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -826,9 +875,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
        goto fail;
     }
  
@@ -478,3 +516,16 @@ index 096ce4c..6ca0539 100644
  }
  
  VkResult panvk_physical_device_init(struct panvk_physical_device *device,
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 60af69b..c932236 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -140,7 +140,7 @@ vk_device_init(struct vk_device *device,
+    VkResult result =
+       vk_physical_device_check_device_features(physical_device,
+                                                pCreateInfo);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS && result != VK_ERROR_FEATURE_NOT_PRESENT)
+       return result;
+ 
+    collect_enabled_features(device, pCreateInfo);
