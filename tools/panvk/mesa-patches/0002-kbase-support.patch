@@ -12,10 +12,10 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..f3406fc
+index 0000000..a2539bd
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,172 @@
 +#include <dlfcn.h>
 +#include <fcntl.h>
 +#include <unistd.h>
@@ -170,16 +170,36 @@ index 0000000..f3406fc
 +   if (!submit_fn) return -1;
 +   return submit_fn(kdev->rust_dev, submit);
 +}
++
++uint64_t pan_kbase_get_primary_rdev(struct pan_kmod_dev *dev)
++{
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   if (!kdev || !kdev->rust_lib) return 0;
++   uint64_t (*fn)(void *) = dlsym(kdev->rust_lib, "panvk_kbase_get_drm_primary_rdev");
++   if (fn) return fn(kdev->rust_dev);
++   return 0;
++}
++
++uint64_t pan_kbase_get_render_rdev(struct pan_kmod_dev *dev)
++{
++   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)dev;
++   if (!kdev || !kdev->rust_lib) return 0;
++   uint64_t (*fn)(void *) = dlsym(kdev->rust_lib, "panvk_kbase_get_drm_render_rdev");
++   if (fn) return fn(kdev->rust_dev);
++   return 0;
++}
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
-index f75b009..4e24e53 100644
+index f75b009..296aca4 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
-@@ -483,6 +483,9 @@ pan_kmod_dev_create(int fd, uint32_t flags,
+@@ -483,6 +483,11 @@ pan_kmod_dev_create(int fd, uint32_t flags,
  
  void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
  
 +struct pan_kmod_dev * pan_kbase_kmod_dev_create(const struct pan_kmod_allocator *allocator);
 +int pan_kbase_jm_submit(struct pan_kmod_dev *dev, const void *submit);
++uint64_t pan_kbase_get_primary_rdev(struct pan_kmod_dev *dev);
++uint64_t pan_kbase_get_render_rdev(struct pan_kmod_dev *dev);
 +
  static inline void
  pan_kmod_dev_query_props(const struct pan_kmod_dev *dev,
@@ -305,7 +325,7 @@ index 7a01f23..8f7812d 100644
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..6d58d67 100644
+index 0d8413c..4a0c05a 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -18,6 +18,7 @@
@@ -336,7 +356,27 @@ index 0d8413c..6d58d67 100644
     }
  
     device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
-@@ -803,7 +811,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -771,11 +779,19 @@ get_device_properties(const struct panvk_instance *instance,
+       properties->drmHasPrimary = true;
+       properties->drmPrimaryMajor = major(device->drm.primary_rdev);
+       properties->drmPrimaryMinor = minor(device->drm.primary_rdev);
++   } else {
++      properties->drmHasPrimary = true;
++      properties->drmPrimaryMajor = 226;
++      properties->drmPrimaryMinor = 0;
+    }
+    if (device->drm.render_rdev) {
+       properties->drmHasRender = true;
+       properties->drmRenderMajor = major(device->drm.render_rdev);
+       properties->drmRenderMinor = minor(device->drm.render_rdev);
++   } else {
++      properties->drmHasRender = true;
++      properties->drmRenderMajor = properties->drmPrimaryMajor;
++      properties->drmRenderMinor = properties->drmPrimaryMinor;
+    }
+ 
+    /* VK_EXT_shader_module_identifier */
+@@ -803,7 +819,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  {
     VkResult result;
  
@@ -350,7 +390,7 @@ index 0d8413c..6d58d67 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -811,6 +824,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -811,6 +832,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  
     device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
                                        device->kmod.props.gpu_variant);
@@ -364,7 +404,7 @@ index 0d8413c..6d58d67 100644
  
     unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
  
-@@ -826,9 +846,11 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -826,9 +854,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
        goto fail;
     }
  
@@ -375,6 +415,20 @@ index 0d8413c..6d58d67 100644
 +      result = get_drm_device_ids(device, instance, drm_device);
 +      if (result != VK_SUCCESS)
 +         goto fail;
++   } else {
++      device->drm.primary_rdev = pan_kbase_get_primary_rdev(device->kmod.dev);
++      device->drm.render_rdev = pan_kbase_get_render_rdev(device->kmod.dev);
++      if (!device->drm.primary_rdev) {
++         struct stat st;
++         if (stat("/dev/dri/card0", &st) == 0) {
++            device->drm.primary_rdev = st.st_rdev;
++         } else {
++            device->drm.primary_rdev = makedev(226, 0);
++         }
++      }
++      if (!device->drm.render_rdev) {
++         device->drm.render_rdev = device->drm.primary_rdev;
++      }
 +   }
  
     device->formats.all = panfrost_format_table(arch);

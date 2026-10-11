@@ -6,7 +6,7 @@
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use libc::{c_int, c_void, c_char, size_t};
+use libc::{c_int, c_void, size_t};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::fs::OpenOptions;
 
@@ -450,6 +450,28 @@ pub extern "C" fn panvk_kbase_get_props(
     0
 }
 
+#[no_mangle]
+pub extern "C" fn panvk_kbase_get_drm_primary_rdev(_dev: *mut c_void) -> u64 {
+    let path = std::ffi::CString::new("/dev/dri/card0").unwrap();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path.as_ptr(), &mut stat) } == 0 {
+        stat.st_rdev
+    } else {
+        libc::makedev(226, 0)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn panvk_kbase_get_drm_render_rdev(dev: *mut c_void) -> u64 {
+    let path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path.as_ptr(), &mut stat) } == 0 {
+        stat.st_rdev
+    } else {
+        panvk_kbase_get_drm_primary_rdev(dev)
+    }
+}
+
 #[repr(C)]
 pub struct drm_panfrost_submit {
     pub jc: u64,
@@ -494,7 +516,7 @@ pub extern "C" fn panvk_kbase_submit(
     atom.atom_number = 1; // Just use 1 for now
     atom.prio = 1; // Medium priority
 
-    let mut kbase_submit = kbase_ioctl_job_submit {
+    let kbase_submit = kbase_ioctl_job_submit {
         addr: &mut atom as *mut _ as u64,
         nr_atoms: 1,
         stride: std::mem::size_of::<base_jd_atom_v2>() as u32,
@@ -504,7 +526,6 @@ pub extern "C" fn panvk_kbase_submit(
         libc::ioctl(
             kbase_dev.fd.as_raw_fd(),
             KBASE_IOCTL_JOB_SUBMIT as _,
-
             &kbase_submit,
         )
     };

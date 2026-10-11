@@ -179,6 +179,31 @@ int drmCloseBufferHandle(int fd, uint32_t handle) {
   return release_handle(fd, handle) ? 0 : -EINVAL;
 }
 
+#define DRM_NODE_PRIMARY 0
+#define DRM_NODE_CONTROL 1
+#define DRM_NODE_RENDER  2
+
+typedef struct _drmDevice {
+  char **nodes;
+  int available_nodes;
+} *drmDevicePtr;
+
+int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device) {
+  int (*fn)(dev_t, uint32_t, drmDevicePtr *) = (int (*)(dev_t, uint32_t, drmDevicePtr *)) real("drmGetDeviceFromDevId");
+  if (!fn) {
+    return -ENOSYS;
+  }
+  int ret = fn(dev_id, flags, device);
+  if (ret == 0 && device && *device) {
+    if (!((*device)->available_nodes & (1 << DRM_NODE_RENDER)) &&
+        ((*device)->available_nodes & (1 << DRM_NODE_PRIMARY))) {
+      (*device)->available_nodes |= (1 << DRM_NODE_RENDER);
+      (*device)->nodes[DRM_NODE_RENDER] = (*device)->nodes[DRM_NODE_PRIMARY];
+    }
+  }
+  return ret;
+}
+
 /*
  * Zink gives its handles back with the GEM_CLOSE ioctl itself, not drmCloseBufferHandle
  * (zink_bo.c, bo_destroy). KGSL refuses the ioctl, so the duplicated descriptor stayed open and
