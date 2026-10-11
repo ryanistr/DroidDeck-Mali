@@ -277,12 +277,18 @@ if [ -z "${BL_INSIDE:-}" ]; then
     args+=(--mangoapp)
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
-  export PANVK_DEBUG=startup,trace,sync
+  if [ -e /dev/mali0 ]; then
+    mkdir -p /dev/dri 2>/dev/null || true
+    [ -e /dev/dri/card0 ] || ln -sf /dev/mali0 /dev/dri/card0 2>/dev/null || true
+    [ -e /dev/dri/renderD128 ] || ln -sf /dev/mali0 /dev/dri/renderD128 2>/dev/null || true
+  fi
+  export PANVK_DEBUG=startup
   export VK_LOADER_DEBUG=all
+  export WAYLAND_DEBUG=1
   ulimit -c unlimited 2>/dev/null || true
   export BL_INSIDE=1
   echo "== gamescope launching: gamescope ${args[@]} -- $0 $mode $@"
-  gamescope "${args[@]}" -- "$0" "$mode" "$@"
+  stdbuf -oL -eL gamescope "${args[@]}" -- "$0" "$mode" "$@"
   _gs_rc=$?
   echo "== gamescope exited with code: $_gs_rc"
   exit $_gs_rc

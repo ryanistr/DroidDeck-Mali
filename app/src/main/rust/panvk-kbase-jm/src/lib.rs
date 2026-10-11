@@ -9,6 +9,7 @@
 use libc::{c_int, c_void, size_t};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
 // Kbase UAPI — MT6893 mali_kbase (ioctl type 0x80, JM UAPI v11)
@@ -114,42 +115,108 @@ impl Default for kbase_ioctl_job_submit {
         Self {
             addr: 0,
             nr_atoms: 0,
-            stride: std::mem::size_of::<base_jd_atom_v2>() as u32,
+            stride: std::mem::size_of::<KbaseAtom72>() as u32,
         }
     }
 }
 
-// base_jd_atom_v2 — the JM submission unit
-#[repr(C)]
+// base_dependency — dependency pair
+#[repr(C, packed)]
 #[derive(Debug, Default, Clone, Copy)]
-struct base_jd_atom_v2 {
-    jc: u64,
-    udata: base_jd_udata,
-    extres_list: u64,
-    nr_extres: u16,
-    compat_core_req: u32,
-    pre_dep: [base_dependency; 2],
-    atom_number: u8,
-    prio: u8,
-    device_nr: u8,
-    jobslot: u8,
-    core_req: u32,
-    renderpass_id: u8,
-    _padding: [u8; 7],
+pub struct base_dependency {
+    pub atom_id: u8,
+    pub dependency_type: u8,
 }
 
-#[repr(C)]
+// KbaseAtom72 — MT6893 vendor r49 packed layout (72 bytes)
+#[repr(C, packed)]
 #[derive(Debug, Default, Clone, Copy)]
-struct base_jd_udata {
-    blob: [u64; 2],
+pub struct KbaseAtom72 {
+    pub seq_nr: u64,                     // 0..8
+    pub jc: u64,                         // 8..16
+    pub udata: [u64; 2],                 // 16..32
+    pub extres_list: u64,                // 32..40
+    pub nr_extres: u16,                  // 40..42
+    pub jit_id: [u8; 2],                 // 42..44
+    pub pre_dep: [base_dependency; 2],   // 44..48 (2 x 2 bytes)
+    pub atom_number: u8,                 // 48 (0x30)
+    pub prio: u8,                        // 49 (0x31)
+    pub device_nr: u8,                   // 50 (0x32)
+    pub jobslot: u8,                     // 51 (0x33)
+    pub core_req: u32,                   // 52..56 (0x34..0x38)
+    pub renderpass_id: u8,               // 56 (0x38)
+    pub padding: [u8; 7],                // 57..64
+    pub frame_nr: u32,                   // 64..68
+    pub pad2: u32,                       // 68..72
 }
 
-#[repr(C)]
+// KbaseAtom64 — standard v11 JM layout without seq_nr (64 bytes)
+#[repr(C, packed)]
 #[derive(Debug, Default, Clone, Copy)]
-struct base_dependency {
-    atom_id: u8,
-    dependency_type: u8,
+pub struct KbaseAtom64 {
+    pub jc: u64,                         // 0..8
+    pub udata: [u64; 2],                 // 8..24
+    pub extres_list: u64,                // 24..32
+    pub nr_extres: u16,                  // 32..34
+    pub jit_id: [u8; 2],                 // 34..36
+    pub pre_dep: [base_dependency; 2],   // 36..40
+    pub atom_number: u8,                 // 40
+    pub prio: u8,                        // 41
+    pub device_nr: u8,                   // 42
+    pub jobslot: u8,                     // 43
+    pub core_req: u32,                   // 44..48
+    pub renderpass_id: u8,               // 48
+    pub padding: [u8; 7],                // 49..56
+    pub frame_nr: u32,                   // 56..60
+    pub pad2: u32,                       // 60..64
 }
+
+// KbaseAtom56 — legacy v10 JM layout (56 bytes)
+#[repr(C, packed)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KbaseAtom56 {
+    pub jc: u64,                         // 0..8
+    pub udata: [u64; 2],                 // 8..24
+    pub extres_list: u64,                // 24..32
+    pub nr_extres: u16,                  // 32..34
+    pub jit_id: [u8; 2],                 // 34..36
+    pub pre_dep: [base_dependency; 2],   // 36..40
+    pub atom_number: u8,                 // 40
+    pub prio: u8,                        // 41
+    pub device_nr: u8,                   // 42
+    pub jobslot: u8,                     // 43
+    pub core_req: u32,                   // 44..48
+    pub padding: [u8; 8],                // 48..56
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct base_jd_event_v2 {
+    pub event_code: u32,                 // 0..4
+    pub atom_number: u8,                 // 4..5
+    pub padding: [u8; 3],                // 5..8
+    pub udata: [u64; 2],                 // 8..24
+}
+
+// JD core requirements
+pub const BASE_JD_REQ_DEP: u32 = 0;
+pub const BASE_JD_REQ_FS: u32  = 1 << 0; // 0x001: Fragment shader job
+pub const BASE_JD_REQ_CS: u32  = 1 << 1; // 0x002: Compute shader job
+pub const BASE_JD_REQ_T: u32   = 1 << 2; // 0x004: Tiling job
+pub const BASE_JD_REQ_CF: u32  = 1 << 3; // 0x008: Cache flush
+pub const BASE_JD_REQ_V: u32   = 1 << 4; // 0x010: Value writeback job
+
+// JD event codes
+pub const BASE_JD_EVENT_DONE: u32               = 0x01;
+pub const BASE_JD_EVENT_STOPPED: u32            = 0x02;
+pub const BASE_JD_EVENT_TERMINATED: u32         = 0x03;
+pub const BASE_JD_EVENT_ACTIVE: u32             = 0x04;
+pub const BASE_JD_EVENT_JOB_CONFIG_FAULT: u32   = 0x40;
+pub const BASE_JD_EVENT_JOB_POWER_FAULT: u32    = 0x48;
+pub const BASE_JD_EVENT_JOB_READ_FAULT: u32     = 0x50;
+pub const BASE_JD_EVENT_MEM_GROWTH_FAILED: u32  = 0x58;
+pub const BASE_JD_EVENT_JOB_CANCELLED: u32      = 0x80;
+
 
 // Memory allocation flags
 const BASE_MEM_PROT_CPU_RD: u64 = 1 << 0;
@@ -518,6 +585,191 @@ pub struct drm_panfrost_submit {
     pub requirements: u32,
 }
 
+static WINNING_STRIDE: AtomicU32 = AtomicU32::new(0);
+static ATOM_COUNTER: AtomicU8 = AtomicU8::new(1);
+static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn event_code_str(code: u32) -> &'static str {
+    match code {
+        BASE_JD_EVENT_DONE => "DONE",
+        BASE_JD_EVENT_STOPPED => "STOPPED",
+        BASE_JD_EVENT_TERMINATED => "TERMINATED",
+        BASE_JD_EVENT_ACTIVE => "ACTIVE",
+        BASE_JD_EVENT_JOB_CONFIG_FAULT => "JOB_CONFIG_FAULT",
+        BASE_JD_EVENT_JOB_POWER_FAULT => "JOB_POWER_FAULT",
+        BASE_JD_EVENT_JOB_READ_FAULT => "JOB_READ_FAULT",
+        BASE_JD_EVENT_MEM_GROWTH_FAILED => "MEM_GROWTH_FAILED",
+        BASE_JD_EVENT_JOB_CANCELLED => "JOB_CANCELLED",
+        _ => "UNKNOWN_FAULT",
+    }
+}
+
+fn parse_u32_env(name: &str) -> Option<u32> {
+    let val = std::env::var(name).ok()?;
+    let trimmed = val.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+fn get_frag_core_req() -> u32 {
+    parse_u32_env("PANVK_KBASE_FRAG_CORE")
+        .unwrap_or(BASE_JD_REQ_FS | BASE_JD_REQ_CS) // 0x003
+}
+
+fn get_vtc_core_req() -> u32 {
+    parse_u32_env("PANVK_KBASE_VTC_CORE")
+        .unwrap_or(BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V) // 0x016
+}
+
+fn submit_with_stride(
+    fd: c_int,
+    jc: u64,
+    core_req: u32,
+    jobslot: u8,
+    atom_num: u8,
+    seq_num: u64,
+    stride: u32,
+) -> Result<u32, std::io::Error> {
+    match stride {
+        72 => {
+            let mut atom = KbaseAtom72 {
+                seq_nr: seq_num,
+                jc,
+                udata: [0, 0],
+                extres_list: 0,
+                nr_extres: 0,
+                jit_id: [0, 0],
+                pre_dep: [base_dependency::default(); 2],
+                atom_number: atom_num,
+                prio: 1,
+                device_nr: 0,
+                jobslot,
+                core_req,
+                renderpass_id: 0,
+                padding: [0; 7],
+                frame_nr: 1,
+                pad2: 0,
+            };
+            let submit = kbase_ioctl_job_submit {
+                addr: &mut atom as *mut _ as u64,
+                nr_atoms: 1,
+                stride: 72,
+            };
+            let ret = unsafe { libc::ioctl(fd, KBASE_IOCTL_JOB_SUBMIT as _, &submit) };
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(72)
+        }
+        56 => {
+            let mut atom = KbaseAtom56 {
+                jc,
+                udata: [0, 0],
+                extres_list: 0,
+                nr_extres: 0,
+                jit_id: [0, 0],
+                pre_dep: [base_dependency::default(); 2],
+                atom_number: atom_num,
+                prio: 1,
+                device_nr: 0,
+                jobslot,
+                core_req,
+                padding: [0; 8],
+            };
+            let submit = kbase_ioctl_job_submit {
+                addr: &mut atom as *mut _ as u64,
+                nr_atoms: 1,
+                stride: 56,
+            };
+            let ret = unsafe { libc::ioctl(fd, KBASE_IOCTL_JOB_SUBMIT as _, &submit) };
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(56)
+        }
+        64 => {
+            let mut atom = KbaseAtom64 {
+                jc,
+                udata: [0, 0],
+                extres_list: 0,
+                nr_extres: 0,
+                jit_id: [0, 0],
+                pre_dep: [base_dependency::default(); 2],
+                atom_number: atom_num,
+                prio: 1,
+                device_nr: 0,
+                jobslot,
+                core_req,
+                renderpass_id: 0,
+                padding: [0; 7],
+                frame_nr: 1,
+                pad2: 0,
+            };
+            let submit = kbase_ioctl_job_submit {
+                addr: &mut atom as *mut _ as u64,
+                nr_atoms: 1,
+                stride: 64,
+            };
+            let ret = unsafe { libc::ioctl(fd, KBASE_IOCTL_JOB_SUBMIT as _, &submit) };
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(64)
+        }
+        other => {
+            eprintln!("panvk-kbase: unsupported stride {}", other);
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        }
+    }
+}
+
+fn submit_atom(
+    fd: c_int,
+    jc: u64,
+    core_req: u32,
+    jobslot: u8,
+    atom_num: u8,
+    seq_num: u64,
+) -> Result<u32, std::io::Error> {
+    if let Some(forced_stride) = parse_u32_env("PANVK_KBASE_STRIDE") {
+        return submit_with_stride(fd, jc, core_req, jobslot, atom_num, seq_num, forced_stride);
+    }
+
+    let winning = WINNING_STRIDE.load(Ordering::Relaxed);
+    if winning != 0 {
+        return submit_with_stride(fd, jc, core_req, jobslot, atom_num, seq_num, winning);
+    }
+
+    // Auto-detect stride: try 72 first, then 56, then 64
+    match submit_with_stride(fd, jc, core_req, jobslot, atom_num, seq_num, 72) {
+        Ok(s) => {
+            WINNING_STRIDE.store(72, Ordering::Relaxed);
+            eprintln!("panvk-kbase: JOB_SUBMIT auto-detected stride 72 (MTK vendor packed)");
+            Ok(s)
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            match submit_with_stride(fd, jc, core_req, jobslot, atom_num, seq_num, 56) {
+                Ok(s) => {
+                    WINNING_STRIDE.store(56, Ordering::Relaxed);
+                    eprintln!("panvk-kbase: JOB_SUBMIT auto-detected stride 56");
+                    Ok(s)
+                }
+                Err(e2) if e2.raw_os_error() == Some(libc::EINVAL) => {
+                    let s = submit_with_stride(fd, jc, core_req, jobslot, atom_num, seq_num, 64)?;
+                    WINNING_STRIDE.store(64, Ordering::Relaxed);
+                    eprintln!("panvk-kbase: JOB_SUBMIT auto-detected stride 64");
+                    Ok(s)
+                }
+                Err(e2) => Err(e2),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn panvk_kbase_submit(
     dev: *mut c_void,
@@ -532,44 +784,157 @@ pub extern "C" fn panvk_kbase_submit(
 
     // Map requirements
     let is_fragment = (sub.requirements & 1) != 0; // PANFROST_JD_REQ_FS
-    let core_req = if is_fragment {
-        1 << 0 // BASE_JD_REQ_FS
+    let (core_req, jobslot) = if is_fragment {
+        (get_frag_core_req(), JS_FRAGMENT)
     } else {
-        (1 << 1) | (1 << 2) // BASE_JD_REQ_CS | BASE_JD_REQ_T
-    };
-    let jobslot = if is_fragment {
-        JS_FRAGMENT
-    } else {
-        JS_COMPUTE_TILER
+        (get_vtc_core_req(), JS_COMPUTE_TILER)
     };
 
-    let mut atom = base_jd_atom_v2::default();
-    atom.jc = sub.jc;
-    atom.core_req = core_req;
-    atom.compat_core_req = core_req;
-    atom.jobslot = jobslot;
-    atom.atom_number = 1; // Just use 1 for now
-    atom.prio = 1; // Medium priority
-
-    let kbase_submit = kbase_ioctl_job_submit {
-        addr: &mut atom as *mut _ as u64,
-        nr_atoms: 1,
-        stride: std::mem::size_of::<base_jd_atom_v2>() as u32,
+    let atom_num = {
+        let n = ATOM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n == 0 { 1 } else { n }
     };
+    let seq_num = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    let ret = unsafe {
-        libc::ioctl(
-            kbase_dev.fd.as_raw_fd(),
-            KBASE_IOCTL_JOB_SUBMIT as _,
-            &kbase_submit,
-        )
-    };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        eprintln!("panvk-kbase: JOB_SUBMIT failed: {}", err);
+    if let Err(e) = submit_atom(
+        kbase_dev.fd.as_raw_fd(),
+        sub.jc,
+        core_req,
+        jobslot,
+        atom_num,
+        seq_num,
+    ) {
+        eprintln!("panvk-kbase: JOB_SUBMIT failed (slot {}): {}", jobslot, e);
         return -1;
     }
 
+    // Synchronously wait for completion event from /dev/mali0
+    let mut pfd = libc::pollfd {
+        fd: kbase_dev.fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let pret = unsafe { libc::poll(&mut pfd, 1, 3000) };
+    if pret <= 0 {
+        if pret == 0 {
+            eprintln!(
+                "panvk-kbase: timeout (3000ms) waiting for atom {} completion (slot {})",
+                atom_num, jobslot
+            );
+        } else {
+            eprintln!("panvk-kbase: poll error: {}", std::io::Error::last_os_error());
+        }
+        return -1;
+    }
+
+    let mut event = base_jd_event_v2::default();
+    let rret = unsafe {
+        libc::read(
+            kbase_dev.fd.as_raw_fd(),
+            &mut event as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<base_jd_event_v2>(),
+        )
+    };
+    if rret < 0 {
+        eprintln!("panvk-kbase: read event failed: {}", std::io::Error::last_os_error());
+        return -1;
+    }
+
+    let event_code = event.event_code;
+    let event_atom = event.atom_number;
+
+    if event_code != BASE_JD_EVENT_DONE {
+        eprintln!(
+            "panvk-kbase: atom {} failed with event_code 0x{:x} ({})",
+            event_atom,
+            event_code,
+            event_code_str(event_code),
+        );
+        return -1;
+    }
+
+
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_struct_sizes() {
+        assert_eq!(std::mem::size_of::<KbaseAtom72>(), 72);
+        assert_eq!(std::mem::size_of::<KbaseAtom64>(), 64);
+        assert_eq!(std::mem::size_of::<KbaseAtom56>(), 56);
+        assert_eq!(std::mem::size_of::<base_jd_event_v2>(), 24);
+        assert_eq!(std::mem::size_of::<kbase_ioctl_job_submit>(), 16);
+    }
+
+    #[test]
+    fn test_kbase_atom_72_offsets() {
+        let a = KbaseAtom72::default();
+        let base = &a as *const _ as usize;
+        assert_eq!(std::ptr::addr_of!(a.seq_nr) as usize - base, 0);
+        assert_eq!(std::ptr::addr_of!(a.jc) as usize - base, 8);
+        assert_eq!(std::ptr::addr_of!(a.udata) as usize - base, 16);
+        assert_eq!(std::ptr::addr_of!(a.extres_list) as usize - base, 32);
+        assert_eq!(std::ptr::addr_of!(a.nr_extres) as usize - base, 40);
+        assert_eq!(std::ptr::addr_of!(a.jit_id) as usize - base, 42);
+        assert_eq!(std::ptr::addr_of!(a.pre_dep) as usize - base, 44);
+        assert_eq!(std::ptr::addr_of!(a.atom_number) as usize - base, 48);
+        assert_eq!(std::ptr::addr_of!(a.prio) as usize - base, 49);
+        assert_eq!(std::ptr::addr_of!(a.device_nr) as usize - base, 50);
+        assert_eq!(std::ptr::addr_of!(a.jobslot) as usize - base, 51);
+        assert_eq!(std::ptr::addr_of!(a.core_req) as usize - base, 52);
+        assert_eq!(std::ptr::addr_of!(a.renderpass_id) as usize - base, 56);
+        assert_eq!(std::ptr::addr_of!(a.padding) as usize - base, 57);
+        assert_eq!(std::ptr::addr_of!(a.frame_nr) as usize - base, 64);
+        assert_eq!(std::ptr::addr_of!(a.pad2) as usize - base, 68);
+    }
+
+    #[test]
+    fn test_kbase_atom_56_offsets() {
+        let a = KbaseAtom56::default();
+        let base = &a as *const _ as usize;
+        assert_eq!(std::ptr::addr_of!(a.jc) as usize - base, 0);
+        assert_eq!(std::ptr::addr_of!(a.udata) as usize - base, 8);
+        assert_eq!(std::ptr::addr_of!(a.extres_list) as usize - base, 24);
+        assert_eq!(std::ptr::addr_of!(a.nr_extres) as usize - base, 32);
+        assert_eq!(std::ptr::addr_of!(a.jit_id) as usize - base, 34);
+        assert_eq!(std::ptr::addr_of!(a.pre_dep) as usize - base, 36);
+        assert_eq!(std::ptr::addr_of!(a.atom_number) as usize - base, 40);
+        assert_eq!(std::ptr::addr_of!(a.prio) as usize - base, 41);
+        assert_eq!(std::ptr::addr_of!(a.device_nr) as usize - base, 42);
+        assert_eq!(std::ptr::addr_of!(a.jobslot) as usize - base, 43);
+        assert_eq!(std::ptr::addr_of!(a.core_req) as usize - base, 44);
+        assert_eq!(std::ptr::addr_of!(a.padding) as usize - base, 48);
+    }
+
+    #[test]
+    fn test_kbase_atom_64_offsets() {
+        let a = KbaseAtom64::default();
+        let base = &a as *const _ as usize;
+        assert_eq!(std::ptr::addr_of!(a.jc) as usize - base, 0);
+        assert_eq!(std::ptr::addr_of!(a.udata) as usize - base, 8);
+        assert_eq!(std::ptr::addr_of!(a.extres_list) as usize - base, 24);
+        assert_eq!(std::ptr::addr_of!(a.nr_extres) as usize - base, 32);
+        assert_eq!(std::ptr::addr_of!(a.jit_id) as usize - base, 34);
+        assert_eq!(std::ptr::addr_of!(a.pre_dep) as usize - base, 36);
+        assert_eq!(std::ptr::addr_of!(a.atom_number) as usize - base, 40);
+        assert_eq!(std::ptr::addr_of!(a.prio) as usize - base, 41);
+        assert_eq!(std::ptr::addr_of!(a.device_nr) as usize - base, 42);
+        assert_eq!(std::ptr::addr_of!(a.jobslot) as usize - base, 43);
+        assert_eq!(std::ptr::addr_of!(a.core_req) as usize - base, 44);
+        assert_eq!(std::ptr::addr_of!(a.renderpass_id) as usize - base, 48);
+        assert_eq!(std::ptr::addr_of!(a.padding) as usize - base, 49);
+        assert_eq!(std::ptr::addr_of!(a.frame_nr) as usize - base, 56);
+        assert_eq!(std::ptr::addr_of!(a.pad2) as usize - base, 60);
+    }
+
+    #[test]
+    fn test_core_req_defaults() {
+        assert_eq!(get_frag_core_req(), 0x003);
+        assert_eq!(get_vtc_core_req(), 0x016);
+    }
+}
+
