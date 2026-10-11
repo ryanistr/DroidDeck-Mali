@@ -14,11 +14,49 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define MAX_HANDLES 4096
+
+struct dma_heap_allocation_data {
+  uint64_t len;
+  uint32_t fd;
+  uint32_t fd_flags;
+  uint64_t heap_flags;
+};
+#define DMA_HEAP_IOC_MAGIC 'H'
+#define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+
+static int alloc_dma_buf(size_t len) {
+  int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+  int dma_fd = -1;
+  if (heap_fd >= 0) {
+    struct dma_heap_allocation_data data = {
+      .len = len > 0 ? len : 4096,
+      .fd = 0,
+      .fd_flags = O_RDWR | O_CLOEXEC,
+      .heap_flags = 0,
+    };
+    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) == 0) {
+      dma_fd = data.fd;
+    }
+    close(heap_fd);
+  }
+  if (dma_fd < 0) {
+    dma_fd = memfd_create("dma-buf-fallback", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (dma_fd >= 0) {
+      if (ftruncate(dma_fd, len > 0 ? len : 4096) != 0) {
+        close(dma_fd);
+        dma_fd = -1;
+      }
+    }
+  }
+  return dma_fd;
+}
 
 /* DRM_IOCTL_GEM_CLOSE from drm.h: _IOW('d', 0x09, struct drm_gem_close { u32 handle, pad; }). */
 struct gem_close {
@@ -121,12 +159,22 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
     int (*fn)(int, int, uint32_t *) = (int (*)(int, int, uint32_t *)) real("drmPrimeFDToHandle");
     return fn ? fn(fd, prime_fd, handle) : -ENOSYS;
   }
+  pthread_mutex_lock(&lock);
+  for (int i = 0; i < MAX_HANDLES; i++) {
+    if (handle_entries[i].handle != 0 &&
+        same_file_description(handle_entries[i].drm_fd, fd) &&
+        same_file_description(handle_entries[i].dma_fd, prime_fd)) {
+      *handle = handle_entries[i].handle;
+      pthread_mutex_unlock(&lock);
+      return 0;
+    }
+  }
   int dup_fd = fcntl(prime_fd, F_DUPFD_CLOEXEC, 0);
   if (dup_fd < 0) {
+    pthread_mutex_unlock(&lock);
     return -errno;
   }
   int ret = -ENOMEM;
-  pthread_mutex_lock(&lock);
   for (int i = 0; i < MAX_HANDLES; i++) {
     if (handle_entries[i].handle == 0) {
       uint32_t token = alloc_handle_locked();
@@ -156,6 +204,23 @@ int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
   int ret = -EINVAL;
   pthread_mutex_lock(&lock);
   int index = find_handle_locked(fd, handle);
+  if (index < 0) {
+    int dma_fd = alloc_dma_buf(16 * 1024 * 1024);
+    if (dma_fd >= 0) {
+      for (int i = 0; i < MAX_HANDLES; i++) {
+        if (handle_entries[i].handle == 0) {
+          handle_entries[i].handle = handle;
+          handle_entries[i].dma_fd = dma_fd;
+          handle_entries[i].drm_fd = fd;
+          index = i;
+          break;
+        }
+      }
+      if (index < 0) {
+        close(dma_fd);
+      }
+    }
+  }
   if (index >= 0) {
     *prime_fd = fcntl(handle_entries[index].dma_fd, F_DUPFD_CLOEXEC, 0);
     ret = *prime_fd < 0 ? -errno : 0;
@@ -201,42 +266,59 @@ typedef struct _drmDevice {
 } *drmDevicePtr;
 
 static drmDevicePtr alloc_fallback_drm_device(const char *node_path) {
-  size_t total = sizeof(struct _drmDevice) +
-                 DRM_NODE_MAX * sizeof(char *) +
-                 DRM_NODE_MAX * DRM_NODE_LEN;
-  drmDevicePtr dev = (drmDevicePtr) calloc(1, total);
+  drmDevicePtr dev = (drmDevicePtr) calloc(1, sizeof(struct _drmDevice));
   if (!dev) return NULL;
-  char *ptr = (char *)dev + sizeof(struct _drmDevice);
-  dev->nodes = (char **)ptr;
-  ptr += DRM_NODE_MAX * sizeof(char *);
+  dev->nodes = (char **) calloc(DRM_NODE_MAX, sizeof(char *));
+  if (!dev->nodes) {
+    free(dev);
+    return NULL;
+  }
   for (int i = 0; i < DRM_NODE_MAX; i++) {
-    dev->nodes[i] = ptr;
-    ptr += DRM_NODE_LEN;
+    dev->nodes[i] = (char *) calloc(1, DRM_NODE_LEN);
   }
   strncpy(dev->nodes[DRM_NODE_PRIMARY], node_path, DRM_NODE_LEN - 1);
   strncpy(dev->nodes[DRM_NODE_RENDER], node_path, DRM_NODE_LEN - 1);
   dev->available_nodes = (1 << DRM_NODE_PRIMARY) | (1 << DRM_NODE_RENDER);
-  dev->bustype = 0; /* DRM_BUS_PCI - no nested allocations to free */
+  dev->bustype = -1;
   return dev;
+}
+
+void drmFreeDevice(drmDevicePtr *device) {
+  if (!device || !*device) return;
+  drmDevicePtr d = *device;
+  if (d->nodes) {
+    for (int i = 0; i < DRM_NODE_MAX; i++) {
+      free(d->nodes[i]);
+    }
+    free(d->nodes);
+  }
+  free(d->businfo);
+  free(d->deviceinfo);
+  free(d);
+  *device = NULL;
+}
+
+void drmFreeDevices(drmDevicePtr devices[], int count) {
+  if (!devices) return;
+  for (int i = 0; i < count; i++) {
+    if (devices[i]) {
+      drmFreeDevice(&devices[i]);
+    }
+  }
 }
 
 static const char *get_fallback_node_path(void) {
   if (access("/dev/dri/renderD128", R_OK | W_OK) == 0) return "/dev/dri/renderD128";
-  if (access("/dev/dri/card0", R_OK | W_OK) == 0) return "/dev/dri/card0";
   if (access("/dev/mali0", R_OK | W_OK) == 0) return "/dev/mali0";
   if (access("/dev/kgsl-3d0", R_OK | W_OK) == 0) return "/dev/kgsl-3d0";
-  return "/dev/dri/card0";
+  if (access("/dev/dri/card0", R_OK | W_OK) == 0) return "/dev/dri/card0";
+  return "/dev/mali0";
 }
 
 int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device) {
   int (*fn)(dev_t, uint32_t, drmDevicePtr *) = (int (*)(dev_t, uint32_t, drmDevicePtr *)) real("drmGetDeviceFromDevId");
   int ret = fn ? fn(dev_id, flags, device) : -1;
   if (ret == 0 && device && *device) {
-    if (!((*device)->available_nodes & (1 << DRM_NODE_RENDER)) &&
-        ((*device)->available_nodes & (1 << DRM_NODE_PRIMARY))) {
-      (*device)->available_nodes |= (1 << DRM_NODE_RENDER);
-      (*device)->nodes[DRM_NODE_RENDER] = (*device)->nodes[DRM_NODE_PRIMARY];
-    }
     return 0;
   }
   if (device) {
@@ -247,6 +329,22 @@ int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device) {
   }
   return ret;
 }
+
+struct gbm_device;
+struct gbm_device *gbm_create_device(int fd) {
+  struct stat st;
+  if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) {
+    if (major(st.st_rdev) == 226 && minor(st.st_rdev) == 0) {
+      return NULL;
+    }
+  }
+  if (is_non_drm_gpu(fd)) {
+    return NULL;
+  }
+  struct gbm_device *(*fn)(int) = (struct gbm_device *(*)(int)) real("gbm_create_device");
+  return fn ? fn(fd) : NULL;
+}
+
 
 
 /*

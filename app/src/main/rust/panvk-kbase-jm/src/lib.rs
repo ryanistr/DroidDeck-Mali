@@ -214,7 +214,7 @@ pub const BASE_JD_EVENT_ACTIVE: u32             = 0x04;
 pub const BASE_JD_EVENT_JOB_CONFIG_FAULT: u32   = 0x40;
 pub const BASE_JD_EVENT_JOB_POWER_FAULT: u32    = 0x48;
 pub const BASE_JD_EVENT_JOB_READ_FAULT: u32     = 0x50;
-pub const BASE_JD_EVENT_MEM_GROWTH_FAILED: u32  = 0x58;
+pub const BASE_JD_EVENT_DATA_INVALID_FAULT: u32 = 0x58;
 pub const BASE_JD_EVENT_JOB_CANCELLED: u32      = 0x80;
 
 
@@ -373,9 +373,9 @@ impl KbaseDevice {
                 eprintln!("GET_GPUPROPS (read) failed");
                 return Err(std::io::Error::last_os_error());
             }
-            // GPU ID is typically at offset 0 of the props buffer
-            // Parse the first u32 as product_id
-            0x7211
+            let id = parse_u32_env("PANVK_KBASE_GPU_ID").unwrap_or(0x9091) as u64;
+            eprintln!("panvk-kbase: initialized GPU ID 0x{:x}", id);
+            id
         };
 
         Ok(Self {
@@ -598,7 +598,7 @@ fn event_code_str(code: u32) -> &'static str {
         BASE_JD_EVENT_JOB_CONFIG_FAULT => "JOB_CONFIG_FAULT",
         BASE_JD_EVENT_JOB_POWER_FAULT => "JOB_POWER_FAULT",
         BASE_JD_EVENT_JOB_READ_FAULT => "JOB_READ_FAULT",
-        BASE_JD_EVENT_MEM_GROWTH_FAILED => "MEM_GROWTH_FAILED",
+        BASE_JD_EVENT_DATA_INVALID_FAULT => "DATA_INVALID_FAULT",
         BASE_JD_EVENT_JOB_CANCELLED => "JOB_CANCELLED",
         _ => "UNKNOWN_FAULT",
     }
@@ -796,6 +796,11 @@ pub extern "C" fn panvk_kbase_submit(
     };
     let seq_num = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+    eprintln!(
+        "panvk-kbase: submit atom {} slot {} req 0x{:x} core_req 0x{:x} jc 0x{:x}",
+        atom_num, jobslot, sub.requirements, core_req, sub.jc
+    );
+
     if let Err(e) = submit_atom(
         kbase_dev.fd.as_raw_fd(),
         sub.jc,
@@ -851,6 +856,8 @@ pub extern "C" fn panvk_kbase_submit(
             event_code_str(event_code),
         );
         return -1;
+    } else {
+        eprintln!("panvk-kbase: atom {} completed OK", event_atom);
     }
 
 

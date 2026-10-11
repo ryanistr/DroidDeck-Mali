@@ -12,12 +12,14 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..bbcea0a
+index 0000000..5602b4a
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,285 @@
 +#include <dlfcn.h>
 +#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
 +#include <unistd.h>
 +#include <xf86drm.h>
 +
@@ -42,6 +44,7 @@ index 0000000..bbcea0a
 +struct pan_kbase_bo {
 +   struct pan_kmod_bo base;
 +   void *rust_bo;
++   int dma_fd;
 +};
 +
 +static void
@@ -88,6 +91,7 @@ index 0000000..bbcea0a
 +   }
 +   
 +   kbo->rust_bo = rust_bo;
++   kbo->dma_fd = -1;
 +   kbo->base.dev = dev;
 +   kbo->base.size = kdev->bo_size_fn(rust_bo);
 +   kbo->base.handle = __sync_fetch_and_add(&next_handle, 1);
@@ -102,8 +106,61 @@ index 0000000..bbcea0a
 +   struct pan_kbase_bo *kbo = (struct pan_kbase_bo *)bo;
 +   struct pan_kbase_dev *kdev = (struct pan_kbase_dev *)bo->dev;
 +   
++   if (kbo->dma_fd >= 0) {
++      close(kbo->dma_fd);
++      kbo->dma_fd = -1;
++   }
 +   kdev->free_bo_fn(kdev->rust_dev, kbo->rust_bo);
 +   bo->dev->allocator->free(bo->dev->allocator, kbo);
++}
++
++struct dma_heap_allocation_data {
++   uint64_t len;
++   uint32_t fd;
++   uint32_t fd_flags;
++   uint64_t heap_flags;
++};
++#define DMA_HEAP_IOC_MAGIC 'H'
++#define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
++
++static int
++pan_kbase_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
++{
++   struct pan_kbase_bo *kbo = (struct pan_kbase_bo *)bo;
++   if (dmabuf_fd >= 0) {
++      if (kbo->dma_fd < 0) {
++         kbo->dma_fd = fcntl(dmabuf_fd, F_DUPFD_CLOEXEC, 0);
++      }
++      return 0;
++   }
++
++   if (kbo->dma_fd >= 0)
++      return fcntl(kbo->dma_fd, F_DUPFD_CLOEXEC, 0);
++
++   int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
++   int dma_fd = -1;
++   if (heap_fd >= 0) {
++      struct dma_heap_allocation_data data = {
++         .len = bo->size > 0 ? bo->size : 4096,
++         .fd = 0,
++         .fd_flags = O_RDWR | O_CLOEXEC,
++         .heap_flags = 0,
++      };
++      if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) == 0) {
++         dma_fd = data.fd;
++      }
++      close(heap_fd);
++   }
++   if (dma_fd < 0) {
++      dma_fd = memfd_create("panvk-dma", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++      if (dma_fd >= 0 && bo->size > 0)
++         ftruncate(dma_fd, bo->size);
++   }
++   if (dma_fd >= 0) {
++      kbo->dma_fd = dma_fd;
++      return fcntl(kbo->dma_fd, F_DUPFD_CLOEXEC, 0);
++   }
++   return -1;
 +}
 +
 +static off_t
@@ -174,6 +231,7 @@ index 0000000..bbcea0a
 +   .dev_query_user_va_range = pan_kbase_dev_query_user_va_range,
 +   .bo_alloc = pan_kbase_bo_alloc,
 +   .bo_free = pan_kbase_bo_free,
++   .bo_export = pan_kbase_bo_export,
 +   .bo_get_mmap_offset = pan_kbase_bo_get_mmap_offset,
 +   .bo_wait = pan_kbase_bo_wait,
 +   .vm_create = pan_kbase_vm_create,
@@ -244,7 +302,7 @@ index 0000000..bbcea0a
 +   return 0;
 +}
 diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
-index f75b009..e62f619 100644
+index f75b009..c56f040 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
 @@ -483,6 +483,12 @@ pan_kmod_dev_create(int fd, uint32_t flags,
@@ -260,6 +318,39 @@ index f75b009..e62f619 100644
  static inline void
  pan_kmod_dev_query_props(const struct pan_kmod_dev *dev,
                           struct pan_kmod_dev_props *props)
+@@ -563,9 +569,16 @@ struct pan_kmod_bo *pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd,
+ static inline int
+ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ {
+-   int fd;
++   int fd = -1;
+ 
+    if (drmPrimeHandleToFD(bo->dev->fd, bo->handle, DRM_CLOEXEC, &fd)) {
++      if (bo->dev->ops->bo_export) {
++         fd = bo->dev->ops->bo_export(bo, -1);
++         if (fd >= 0) {
++            bo->flags |= PAN_KMOD_BO_FLAG_EXPORTED;
++            return fd;
++         }
++      }
+       mesa_loge("drmPrimeHandleToFD() failed (err=%d)", errno);
+       return -1;
+    }
+diff --git a/src/panfrost/lib/pan_props.c b/src/panfrost/lib/pan_props.c
+index 278abfd..32ca26e 100644
+--- a/src/panfrost/lib/pan_props.c
++++ b/src/panfrost/lib/pan_props.c
+@@ -67,6 +67,10 @@ const struct panfrost_model panfrost_model_list[] = {
+         MODEL(0x7402, 0, "G52 r1", "TGOx", HAS_ANISO,         16384, {}),
+         MODEL(0x9091, 0, "G57",    "TNAx", HAS_ANISO,         16384, {}),
+         MODEL(0x9093, 0, "G57",    "TNAx", HAS_ANISO,         16384, {}),
++        MODEL(0x9080, 0, "G77",    "TNAx", HAS_ANISO,         16384, {}),
++        MODEL(0x9081, 0, "G77",    "TNAx", HAS_ANISO,         16384, {}),
++        MODEL(0x9082, 0, "G77",    "TNAx", HAS_ANISO,         16384, {}),
++        MODEL(0x9083, 0, "G77",    "TNAx", HAS_ANISO,         16384, {}),
+ 
+         MODEL(0xa867, 0, "G610",   "TVIx", HAS_ANISO,         32768, {}),
+         MODEL(0xac74, 0, "G310",   "TVAx", HAS_ANISO,         16384, {}),
 diff --git a/src/panfrost/vulkan/jm/panvk_queue.h b/src/panfrost/vulkan/jm/panvk_queue.h
 index 85f2e5a..c184fa2 100644
 --- a/src/panfrost/vulkan/jm/panvk_queue.h
@@ -476,6 +567,28 @@ index 8b59eb4..aa2d126 100644
                              INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
     assert(!ret);
  
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index dd2932c..815eeca 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -46,7 +46,7 @@ valhall_archs = [9, 10]
+ valhall_inc_dir = ['valhall']
+ valhall_files = []
+ 
+-jm_archs = [6, 7]
++jm_archs = [6, 7, 9]
+ jm_inc_dir = ['jm']
+ jm_files = [
+   'jm/panvk_vX_cmd_buffer.c',
+@@ -85,7 +85,7 @@ common_per_arch_files = [
+   'panvk_vX_shader.c',
+ ]
+ 
+-foreach arch : [6, 7, 10]
++foreach arch : [6, 7, 9, 10]
+   per_arch_files = common_per_arch_files
+   inc_panvk_per_arch = []
+ 
 diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
 index 7a01f23..8f7812d 100644
 --- a/src/panfrost/vulkan/panvk_instance.c
@@ -532,8 +645,32 @@ index 7a01f23..8f7812d 100644
     instance->vk.physical_devices.try_create_for_drm =
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
+diff --git a/src/panfrost/vulkan/panvk_macros.h b/src/panfrost/vulkan/panvk_macros.h
+index 7fe18db..63bc922 100644
+--- a/src/panfrost/vulkan/panvk_macros.h
++++ b/src/panfrost/vulkan/panvk_macros.h
+@@ -52,6 +52,9 @@ panvk_catch_indirect_alloc_failure(VkResult error)
+       case 7:                                                                  \
+          panvk_arch_name(name, v7)(__VA_ARGS__);                               \
+          break;                                                                \
++      case 9:                                                                  \
++         panvk_arch_name(name, v9)(__VA_ARGS__);                               \
++         break;                                                                \
+       case 10:                                                                 \
+          panvk_arch_name(name, v10)(__VA_ARGS__);                              \
+          break;                                                                \
+@@ -69,6 +72,9 @@ panvk_catch_indirect_alloc_failure(VkResult error)
+       case 7:                                                                  \
+          ret = panvk_arch_name(name, v7)(__VA_ARGS__);                         \
+          break;                                                                \
++      case 9:                                                                  \
++         ret = panvk_arch_name(name, v9)(__VA_ARGS__);                         \
++         break;                                                                \
+       case 10:                                                                 \
+          ret = panvk_arch_name(name, v10)(__VA_ARGS__);                        \
+          break;                                                                \
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..e57c1c4 100644
+index 0d8413c..29e1340 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
 @@ -18,6 +18,7 @@
@@ -674,7 +811,7 @@ index 0d8413c..e57c1c4 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -811,6 +859,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -811,12 +859,20 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  
     device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
                                        device->kmod.props.gpu_variant);
@@ -688,7 +825,14 @@ index 0d8413c..e57c1c4 100644
  
     unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
  
-@@ -826,9 +881,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+    switch (arch) {
+    case 6:
+    case 7:
++   case 9:
+    case 10:
+       break;
+ 
+@@ -826,9 +882,25 @@ panvk_physical_device_init(struct panvk_physical_device *device,
        goto fail;
     }
  
@@ -717,7 +861,7 @@ index 0d8413c..e57c1c4 100644
  
     device->formats.all = panfrost_format_table(arch);
     device->formats.blendable = panfrost_blendable_format_table(arch);
-@@ -1026,6 +1097,14 @@ get_format_properties(struct panvk_physical_device *physical_device,
+@@ -1026,6 +1098,14 @@ get_format_properties(struct panvk_physical_device *physical_device,
     if (arch >= 9 && format == VK_FORMAT_D32_SFLOAT_S8_UINT)
        goto end;
  
@@ -732,7 +876,7 @@ index 0d8413c..e57c1c4 100644
     if (pfmt == PIPE_FORMAT_NONE)
        goto end;
  
-@@ -1346,6 +1425,26 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+@@ -1346,6 +1426,26 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
     VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = NULL;
     VkResult result;
  
@@ -759,7 +903,7 @@ index 0d8413c..e57c1c4 100644
     result = get_image_format_properties(physical_device, base_info,
                                          &base_props->imageFormatProperties,
                                          &format_feature_flags);
-@@ -1366,23 +1465,6 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
+@@ -1366,23 +1466,6 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
        }
     }
  
