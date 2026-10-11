@@ -12,16 +12,17 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..e56c552
+index 0000000..4703fef
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,226 @@
 +#include <dlfcn.h>
 +#include <fcntl.h>
 +#include <unistd.h>
 +#include <xf86drm.h>
 +
 +#include "pan_kmod.h"
++#include "pan_kmod_backend.h"
 +#include "util/os_mman.h"
 +
 +struct pan_kbase_dev {
