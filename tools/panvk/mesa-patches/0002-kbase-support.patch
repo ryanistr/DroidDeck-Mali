@@ -12,7 +12,7 @@ index 68b94cc..d828444 100644
  libpankmod_lib = static_library(
 diff --git a/src/panfrost/lib/kmod/pan_kbase.c b/src/panfrost/lib/kmod/pan_kbase.c
 new file mode 100644
-index 0000000..102be85
+index 0000000..f3406fc
 --- /dev/null
 +++ b/src/panfrost/lib/kmod/pan_kbase.c
 @@ -0,0 +1,154 @@
@@ -184,8 +184,22 @@ index f75b009..4e24e53 100644
  static inline void
  pan_kmod_dev_query_props(const struct pan_kmod_dev *dev,
                           struct pan_kmod_dev_props *props)
+diff --git a/src/panfrost/vulkan/jm/panvk_queue.h b/src/panfrost/vulkan/jm/panvk_queue.h
+index 85f2e5a..c184fa2 100644
+--- a/src/panfrost/vulkan/jm/panvk_queue.h
++++ b/src/panfrost/vulkan/jm/panvk_queue.h
+@@ -29,7 +29,8 @@ panvk_per_arch(queue_finish)(struct panvk_queue *queue)
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+ 
+    vk_queue_finish(&queue->vk);
+-   drmSyncobjDestroy(dev->vk.drm_fd, queue->sync);
++   if (dev->vk.drm_fd != -1)
++      drmSyncobjDestroy(dev->vk.drm_fd, queue->sync);
+ }
+ 
+ VkResult panvk_per_arch(queue_init)(struct panvk_device *device,
 diff --git a/src/panfrost/vulkan/jm/panvk_vX_queue.c b/src/panfrost/vulkan/jm/panvk_vX_queue.c
-index 8b59eb4..aedc8a3 100644
+index 8b59eb4..3bff9f5 100644
 --- a/src/panfrost/vulkan/jm/panvk_vX_queue.c
 +++ b/src/panfrost/vulkan/jm/panvk_vX_queue.c
 @@ -69,7 +69,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
@@ -214,8 +228,28 @@ index 8b59eb4..aedc8a3 100644
        assert(!ret);
        if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
           ret = drmSyncobjWait(dev->vk.drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
+@@ -314,7 +322,8 @@ panvk_per_arch(queue_init)(struct panvk_device *device,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   int ret = drmSyncobjCreate(device->vk.drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
++   int ret = (device->vk.drm_fd == -1) ? 0 :
++             drmSyncobjCreate(device->vk.drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
+                               &queue->sync);
+    if (ret) {
+       vk_queue_finish(&queue->vk);
+@@ -337,7 +346,8 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+    if (vk_device_is_lost(&dev->vk))
+       return VK_ERROR_DEVICE_LOST;
+ 
+-   int ret = drmSyncobjWait(queue->vk.base.device->drm_fd, &queue->sync, 1,
++   int ret = (queue->vk.base.device->drm_fd == -1) ? 0 :
++             drmSyncobjWait(queue->vk.base.device->drm_fd, &queue->sync, 1,
+                             INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+    assert(!ret);
+ 
 diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
-index 7a01f23..97d5410 100644
+index 7a01f23..8f7812d 100644
 --- a/src/panfrost/vulkan/panvk_instance.c
 +++ b/src/panfrost/vulkan/panvk_instance.c
 @@ -14,6 +14,7 @@
@@ -262,7 +296,7 @@ index 7a01f23..97d5410 100644
  static void
  panvk_destroy_physical_device(struct vk_physical_device *device)
  {
-@@ -185,6 +214,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+@@ -185,6 +215,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
        .priv = &instance->vk.alloc,
     };
  
@@ -271,10 +305,38 @@ index 7a01f23..97d5410 100644
        panvk_physical_device_try_create;
     instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 0d8413c..42ac48b 100644
+index 0d8413c..6d58d67 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
-@@ -803,7 +803,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -18,6 +18,7 @@
+ 
+ #include "vk_device.h"
+ #include "vk_drm_syncobj.h"
++#include "vk_sync_dummy.h"
+ #include "vk_format.h"
+ #include "vk_limits.h"
+ #include "vk_log.h"
+@@ -147,10 +148,17 @@ get_device_sync_types(struct panvk_physical_device *device,
+    const unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
+    uint32_t sync_type_count = 0;
+ 
++   if (device->kmod.dev->fd < 0) {
++      device->sync_types[sync_type_count++] = &vk_sync_dummy_type;
++      device->sync_types[sync_type_count] = NULL;
++      return VK_SUCCESS;
++   }
++
+    device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
+    if (!device->drm_syncobj_type.features) {
+-      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+-                       "failed to query syncobj features");
++      device->sync_types[sync_type_count++] = &vk_sync_dummy_type;
++      device->sync_types[sync_type_count] = NULL;
++      return VK_SUCCESS;
+    }
+ 
+    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
+@@ -803,7 +811,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  {
     VkResult result;
  
@@ -288,7 +350,21 @@ index 0d8413c..42ac48b 100644
     if (result != VK_SUCCESS)
        return result;
  
-@@ -837,8 +842,10 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -811,6 +824,13 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+ 
+    device->model = panfrost_get_model(device->kmod.props.gpu_prod_id,
+                                       device->kmod.props.gpu_variant);
++   if (!device->model) {
++      static const struct panfrost_model fallback_model = {
++         .gpu_id = 0x7211,
++         .name = "Mali-G76 (Panfrost)",
++      };
++      device->model = &fallback_model;
++   }
+ 
+    unsigned arch = pan_arch(device->kmod.props.gpu_prod_id);
+ 
+@@ -826,9 +846,11 @@ panvk_physical_device_init(struct panvk_physical_device *device,
        goto fail;
     }
  
@@ -302,3 +378,17 @@ index 0d8413c..42ac48b 100644
 +   }
  
     device->formats.all = panfrost_format_table(arch);
+    device->formats.blendable = panfrost_blendable_format_table(arch);
+diff --git a/src/panfrost/vulkan/panvk_physical_device.h b/src/panfrost/vulkan/panvk_physical_device.h
+index 096ce4c..6ca0539 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.h
++++ b/src/panfrost/vulkan/panvk_physical_device.h
+@@ -70,7 +70,7 @@ panvk_get_vk_version()
+    if (version_override)
+       return version_override;
+ 
+-   return VK_MAKE_API_VERSION(0, 1, 0, VK_HEADER_VERSION);
++   return VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION);
+ }
+ 
+ VkResult panvk_physical_device_init(struct panvk_physical_device *device,
