@@ -274,7 +274,7 @@ index 85f2e5a..c184fa2 100644
  
  VkResult panvk_per_arch(queue_init)(struct panvk_device *device,
 diff --git a/src/panfrost/vulkan/jm/panvk_vX_queue.c b/src/panfrost/vulkan/jm/panvk_vX_queue.c
-index 8b59eb4..3bff9f5 100644
+index 8b59eb4..c80513e 100644
 --- a/src/panfrost/vulkan/jm/panvk_vX_queue.c
 +++ b/src/panfrost/vulkan/jm/panvk_vX_queue.c
 @@ -69,7 +69,11 @@ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
@@ -303,7 +303,25 @@ index 8b59eb4..3bff9f5 100644
        assert(!ret);
        if (debug & (PANVK_DEBUG_TRACE | PANVK_DEBUG_SYNC)) {
           ret = drmSyncobjWait(dev->vk.drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
-@@ -314,7 +322,8 @@ panvk_per_arch(queue_init)(struct panvk_device *device,
+@@ -138,6 +146,8 @@ static void
+ panvk_queue_transfer_sync(struct panvk_queue *queue, uint32_t syncobj)
+ {
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   if (dev->vk.drm_fd == -1)
++      return;
+    int ret;
+ 
+    struct drm_syncobj_handle handle = {
+@@ -183,6 +193,8 @@ panvk_signal_event_syncobjs(struct panvk_queue *queue,
+                             struct panvk_batch *batch)
+ {
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   if (dev->vk.drm_fd == -1)
++      return;
+ 
+    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
+       switch (op->type) {
+@@ -314,7 +326,8 @@ panvk_per_arch(queue_init)(struct panvk_device *device,
     if (result != VK_SUCCESS)
        return result;
  
@@ -313,7 +331,7 @@ index 8b59eb4..3bff9f5 100644
                                &queue->sync);
     if (ret) {
        vk_queue_finish(&queue->vk);
-@@ -337,7 +346,8 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+@@ -337,7 +350,8 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
     if (vk_device_is_lost(&dev->vk))
        return VK_ERROR_DEVICE_LOST;
  
@@ -572,7 +590,7 @@ index 096ce4c..6ca0539 100644
  
  VkResult panvk_physical_device_init(struct panvk_physical_device *device,
 diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
-index 97398a2..6d2e1f3 100644
+index 97398a2..dd78dd3 100644
 --- a/src/panfrost/vulkan/panvk_vX_device.c
 +++ b/src/panfrost/vulkan/panvk_vX_device.c
 @@ -216,9 +216,13 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
@@ -592,6 +610,16 @@ index 97398a2..6d2e1f3 100644
  
     if (!device->kmod.dev) {
        result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+@@ -271,7 +275,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+ 
+    panfrost_upload_sample_positions(device->sample_positions->addr.host);
+ 
+-   vk_device_set_drm_fd(&device->vk, device->kmod.dev->fd);
++   if (device->kmod.dev->ops != &pan_kbase_ops)
++      vk_device_set_drm_fd(&device->vk, device->kmod.dev->fd);
+ 
+    result = panvk_meta_init(device);
+    if (result != VK_SUCCESS)
 diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
 index 60af69b..c932236 100644
 --- a/src/vulkan/runtime/vk_device.c
