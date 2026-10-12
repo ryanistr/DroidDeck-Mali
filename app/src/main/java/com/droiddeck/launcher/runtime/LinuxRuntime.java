@@ -114,14 +114,20 @@ public final class LinuxRuntime {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
-        com.droiddeck.launcher.gpu.GpuInfo.Family family = com.droiddeck.launcher.gpu.GpuInfo.detect().getFamily();
+        com.droiddeck.launcher.gpu.GpuInfo gpu = com.droiddeck.launcher.gpu.GpuInfo.detect();
+        com.droiddeck.launcher.gpu.GpuInfo.Family family = gpu.getFamily();
         boolean isMali = family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
                          family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
                          family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
                          family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN;
         if (isMali) {
+            // PanVK only for a generation this build carries a backend for: pointing the loader at a
+            // driver that cannot create a device is how a session dies at "failed to find physical
+            // device". 0 means the model is unknown, and an unknown Mali is not worth a hard failure.
+            boolean panvk = gpu.getArch() == 0 || gpu.getPanvkBackend();
             for (File manifest : manifests) {
-                if (manifest.getName().contains("panvk")) return manifest;
+                if (panvk && manifest.getName().contains("panvk")) return manifest;
+                if (!panvk && manifest.getName().contains("lvp")) return manifest;
             }
             return null;
         }

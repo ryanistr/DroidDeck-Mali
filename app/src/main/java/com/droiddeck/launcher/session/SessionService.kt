@@ -594,13 +594,23 @@ class SessionService : Service() {
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
+        // An unknown Mali (arch 0) is given the benefit of the doubt; a known generation with no
+        // backend here is not, because PanVK fails at device creation and the session never starts.
+        val maliPanvk = isMali && (gpuInfo.arch == 0 || gpuInfo.panvkBackend)
 
-        if (isMali) {
+        if (maliPanvk) {
             // Mali: use PanVK for Vulkan, Panfrost for OpenGL
             guest.add("MESA_LOADER_DRIVER_OVERRIDE=panvk")
             guest.add("GALLIUM_DRIVER=panfrost")
             guest.add("LIBGL_KOPPER_DRI2=true")
-            Log.i(TAG, "GPU: Mali detected (${gpuInfo.family.label}), using PanVK/Panfrost")
+            Log.i(TAG, "GPU: Mali ${gpuInfo.name} (arch v${gpuInfo.arch}), using PanVK/Panfrost")
+        } else if (isMali) {
+            // A generation this build cannot drive (v10 and newer submit through CSF, which the
+            // kbase layer here does not implement): software rendering, so the session still runs.
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=llvmpipe")
+            guest.add("GALLIUM_DRIVER=llvmpipe")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+            Log.w(TAG, "GPU: Mali ${gpuInfo.name} (arch v${gpuInfo.arch}) has no PanVK backend; using software rendering")
         } else {
             // Adreno: use Zink + Turnip
             guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
