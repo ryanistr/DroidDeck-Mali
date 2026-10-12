@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -102,6 +103,37 @@ static void *real(const char *name) {
   return fn;
 }
 
+/*
+ * libdrm arrives as a dependency of whichever ICD the Vulkan loader dlopens, i.e. inside that
+ * library's local scope, where dlsym(RTLD_NEXT) cannot see it. Resolving through a handle to
+ * libdrm itself keeps the overrides below able to hand every real device back to libdrm instead
+ * of free()ing businfo/deviceinfo, which libdrm owns as interior pointers of one allocation.
+ */
+static void *real_drm(const char *name) {
+  void *fn = dlsym(RTLD_NEXT, name);
+  if (fn) {
+    return fn;
+  }
+  void *drm = dlopen("libdrm.so.2", RTLD_LAZY | RTLD_NOLOAD);
+  if (!drm) {
+    drm = dlopen("libdrm.so.2", RTLD_LAZY);
+  }
+  if (!drm) {
+    for (int i = 2; i <= 4 && !drm; i++) {
+      char soname[32];
+      snprintf(soname, sizeof(soname), "libdrm.so.%d", i);
+      drm = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD);
+    }
+  }
+  if (drm) {
+    fn = dlsym(drm, name);
+  }
+  if (!fn) {
+    errno = ENOSYS;
+  }
+  return fn;
+}
+
 static int same_file_description(int a, int b) {
   if (a == b) {
     return 1;
@@ -156,7 +188,7 @@ static uint32_t alloc_handle_locked(void) {
 
 int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
   if (!is_non_drm_gpu(fd)) {
-    int (*fn)(int, int, uint32_t *) = (int (*)(int, int, uint32_t *)) real("drmPrimeFDToHandle");
+    int (*fn)(int, int, uint32_t *) = (int (*)(int, int, uint32_t *)) real_drm("drmPrimeFDToHandle");
     return fn ? fn(fd, prime_fd, handle) : -ENOSYS;
   }
   pthread_mutex_lock(&lock);
@@ -198,7 +230,7 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
 
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
   if (!is_non_drm_gpu(fd)) {
-    int (*fn)(int, uint32_t, uint32_t, int *) = (int (*)(int, uint32_t, uint32_t, int *)) real("drmPrimeHandleToFD");
+    int (*fn)(int, uint32_t, uint32_t, int *) = (int (*)(int, uint32_t, uint32_t, int *)) real_drm("drmPrimeHandleToFD");
     return fn ? fn(fd, handle, flags, prime_fd) : -ENOSYS;
   }
   int ret = -EINVAL;
@@ -245,7 +277,7 @@ static int release_handle(int fd, uint32_t handle) {
 
 int drmCloseBufferHandle(int fd, uint32_t handle) {
   if (!is_non_drm_gpu(fd)) {
-    int (*fn)(int, uint32_t) = (int (*)(int, uint32_t)) real("drmCloseBufferHandle");
+    int (*fn)(int, uint32_t) = (int (*)(int, uint32_t)) real_drm("drmCloseBufferHandle");
     return fn ? fn(fd, handle) : -ENOSYS;
   }
   return release_handle(fd, handle) ? 0 : -EINVAL;
@@ -265,6 +297,38 @@ typedef struct _drmDevice {
   void *deviceinfo;
 } *drmDevicePtr;
 
+/*
+ * Devices this library synthesized. libdrm allocates a real device and its businfo/deviceinfo in
+ * one block and frees them itself, but alloc_fallback_drm_device() callocs each separately and
+ * must free each. Tracking ours lets drmFreeDevice apply the right rule to both - freeing a real
+ * device's interior pointers as if they were separate aborts with "free(): invalid pointer".
+ */
+static drmDevicePtr own_devices[64];
+static size_t own_device_count;
+static pthread_mutex_t own_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void remember_own_device(drmDevicePtr d) {
+  pthread_mutex_lock(&own_lock);
+  if (own_device_count < sizeof(own_devices) / sizeof(own_devices[0])) {
+    own_devices[own_device_count++] = d;
+  }
+  pthread_mutex_unlock(&own_lock);
+}
+
+static int is_own_device(drmDevicePtr d) {
+  int found = 0;
+  pthread_mutex_lock(&own_lock);
+  for (size_t i = 0; i < own_device_count; i++) {
+    if (own_devices[i] == d) {
+      own_devices[i] = own_devices[--own_device_count];
+      found = 1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&own_lock);
+  return found;
+}
+
 static drmDevicePtr alloc_fallback_drm_device(const char *node_path) {
   drmDevicePtr dev = (drmDevicePtr) calloc(1, sizeof(struct _drmDevice));
   if (!dev) return NULL;
@@ -280,12 +344,21 @@ static drmDevicePtr alloc_fallback_drm_device(const char *node_path) {
   strncpy(dev->nodes[DRM_NODE_RENDER], node_path, DRM_NODE_LEN - 1);
   dev->available_nodes = (1 << DRM_NODE_PRIMARY) | (1 << DRM_NODE_RENDER);
   dev->bustype = -1;
+  remember_own_device(dev);
   return dev;
 }
 
 void drmFreeDevice(drmDevicePtr *device) {
   if (!device || !*device) return;
   drmDevicePtr d = *device;
+  if (!is_own_device(d)) {
+    /* libdrm's own device: it owns one allocation, so let its free do the work. */
+    void (*fn)(drmDevicePtr *) = (void (*)(drmDevicePtr *)) real_drm("drmFreeDevice");
+    if (fn) {
+      fn(device);
+      return;
+    }
+  }
   if (d->nodes) {
     for (int i = 0; i < DRM_NODE_MAX; i++) {
       free(d->nodes[i]);
@@ -316,7 +389,7 @@ static const char *get_fallback_node_path(void) {
 }
 
 int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device) {
-  int (*fn)(dev_t, uint32_t, drmDevicePtr *) = (int (*)(dev_t, uint32_t, drmDevicePtr *)) real("drmGetDeviceFromDevId");
+  int (*fn)(dev_t, uint32_t, drmDevicePtr *) = (int (*)(dev_t, uint32_t, drmDevicePtr *)) real_drm("drmGetDeviceFromDevId");
   int ret = fn ? fn(dev_id, flags, device) : -1;
   if (ret == 0 && device && *device) {
     return 0;
