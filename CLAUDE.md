@@ -10,6 +10,15 @@ Single Gradle module `:app`, package `com.droiddeck.launcher` (was `com.steamdec
 
 The APK is mostly a launcher plus native/session supporting code; the actual Steam client, desktop, Proton, and games all live in the downloaded Linux runtime, not in this repo.
 
+### Fork mission: Mali GPU support
+
+This tree is the **Mali fork** of DroidDeck (`ryanistr/DroidDeck-Mali`; upstream `Droid-Deck/DroidDeck`). Upstream only targets an Adreno (Qualcomm) GPU; the point of this fork is to make the same Steam-in-a-rootfs stack run on ARM **Mali** GPUs, and to get there by **rebuilding the GPU driver stack from the ground up** from source instead of shipping the vendor blob. The reference target is MediaTek MT6893 (Dimensity 1200/8050), Mali-G77 MC9 (Valhall, arch 9), on a rooted Infinix GT 10 Pro (X6739); `GpuInfo`/`DeviceReport` special-case that SoC by name.
+
+- The stack rebuilt here is **Mesa PanVK** built two ways from one source tree: `tools/panvk/build-panvk.sh` (glibc, for the runtime) and `tools/panvk/build-panvk-android.sh` (bionic, for the app's compositor), both applying `tools/panvk/mesa-patches/`.
+- A **Rust kbase backend** (`app/src/main/rust/panvk-kbase-jm/`, `libpanvk_kbase_jm.so`) drives ARM's proprietary `mali_kbase` kernel module directly over `/dev/mali0`; stock upstream Mesa cannot reach that kernel driver.
+- **Compatibility layers** for Mali that upstream lacks: DRM-node emulation for the KMS-only MediaTek display controller, GPU-family classification (Midgard/Bifrost/Valhall/unknown), and driver selection that switches the whole app onto the PanVK path for every Mali family.
+- This is experimental, device-driven bring-up.
+
 ## Essential Commands
 
 ```sh
@@ -95,7 +104,7 @@ Compose test tags exposed as resource ids via `Modifier.exposeTestTags()` (`ui/T
 
 ### Pinned Components (fetched, never committed)
 
-Gamescope, KDE Plasma desktop package, DirectAudio relay, droiddeck-esync packs, uruntime, mangoapp, msitools binaries pinned by checksummed `release.env` / `packages.txt` under `tools/` and downloaded from GitHub releases during build (cached by checksum). Component build workflows (`build-gamescope.yml`, `build-desktop-kde.yml`, `build-aaudio-sink.yml`) produce those release assets on arm64 runners; separate from APK build.
+Gamescope, KDE Plasma desktop package, DirectAudio relay, droiddeck-esync packs, uruntime, mangoapp, msitools binaries, and the Mali **PanVK** driver pinned by checksummed `release.env` / `packages.txt` under `tools/` and downloaded from GitHub releases during build (cached by checksum). Component build workflows (`build-gamescope.yml`, `build-desktop-kde.yml`, `build-aaudio-sink.yml`, `build-panvk.yml`) produce those release assets on arm64 runners; separate from APK build.
 
 ### Runtime Input Attestation
 
@@ -123,6 +132,7 @@ Gamescope, KDE Plasma desktop package, DirectAudio relay, droiddeck-esync packs,
 - **Commits:** conventional-ish prefixes (`feat:`, `fix:`, `perf:`, or plain capitalized summary), often with PR number (`(#NNN)`). No `Co-Authored-By` / agent attribution lines, ever.
 - **`droiddeckctl` gating:** `run`, `guest`, `cdp`, `env` mutations, `override`, `prefs` require **Setup → Session → Debugging tools** (off by default, exit code 7 when refused). Bridge provider answers commands as JSON over `content://com.droiddeck.launcher.agent` and requires `android.permission.DUMP`. See `docs/agent-control.md` for commands, exit codes, limits.
 - **Never work in `/tmp`** (host machine rule: it is RAM-backed; use repo or `~/` for scratch).
+- **Mali / PanVK gotchas** (this fork's focus): on MT6893 `/dev/dri/card0` is `mediatek-drm` (a display controller with no Vulkan, no GBM, no render node) - the 3D engine is only reachable through `mali_kbase` at `/dev/mali0`, so DRM walks must prefer `/dev/mali0`. `tools/linuxfs/preload/drm.c` synthesizes a DRM device for `/dev/mali0` and makes `gbm_create_device()` return `NULL` for the MediaTek KMS node (its fallback device allocates `dev`, `dev->nodes` and each node separately, since libdrm's `drmFreeDevice()` would otherwise free an interior pointer). `droiddeck-session` sets `XWAYLAND_NO_GLAMOR=1` (Xwayland cannot use Gallium 3D on a display-only node). The Mesa patch makes `libvulkan_panvk.so` `dlopen("libpanvk_kbase_jm.so")`; if that cdylib is missing, `CreateInstance` returns `VK_ERROR_INCOMPATIBLE_DRIVER` and gamescope reports "failed to find physical device". Stock Mesa 24.3 only enables PanVK on arches 6/7/10; **arch 9 (Valhall)** comes from `tools/panvk/mesa-patches/0003-panvk-v9-jm.patch`. The kbase backend is Rust on **both** halves (host rustup for `build-panvk.sh`, cargo-ndk via Gradle `buildPanvkKbaseJm` for Android), so a Rust toolchain is required either way. The glibc driver is pinned by `tools/panvk/release.env` and fetched by `tools/build_local.sh`; `.github/workflows/build-panvk.yml` builds it on `ubuntu-24.04-arm`.
 
 ## Docs Map
 

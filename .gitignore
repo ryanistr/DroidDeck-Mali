@@ -40,3 +40,10 @@ __pycache__/
 # Local signing with the release key (tools/build_local.sh); holds a password.
 .signing.env
 app/src/main/assets/directaudio/
+
+# Scratch notes (handoffs, plans, reports) are working files, never part of the tree. Root
+# markdown is ignored by default; a real doc at the root has to be allowed explicitly.
+/*.md
+!/AGENTS.md
+!/CLAUDE.md
+!/README.md
