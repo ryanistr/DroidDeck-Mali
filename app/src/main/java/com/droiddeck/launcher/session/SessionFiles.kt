@@ -129,9 +129,10 @@ object SessionFiles {
         val fexPreloads = listOf("x86_64", "i386").flatMap { arch ->
             listOf("libblsession.so", "libfakeinput.so").map { "$arch/$it" to "usr/local/lib/droiddeck-fex/$arch/$it" }
         } + listOf("libfaultreport.so", "libthunkaudit.so", "libvulkan-thunk.so").map { "x86_64/$it" to "usr/local/lib/droiddeck-fex/x86_64/$it" }
-        // PanVK ICD for Mali GPUs - must be staged so the runtime uses PanVK instead of freedreno
+        // PanVK and Lavapipe ICDs for Mali / fallback rendering
         val panvkIcd = listOf(
             "usr/share/vulkan/icd.d/panvk_icd.aarch64.json" to "usr/share/vulkan/icd.d/panvk_icd.aarch64.json",
+            "usr/share/vulkan/icd.d/lvp_icd.aarch64.json" to "usr/share/vulkan/icd.d/lvp_icd.aarch64.json",
             "usr/lib/libvulkan_panvk.so" to "usr/lib/libvulkan_panvk.so"
         )
         val optional = (arrayOf(
@@ -140,7 +141,7 @@ object SessionFiles {
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
         ) + mangoapp + msitools.map { it to it } + fexPreloads + panvkIcd).filter { (asset, _) ->
             val exists = runCatching { context.assets.open("linuxfs/$asset").close(); true }.getOrDefault(false)
-            if (asset.contains("panvk")) Log.i(TAG, "PanVK staging: asset=$asset exists=$exists")
+            if (asset.contains("panvk") || asset.contains("lvp")) Log.i(TAG, "ICD staging: asset=$asset exists=$exists")
             exists
         }
         val all = (if (DesktopCatalog.desktopInstalled(root)) files + desktop else files) + optional
@@ -163,6 +164,7 @@ object SessionFiles {
             if (!installed) Log.e(TAG, "$relative NOT staged")
         }
         File(root, "usr/local/bin/bannerlator-steam-compat").delete()
+        ensureLavapipeManifest(root)
         LegacyNames.migrateRootfs(root)
         ComponentsManager.migrateLaunchDir(context)
         EsyncPacks.stageBundled(context, root)
@@ -372,6 +374,25 @@ object SessionFiles {
         indent + "\t\"LocalPath\"\t\t\"" + path + "\"",
         indent + "}",
     ).joinToString(newline)
+
+    private fun ensureLavapipeManifest(root: File) {
+        val lvpLib = File(root, "usr/lib/libvulkan_lvp.so")
+        val manifest = File(root, "usr/share/vulkan/icd.d/lvp_icd.aarch64.json")
+        if (lvpLib.isFile && !manifest.isFile) {
+            val json = "{\n    \"file_format_version\": \"1.0.1\",\n    \"ICD\": {\n        \"api_version\": \"1.3.354\",\n        \"library_arch\": \"64\",\n        \"library_path\": \"/usr/lib/libvulkan_lvp.so\"\n    }\n}\n"
+            val staged = File(manifest.parentFile, manifest.name + ".staged")
+            try {
+                manifest.parentFile?.mkdirs()
+                FileUtils.writeString(staged, json)
+                staged.setReadable(true, false)
+                staged.renameTo(manifest)
+            } catch (e: Exception) {
+                Log.w(TAG, "could not write lvp_icd.aarch64.json", e)
+            } finally {
+                staged.delete()
+            }
+        }
+    }
 
     /**
      * Where the session writes its log: app-private `files/logs`, bound into the session at the same

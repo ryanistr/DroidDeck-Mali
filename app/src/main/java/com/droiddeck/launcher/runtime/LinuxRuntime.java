@@ -111,7 +111,9 @@ public final class LinuxRuntime {
 
     /** The Vulkan ICD manifest the rootfs ships for the device GPU, or null when it has none. */
     public static File vulkanIcd(Context context) {
-        File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
+        File root = rootDir(context);
+        File icdDir = new File(root, "usr/share/vulkan/icd.d");
+        ensureLavapipeIcd(root, icdDir);
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
         com.droiddeck.launcher.gpu.GpuInfo gpu = com.droiddeck.launcher.gpu.GpuInfo.detect();
@@ -129,6 +131,14 @@ public final class LinuxRuntime {
                 if (panvk && manifest.getName().contains("panvk")) return manifest;
                 if (!panvk && manifest.getName().contains("lvp")) return manifest;
             }
+            for (File manifest : manifests) {
+                if (manifest.getName().contains("lvp")) return manifest;
+            }
+            if (panvk) {
+                for (File manifest : manifests) {
+                    if (manifest.getName().contains("panvk")) return manifest;
+                }
+            }
             return null;
         }
         for (File manifest : manifests) {
@@ -137,7 +147,34 @@ public final class LinuxRuntime {
         for (File manifest : manifests) {
             if (!manifest.getName().contains("lvp")) return manifest;
         }
+        for (File manifest : manifests) {
+            if (manifest.getName().contains("lvp")) return manifest;
+        }
         return null;
+    }
+
+    private static void ensureLavapipeIcd(File root, File icdDir) {
+        File lvpLib = new File(root, "usr/lib/libvulkan_lvp.so");
+        File lvpManifest = new File(icdDir, "lvp_icd.aarch64.json");
+        if (lvpLib.isFile() && !lvpManifest.isFile()) {
+            try {
+                icdDir.mkdirs();
+                String json = "{\n" +
+                        "    \"file_format_version\": \"1.0.1\",\n" +
+                        "    \"ICD\": {\n" +
+                        "        \"api_version\": \"1.3.354\",\n" +
+                        "        \"library_arch\": \"64\",\n" +
+                        "        \"library_path\": \"/usr/lib/libvulkan_lvp.so\"\n" +
+                        "    }\n" +
+                        "}\n";
+                File staged = new File(icdDir, "lvp_icd.aarch64.json.staged");
+                com.droiddeck.launcher.core.FileUtils.writeString(staged, json);
+                staged.setReadable(true, false);
+                staged.renameTo(lvpManifest);
+            } catch (Exception e) {
+                android.util.Log.w("LinuxRuntime", "could not write lvp ICD manifest", e);
+            }
+        }
     }
 
     /**

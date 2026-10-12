@@ -700,7 +700,7 @@ class MainActivity : ComponentActivity() {
                             com.droiddeck.launcher.agent.AgentAccess.setCommandsEnabled(this, !com.droiddeck.launcher.agent.AgentAccess.commandsEnabled(this))
                             agentCommands = com.droiddeck.launcher.agent.AgentAccess.commandsEnabled(this)
                         },
-                        onShareLogs = {
+                        onShareRecentLogs = {
                             SessionLogShare.prepare(this, { SessionLogShare.latest(this) }) { zip ->
                                 if (zip == null) android.widget.Toast.makeText(this, R.string.main_no_logs_yet, android.widget.Toast.LENGTH_LONG).show()
                                 else startActivity(SessionLogShare.shareIntent(this, zip))

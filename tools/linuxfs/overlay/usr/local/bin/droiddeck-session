@@ -280,9 +280,14 @@ if [ -z "${BL_INSIDE:-}" ]; then
   fi
 
   export XWAYLAND_NO_GLAMOR=1
-  export PANVK_DEBUG=startup
-  export VK_LOADER_DEBUG=all
-  export WAYLAND_DEBUG=1
+  # Bring-up tracing: WAYLAND_DEBUG logs every protocol message of every client, line-buffered, and
+  # costs a client most of its frame rate. BL_BRINGUP=1 (droiddeck-env, or an agent's switch) turns
+  # all three back on; a session that is merely being played does not want them.
+  if [ "${BL_BRINGUP:-0}" = 1 ]; then
+    export PANVK_DEBUG=startup
+    export VK_LOADER_DEBUG=all
+    export WAYLAND_DEBUG=1
+  fi
   ulimit -c unlimited 2>/dev/null || true
   export BL_INSIDE=1
   echo "== gamescope launching: gamescope ${args[@]} -- $0 $mode $@"
@@ -981,9 +986,12 @@ BUSCONF
         /usr/local/bin/droiddeck-steam-desktop-ui &
         desktop_ui_pid=$!
       fi
+      _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan )
+      if [ "${XWAYLAND_NO_GLAMOR:-0}" = 1 ] || [ "${GALLIUM_DRIVER:-}" = llvmpipe ] || [ "${BL_GPU_FAMILY:-}" = mali ]; then
+        _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu )
+      fi
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
-        -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 \
-        -cef-use-gl=angle -cef-use-angle=vulkan "$@"
+        "${_cef_gpu_args[@]}" "$@"
       rc=$?
       if [ -n "$desktop_ui_pid" ]; then
         kill "$desktop_ui_pid" 2>/dev/null || true

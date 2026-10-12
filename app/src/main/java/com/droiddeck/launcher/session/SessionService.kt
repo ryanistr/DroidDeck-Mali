@@ -598,6 +598,10 @@ class SessionService : Service() {
         // backend here is not, because PanVK fails at device creation and the session never starts.
         val maliPanvk = isMali && (gpuInfo.arch == 0 || gpuInfo.panvkBackend)
 
+        if (isMali) {
+            guest.add("BL_GPU_FAMILY=mali")
+        }
+
         if (maliPanvk) {
             // Mali: use PanVK for Vulkan, Panfrost for OpenGL
             guest.add("MESA_LOADER_DRIVER_OVERRIDE=panvk")
@@ -618,8 +622,13 @@ class SessionService : Service() {
             guest.add("LIBGL_KOPPER_DRI2=true")
             Log.i(TAG, "GPU: Adreno detected (${gpuInfo.family.label}), using Zink/Turnip")
         }
-        LinuxRuntime.vulkanIcd(this)?.let {
-            val guestIcd = "/usr/share/vulkan/icd.d/" + it.name
+        val icdManifest = LinuxRuntime.vulkanIcd(this)
+        if (icdManifest != null) {
+            val guestIcd = "/usr/share/vulkan/icd.d/" + icdManifest.name
+            guest.add("VK_ICD_FILENAMES=$guestIcd")
+            guest.add("VK_DRIVER_FILES=$guestIcd")
+        } else if (isMali && !maliPanvk) {
+            val guestIcd = "/usr/share/vulkan/icd.d/lvp_icd.aarch64.json"
             guest.add("VK_ICD_FILENAMES=$guestIcd")
             guest.add("VK_DRIVER_FILES=$guestIcd")
         }

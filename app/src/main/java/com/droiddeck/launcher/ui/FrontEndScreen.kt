@@ -193,6 +193,7 @@ class FrontEndActions(
     val onLogs: () -> Unit,
     val onAgentCommands: () -> Unit = {},
     val onShareLogs: () -> Unit = {},
+    val onShareRecentLogs: () -> Unit = {},
     val onClearLogs: () -> Unit = {},
     val onOffline: () -> Unit,
     val onPageBack: () -> Unit = {},
