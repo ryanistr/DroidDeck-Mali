@@ -1,0 +1,75 @@
+name: Build PanVK (Mali-G57 fork)
+
+# Glibc PanVK for Mali Valhall built from the Mali-G57 fork's source, on an arm64 runner.
+#
+# The driver DroidDeck ships has no v9 backend (panvk_v9 = 1 symbol) and upstream Mesa's JM
+# backend is Bifrost-only, so a Valhall (MT6893) device enumerates no GPU and gamescope reports
+# "failed to find physical device". This fork has a real v9 JM backend and its own kbase driver,
+# and from v1.2.0 it gates the dma-buf fd interop group on PANVK_FD_INTEROP, which gamescope
+# requires through VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf /
+# VK_KHR_external_semaphore_fd.
+#
+# Published as an asset the apk build fetches (tools/panvk-g57/release.env names the tag and sha).
+on:
+  push:
+    paths:
+      - 'tools/panvk-g57/**'
+      - '.github/workflows/build-panvk-g57.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream fork version to build (tag v<version>), e.g. 1.2.0'
+        required: false
+        default: '1.2.0'
+      tag:
+        description: 'Release tag to publish as (e.g. panvk-linux-g57-1.2.0-p1); empty = artifact only'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            git meson ninja-build pkg-config patch \
+            libwayland-dev libwayland-egl-backend-dev \
+            libdrm-dev libx11-dev libxext-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-keysyms1-dev \
+            libxfixes-dev libxrandr-dev libxshmfence-dev libxxf86vm-dev \
+            libglvnd-dev libegl-dev libgles-dev \
+            python3-mako python3-ply python3-yaml python3-packaging \
+            libelf-dev zlib1g-dev libzstd-dev libexpat1-dev \
+            bison flex zstd >/dev/null
+      - name: Build PanVK (Mali-G57 fork, glibc)
+        env:
+          PANVK_G57_VERSION: ${{ inputs.version || '1.2.0' }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          bash tools/panvk-g57/build-panvk-g57.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panvk-linux-g57
+          path: |
+            panvk-linux-g57-*.tzst
+            panvk-linux-g57-*.tzst.sha256
+      - name: Publish
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "PanVK Mali-G57 fork (v9 JM kbase, fd interop) staged by the apk into linuxfs/usr/lib. sha256 $(cut -d' ' -f1 panvk-linux-g57-*.tzst.sha256)" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 --clobber
+          # A component the apk fetches by tag, never something users install: it must not become
+          # the repo's Latest release or appear as a pre-release, also when re-uploaded.
+          gh release edit "${{ inputs.tag }}" --latest=false --prerelease=false

@@ -1,0 +1,22 @@
+--- a/src/panfrost/vulkan/panvk_device_memory.c	2026-10-13 05:31:15.477852682 +0700
++++ b/src/panfrost/vulkan/panvk_device_memory.c	2026-10-13 05:31:43.141578373 +0700
+@@ -629,6 +629,11 @@
+ 
+    if (!physical_device->kbase_node_path[0] || !getenv("PANVK_AHB_WSI"))
+       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++#ifndef __ANDROID__
++   /* AHB interop is Android-only: glibc has no AHardwareBuffer, so the
++    * helpers this path calls are not compiled in. */
++   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++#else
+ 
+    /* 4 bytes/pixel only (row math below assumes it). */
+    switch (format) {
+@@ -730,6 +735,7 @@
+            w, h, out.stride, dmabuf);
+    *out_mem = mem_handle;
+    return VK_SUCCESS;
++#endif
+ }
+ 
+ 
