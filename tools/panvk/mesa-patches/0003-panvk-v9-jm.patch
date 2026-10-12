@@ -1,0 +1,146 @@
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -162,6 +162,7 @@
+ 
+    mali_ptr vpd;
+    mali_ptr push_uniforms;
++   mali_ptr tsd;
+ };
+ 
+ struct panvk_cmd_compute_state {
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -1397,21 +1397,25 @@
+    switch (stage) {
+    case MESA_SHADER_COMPUTE:
+       cmd->state.compute.shader = shader;
++#if PAN_ARCH <= 7
+       memset(&cmd->state.compute.cs.desc, 0,
+              sizeof(cmd->state.compute.cs.desc));
++#endif
+       break;
+    case MESA_SHADER_VERTEX:
+       cmd->state.gfx.vs.shader = shader;
+       cmd->state.gfx.linked = false;
++#if PAN_ARCH <= 7
+       memset(&cmd->state.gfx.vs.desc, 0, sizeof(cmd->state.gfx.vs.desc));
++#endif
+       break;
+    case MESA_SHADER_FRAGMENT:
+       cmd->state.gfx.fs.shader = shader;
+       cmd->state.gfx.linked = false;
+ #if PAN_ARCH <= 7
+       cmd->state.gfx.fs.rsd = 0;
+-#endif
+       memset(&cmd->state.gfx.fs.desc, 0, sizeof(cmd->state.gfx.fs.desc));
++#endif
+       break;
+    default:
+       assert(!"Unsupported stage");
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+--- a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+@@ -401,16 +401,20 @@
+       push_desc_set_write(cmdbuf, &cmdbuf->state.gfx.desc_state,
+                           pPushDescriptorSetInfo);
+ 
++#if PAN_ARCH <= 7
+       memset(&cmdbuf->state.gfx.vs.desc, 0, sizeof(cmdbuf->state.gfx.vs.desc));
+       memset(&cmdbuf->state.gfx.fs.desc, 0, sizeof(cmdbuf->state.gfx.fs.desc));
++#endif
+    }
+ 
+    if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+       push_desc_set_write(cmdbuf, &cmdbuf->state.compute.desc_state,
+                           pPushDescriptorSetInfo);
+ 
++#if PAN_ARCH <= 7
+       memset(&cmdbuf->state.compute.cs.desc, 0,
+              sizeof(cmdbuf->state.compute.cs.desc));
++#endif
+    }
+ }
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -43,7 +43,9 @@
+ 
+    save_ctx->push_constants = cmdbuf->state.push_constants;
+    save_ctx->cs.shader = cmdbuf->state.compute.shader;
++#if PAN_ARCH <= 7
+    save_ctx->cs.desc = cmdbuf->state.compute.cs.desc;
++#endif
+ }
+ 
+ void
+@@ -70,10 +72,8 @@
+    }
+ 
+    cmdbuf->state.compute.shader = save_ctx->cs.shader;
++#if PAN_ARCH <= 7
+    cmdbuf->state.compute.cs.desc = save_ctx->cs.desc;
+-
+-#if PAN_ARCH >= 9
+-   cmdbuf->state.compute.cs.desc.res_table = 0;
+ #endif
+ }
+ 
+@@ -97,9 +97,11 @@
+ 
+    save_ctx->push_constants = cmdbuf->state.push_constants;
+    save_ctx->fs.shader = cmdbuf->state.gfx.fs.shader;
++   save_ctx->vs.shader = cmdbuf->state.gfx.vs.shader;
++#if PAN_ARCH <= 7
+    save_ctx->fs.desc = cmdbuf->state.gfx.fs.desc;
+-   save_ctx->vs.shader = cmdbuf->state.gfx.vs.shader;
+    save_ctx->vs.desc = cmdbuf->state.gfx.vs.desc;
++#endif
+    save_ctx->vb0 = cmdbuf->state.gfx.vb.bufs[0];
+ 
+    save_ctx->dyn_state.all = cmdbuf->vk.dynamic_graphics_state;
+@@ -131,18 +133,17 @@
+    }
+ 
+    cmdbuf->state.gfx.fs.shader = save_ctx->fs.shader;
++   cmdbuf->state.gfx.vs.shader = save_ctx->vs.shader;
++#if PAN_ARCH <= 7
+    cmdbuf->state.gfx.fs.desc = save_ctx->fs.desc;
+-   cmdbuf->state.gfx.vs.shader = save_ctx->vs.shader;
+    cmdbuf->state.gfx.vs.desc = save_ctx->vs.desc;
++#endif
+    cmdbuf->state.gfx.vb.bufs[0] = save_ctx->vb0;
+ 
+ #if PAN_ARCH <= 7
+    cmdbuf->state.gfx.vs.attribs = 0;
+    cmdbuf->state.gfx.vs.attrib_bufs = 0;
+    cmdbuf->state.gfx.fs.rsd = 0;
+-#else
+-   cmdbuf->state.gfx.fs.desc.res_table = 0;
+-   cmdbuf->state.gfx.vs.desc.res_table = 0;
+ #endif
+ 
+    cmdbuf->vk.dynamic_graphics_state = save_ctx->dyn_state.all;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_fb_preload.c b/src/panfrost/vulkan/panvk_vX_cmd_fb_preload.c
+--- a/src/panfrost/vulkan/panvk_vX_cmd_fb_preload.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_fb_preload.c
+@@ -196,6 +196,17 @@
+       cfg.register_allocation = MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
+       cfg.binary = panvk_priv_mem_dev_addr(shader->code_mem);
+       cfg.preload.r48_r63 = shader->info.preload >> 48;
++   }
++
++   /* v9 JM has no CSF builder: keep the TSD in the gfx state and allocate it
++    * lazily from the current batch. */
++   struct panvk_batch *batch = cmdbuf->cur_batch;
++   if (!cmdbuf->state.gfx.tsd) {
++      if (!batch || !batch->tls.gpu)
++         batch->tls = panvk_cmd_alloc_desc(cmdbuf, LOCAL_STORAGE);
++      if (!batch || !batch->tls.gpu)
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      cmdbuf->state.gfx.tsd = batch->tls.gpu;
+    }
+ #endif
+ 

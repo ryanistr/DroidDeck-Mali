@@ -153,6 +153,7 @@ object SessionFiles {
                 context.assets.open("linuxfs/$asset").use { input ->
                     staged.outputStream().use { output -> FileUtils.copy(input, output) }
                 }
+                staged.setReadable(true, false)
                 installed = staged.setExecutable(true, false) && staged.renameTo(target)
             } catch (e: Exception) {
                 Log.w(TAG, "could not stage $relative", e)

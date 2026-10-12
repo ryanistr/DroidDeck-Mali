@@ -24,7 +24,7 @@ static unsigned g_frame = 1;
 /* One render pass + pipeline per target format: the screen swapchain's, the scene image's, the HDR
  * composition's. */
 #define NFMT 4
-static struct { VkFormat fmt; VkRenderPass rp; VkPipeline pipe; } g_out[NFMT];
+static struct { VkFormat fmt; VkRenderPass rp; VkPipeline pipe_blend; VkPipeline pipe_opaque; } g_out[NFMT];
 
 #define NSRC 32
 static struct { VkImage img; VkImageView view; VkDescriptorSet ds; unsigned frame; } g_src[NSRC];
@@ -92,7 +92,7 @@ static VkRenderPass make_rp(VkFormat fmt) {
     return rp;
 }
 
-static VkPipeline make_pipe(VkRenderPass rp) {
+static VkPipeline make_pipe(VkRenderPass rp, int blend) {
     VkPipelineShaderStageCreateInfo st[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = g_vert, .pName = "main"},
@@ -113,11 +113,15 @@ static VkPipeline make_pipe(VkRenderPass rp) {
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     /* The target's alpha is left alone: the screen is opaque whatever is drawn onto it. */
     VkPipelineColorBlendAttachmentState ba = {
-        .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .blendEnable = blend ? VK_TRUE : VK_FALSE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT};
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                          (blend ? 0 : VK_COLOR_COMPONENT_A_BIT)};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .attachmentCount = 1, .pAttachments = &ba};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2,
@@ -131,6 +135,12 @@ static VkPipeline make_pipe(VkRenderPass rp) {
 }
 
 static void objects_destroy(void) {
+    for (int i = 0; i < NFMT; i++) {
+        if (g_out[i].pipe_blend) g_vk.DestroyPipeline(g_dev, g_out[i].pipe_blend, NULL);
+        if (g_out[i].pipe_opaque) g_vk.DestroyPipeline(g_dev, g_out[i].pipe_opaque, NULL);
+        if (g_out[i].rp) g_vk.DestroyRenderPass(g_dev, g_out[i].rp, NULL);
+    }
+    memset(g_out, 0, sizeof(g_out));
     if (g_vert) g_vk.DestroyShaderModule(g_dev, g_vert, NULL);
     if (g_frag) g_vk.DestroyShaderModule(g_dev, g_frag, NULL);
     if (g_dpool) g_vk.DestroyDescriptorPool(g_dev, g_dpool, NULL);
@@ -180,15 +190,20 @@ fail:
 
 static int out_slot(VkFormat fmt) {
     int i;
-    for (i = 0; i < NFMT && g_out[i].pipe; i++) if (g_out[i].fmt == fmt) return i;
+    for (i = 0; i < NFMT && g_out[i].pipe_blend; i++) if (g_out[i].fmt == fmt) return i;
     if (i == NFMT) return -1;
     VkRenderPass rp = make_rp(fmt);
-    VkPipeline pipe = rp ? make_pipe(rp) : VK_NULL_HANDLE;
-    if (!pipe) {
+    VkPipeline pipe_blend = rp ? make_pipe(rp, 1) : VK_NULL_HANDLE;
+    VkPipeline pipe_opaque = rp ? make_pipe(rp, 0) : VK_NULL_HANDLE;
+    if (!pipe_blend || !pipe_opaque) {
+        if (pipe_blend) g_vk.DestroyPipeline(g_dev, pipe_blend, NULL);
+        if (pipe_opaque) g_vk.DestroyPipeline(g_dev, pipe_opaque, NULL);
         if (rp) g_vk.DestroyRenderPass(g_dev, rp, NULL);
         return -1;
     }
-    g_out[i].fmt = fmt; g_out[i].rp = rp; g_out[i].pipe = pipe;
+    g_out[i].fmt = fmt; g_out[i].rp = rp;
+    g_out[i].pipe_blend = pipe_blend;
+    g_out[i].pipe_opaque = pipe_opaque;
     return i;
 }
 
@@ -273,7 +288,7 @@ static void src_layout(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkI
 }
 
 int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, int src_h, int src_general,
-                VkImage dst, VkFormat dst_fmt, int dst_w, int dst_h, const VkImageBlit *blit) {
+                VkImage dst, VkFormat dst_fmt, int dst_w, int dst_h, const VkImageBlit *blit, int blend) {
     if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || objects_ensure() != 0) return -1;
     int slot = out_slot(dst_fmt);
     if (slot < 0) return -1;
@@ -305,7 +320,7 @@ int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, i
     g_vk.CmdBeginRenderPass(cmd, &rpi, VK_SUBPASS_CONTENTS_INLINE);
     g_vk.CmdSetViewport(cmd, 0, 1, &vp);
     g_vk.CmdSetScissor(cmd, 0, 1, &rpi.renderArea);
-    g_vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_out[slot].pipe);
+    g_vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend ? g_out[slot].pipe_blend : g_out[slot].pipe_opaque);
     g_vk.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl, 0, 1, &ds, 0, NULL);
     g_vk.CmdPushConstants(cmd, g_pl, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
     g_vk.CmdDraw(cmd, 4, 1, 0, 0);

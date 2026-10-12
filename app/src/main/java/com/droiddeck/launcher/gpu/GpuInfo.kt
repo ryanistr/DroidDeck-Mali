@@ -99,6 +99,7 @@ data class GpuInfo(
         /** [name] when the device names no GPU; English, as the device report shows it. */
         private const val UNNAMED = "this GPU"
 
+        @JvmStatic
         fun detect(): GpuInfo {
             android.util.Log.i("GpuInfo", "=== GpuInfo.detect() START ===")
             // Check for Adreno (KGSL or vendor Vulkan driver)
@@ -237,6 +238,8 @@ data class GpuInfo(
         } catch (_: Exception) {
             ""
         }
+
+        internal fun familyOf(isAdreno: Boolean, model: Int): Family = familyOf(isAdreno, false, model)
 
         internal fun familyOf(isAdreno: Boolean, isMali: Boolean, model: Int): Family = when {
             isMali -> when {

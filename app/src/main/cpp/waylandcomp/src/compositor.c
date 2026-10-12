@@ -34,6 +34,7 @@
 #include <sys/timerfd.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/mman.h>
 #include <android/log.h>
 #include <wayland-server.h>
 
@@ -773,26 +774,67 @@ extern void droiddeck_on_game_frame(void);
  * ("" when /proc gave none) - the app arms its CPU affinity on it (X11 does that from window events). */
 extern void droiddeck_on_game_program(int pid, const char *program);
 
+static int g_dmabuf_import_unsupported = 0;
+
 static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_resource *buffer) {
-    if (s->dmabuf != buffer || s->dmabuf_buf != b) {
-        drop_dmabuf(s, 1);
-        s->dmabuf = buffer;
-        s->dmabuf_buf = b;
-        b->refs++;
-        s->dmabuf_destroy.notify = on_dmabuf_destroyed;
-        wl_resource_add_destroy_listener(buffer, &s->dmabuf_destroy);
-    }
-    if (!b->img && !b->import_failed && b->n_planes >= 1) {
+    if (!b->img && !b->import_failed && !g_dmabuf_import_unsupported && b->n_planes >= 1) {
         b->img = vkp_image_from_dmabuf(b->fd[0], b->format, b->modifier, b->width, b->height,
                                        b->stride[0], b->offset[0]);
         if (b->img && g_zero_copy) sc_layer_probe_dmabuf_fd(b->fd[0]);
         if (!b->img) {
             b->import_failed = 1;
-            WLOGE("dmabuf import failed (%dx%d fmt=0x%08x mod=0x%llx)", b->width, b->height,
-                  b->format, (unsigned long long)b->modifier);
+            g_dmabuf_import_unsupported = 1;
+            WLOGE("dmabuf import failed (%dx%d fmt=0x%08x mod=0x%llx), falling back to mmap upload",
+                  b->width, b->height, b->format, (unsigned long long)b->modifier);
         }
+    } else if (g_dmabuf_import_unsupported) {
+        b->import_failed = 1;
     }
-    if (s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
+    if (b->img) {
+        if (s->dmabuf != buffer || s->dmabuf_buf != b) {
+            drop_dmabuf(s, 1);
+            s->dmabuf = buffer;
+            s->dmabuf_buf = b;
+            b->refs++;
+            s->dmabuf_destroy.notify = on_dmabuf_destroyed;
+            wl_resource_add_destroy_listener(buffer, &s->dmabuf_destroy);
+        }
+        if (s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
+    } else if (b->n_planes >= 1 && b->fd[0] >= 0) {
+        if (s->dmabuf) drop_dmabuf(s, 0);
+        uint32_t page_mask = (uint32_t)sysconf(_SC_PAGESIZE) - 1;
+        uint32_t align_offset = b->offset[0] & ~page_mask;
+        uint32_t off_in_page = b->offset[0] & page_mask;
+        size_t map_size = (size_t)b->stride[0] * (size_t)b->height + off_in_page;
+        void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, b->fd[0], (off_t)align_offset);
+        if (ptr != MAP_FAILED) {
+            const uint8_t *src_bytes = (const uint8_t *)ptr + off_in_page;
+            if (s->shm_img && (vkp_image_width(s->shm_img) != b->width || vkp_image_height(s->shm_img) != b->height)) {
+                vkp_image_destroy(s->shm_img);
+                s->shm_img = NULL;
+            }
+            if (!s->shm_img) s->shm_img = vkp_image_create_shm(b->width, b->height);
+            if (s->shm_img) vkp_image_upload_shm(s->shm_img, src_bytes, b->stride[0]);
+            munmap(ptr, map_size);
+        } else {
+            static int64_t last_mmap_err_ns = 0;
+            int64_t now = now_ns();
+            if (now - last_mmap_err_ns > 2000000000LL) {
+                WLOGE("mmap fallback failed on fd %d (%zu bytes): %s", b->fd[0], map_size, strerror(errno));
+                last_mmap_err_ns = now;
+            }
+        }
+        for (int i = 0; i < b->n_planes; i++) {
+            if (b->fd[i] >= 0) {
+                close(b->fd[i]);
+                b->fd[i] = -1;
+            }
+        }
+        wl_buffer_send_release(buffer);
+    } else {
+        if (s->dmabuf) drop_dmabuf(s, 0);
+        wl_buffer_send_release(buffer);
+    }
     /* The size of the frames a window commits, when it changes after the first announcement: the
      * program rebuilt its swapchain. It earns a line of its own, because a game whose swapchain
      * came back smaller than it was is exactly what a picture suddenly filling one corner of the
@@ -808,7 +850,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
     s->buf_w = b->width;
     s->buf_h = b->height;
     s->buf_alpha = (b->format & 0xff) == 'A';
-    s->has_content = b->img != NULL;
+    s->has_content = (b->img != NULL) || (s->shm_img != NULL);
     g_stat_dmabuf++;
     const int announced_now = !s->announced_vulkan;
     if (!s->announced_vulkan) {
@@ -824,6 +866,9 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                        vkp_modifier_name(b->modifier),
                        ahb_swapchain_has_ahb(b) ? "gralloc buffers: can go on the display layer without a copy"
                                                 : "dma-buf: copied into the screen swapchain");
+        else if (s->shm_img)
+            droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland (mmap fallback): %dx%d",
+                       name, b->width, b->height);
         else if (ahb_swapchain_has_ahb(b))
             droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d on its own display layer only "
                        "(gralloc buffers the compositor cannot import for the copy path)",
@@ -839,7 +884,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
      * game ran at 60. So a new window takes the HUD only when it is at least as big (a
      * full-screen gamescope over the desktop still does), and a window gone quiet for a second
      * gives way to whatever draws next. */
-    if (s != g_hud_surface && (b->img || ahb_swapchain_has_ahb(b)) &&
+    if (s != g_hud_surface && (b->img || s->shm_img || ahb_swapchain_has_ahb(b)) &&
         (!g_hud_surface || now_ns() - g_hud_last_ns > 1000000000LL ||
          (announced_now && (int64_t)b->width * b->height >= (int64_t)g_hud_surface->buf_w * g_hud_surface->buf_h))) {
         char name[160];
@@ -861,6 +906,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                    ten ? "10-bit A2B10G10R10" : "8-bit", vkp_modifier_name(b->modifier),
                    af ? ", gralloc " : ", no gralloc buffer (copy path only)", af ? droiddeck_ahb_format_name(af) : "",
                    b->img ? "the compositor imported it"
+                          : s->shm_img ? "imported via mmap fallback"
                           : af ? "the compositor's driver could NOT import it (display layer only, fullscreen)"
                                : "the compositor's driver could NOT import it (nothing can show it)");
         s->hdr_fmt_logged = b->format;

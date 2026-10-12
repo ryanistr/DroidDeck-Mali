@@ -608,7 +608,11 @@ class SessionService : Service() {
             guest.add("LIBGL_KOPPER_DRI2=true")
             Log.i(TAG, "GPU: Adreno detected (${gpuInfo.family.label}), using Zink/Turnip")
         }
-        LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
+        LinuxRuntime.vulkanIcd(this)?.let {
+            val guestIcd = "/usr/share/vulkan/icd.d/" + it.name
+            guest.add("VK_ICD_FILENAMES=$guestIcd")
+            guest.add("VK_DRIVER_FILES=$guestIcd")
+        }
         // An imported glibc driver (Turnip for Adreno, PanVK for Mali), when one is set: the session
         // script checks the manifest and its library from inside and points the loader at it with
         // VK_DRIVER_FILES, so the runtime's own driver above stays untouched and is what a bad

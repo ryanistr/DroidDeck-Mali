@@ -114,15 +114,24 @@ public final class LinuxRuntime {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
-        // Prefer PanVK ICD for Mali devices
-        for (File manifest : manifests) {
-            if (manifest.getName().contains("panvk")) return manifest;
+        com.droiddeck.launcher.gpu.GpuInfo.Family family = com.droiddeck.launcher.gpu.GpuInfo.detect().getFamily();
+        boolean isMali = family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
+                         family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
+                         family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
+                         family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN;
+        if (isMali) {
+            for (File manifest : manifests) {
+                if (manifest.getName().contains("panvk")) return manifest;
+            }
+            return null;
         }
-        // Fallback to freedreno for Adreno
         for (File manifest : manifests) {
             if (manifest.getName().contains("freedreno")) return manifest;
         }
-        return manifests.length > 0 ? manifests[0] : null;
+        for (File manifest : manifests) {
+            if (!manifest.getName().contains("lvp")) return manifest;
+        }
+        return null;
     }
 
     /**

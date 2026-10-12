@@ -35,6 +35,9 @@ struct vkp_image {
     int in_general;           /* shm images: moved from PREINITIALIZED to GENERAL */
     VkFormat fmt;
     int sampled;              /* created with SAMPLED usage: the alpha pass can read it */
+    VkBuffer staging_buf;
+    VkDeviceMemory staging_mem;
+    int needs_upload;
 };
 
 static ANativeWindow *g_window;  /* the window frames go to; compositor thread only */
@@ -1030,19 +1033,6 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
     return img;
 }
 
-/* Linear wl_shm images can use the blend pass only if the driver samples them with a linear filter. */
-static int shm_sampled(void) {
-    static int known;
-    if (!known) {
-        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        VkFormatProperties2 fp = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
-        if (g_vk.GetPhysicalDeviceFormatProperties2)
-            g_vk.GetPhysicalDeviceFormatProperties2(g_pd, VK_FORMAT_B8G8R8A8_UNORM, &fp);
-        known = (fp.formatProperties.linearTilingFeatures & need) == need ? 1 : -1;
-    }
-    return known == 1;
-}
 
 struct vkp_image *vkp_image_create_shm(int w, int h) {
     if (w <= 0 || h <= 0 || dev_init() != 0) return NULL;
@@ -1051,34 +1041,55 @@ struct vkp_image *vkp_image_create_shm(int w, int h) {
     if (!img) return NULL;
     img->w = w; img->h = h;
     img->fmt = VK_FORMAT_B8G8R8A8_UNORM;
-    img->sampled = shm_sampled();
+    img->sampled = 1;
 
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-        .format = img->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (img->sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
+        .format = img->fmt, .extent = {(uint32_t)w, (uint32_t)h, 1}, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED};
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     if (g_vk.CreateImage(g_dev, &ici, NULL, &img->image) != VK_SUCCESS) { free(img); return NULL; }
 
     VkMemoryRequirements req;
     g_vk.GetImageMemoryRequirements(g_dev, img->image, &req);
-    int idx = memory_type(req.memoryTypeBits,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    int idx = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (idx < 0) idx = memory_type(req.memoryTypeBits, 0);
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                .allocationSize = req.size, .memoryTypeIndex = (uint32_t)idx};
+                                .allocationSize = req.size, .memoryTypeIndex = (uint32_t)(idx < 0 ? 0 : idx)};
     if (idx < 0 || g_vk.AllocateMemory(g_dev, &mai, NULL, &img->mem) != VK_SUCCESS) {
         g_vk.DestroyImage(g_dev, img->image, NULL); free(img); return NULL;
     }
     g_vk.BindImageMemory(g_dev, img->image, img->mem, 0);
 
-    VkImageSubresource subr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
-    VkSubresourceLayout lay;
-    g_vk.GetImageSubresourceLayout(g_dev, img->image, &subr, &lay);
-    img->offset = lay.offset;
-    img->row_pitch = lay.rowPitch;
-    if (g_vk.MapMemory(g_dev, img->mem, 0, req.size, 0, &img->map) != VK_SUCCESS) {
+    /* Host-visible staging buffer for pixel transfers */
+    VkDeviceSize buf_size = (VkDeviceSize)w * (VkDeviceSize)h * 4;
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = buf_size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (g_vk.CreateBuffer(g_dev, &bci, NULL, &img->staging_buf) != VK_SUCCESS) {
+        vkp_image_destroy(img); return NULL;
+    }
+
+    VkMemoryRequirements breq;
+    g_vk.GetBufferMemoryRequirements(g_dev, img->staging_buf, &breq);
+    int bidx = memory_type(breq.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (bidx < 0) bidx = memory_type(breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VkMemoryAllocateInfo bmai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = breq.size, .memoryTypeIndex = (uint32_t)(bidx < 0 ? 0 : bidx)};
+    if (bidx < 0 || g_vk.AllocateMemory(g_dev, &bmai, NULL, &img->staging_mem) != VK_SUCCESS) {
+        vkp_image_destroy(img); return NULL;
+    }
+    g_vk.BindBufferMemory(g_dev, img->staging_buf, img->staging_mem, 0);
+
+    img->offset = 0;
+    img->row_pitch = (VkDeviceSize)w * 4;
+    if (g_vk.MapMemory(g_dev, img->staging_mem, 0, breq.size, 0, &img->map) != VK_SUCCESS) {
         vkp_image_destroy(img); return NULL;
     }
     return img;
@@ -1091,8 +1102,18 @@ void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
     size_t rowbytes = (size_t)img->w * 4;
     if ((size_t)stride < rowbytes) rowbytes = (size_t)stride;
     for (int y = 0; y < img->h; y++)
-        memcpy((uint8_t *)img->map + img->offset + (size_t)y * img->row_pitch,
+        memcpy((uint8_t *)img->map + (size_t)y * img->row_pitch,
                (const uint8_t *)data + (size_t)y * stride, rowbytes);
+    if (g_vk.FlushMappedMemoryRanges) {
+        VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = img->staging_mem,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        g_vk.FlushMappedMemoryRanges(g_dev, 1, &range);
+    }
+    img->needs_upload = 1;
 }
 
 int vkp_image_width(const struct vkp_image *img) { return img ? img->w : 0; }
@@ -1102,7 +1123,9 @@ void vkp_image_destroy(struct vkp_image *img) {
     if (!img) return;
     if (g_dev) {
         blendp_forget_image(img->image);
-        if (img->map) g_vk.UnmapMemory(g_dev, img->mem);
+        if (img->map && img->staging_mem) g_vk.UnmapMemory(g_dev, img->staging_mem);
+        if (img->staging_buf) g_vk.DestroyBuffer(g_dev, img->staging_buf, NULL);
+        if (img->staging_mem) g_vk.FreeMemory(g_dev, img->staging_mem, NULL);
         if (img->image) g_vk.DestroyImage(g_dev, img->image, NULL);
         if (img->mem) g_vk.FreeMemory(g_dev, img->mem, NULL);
     }
@@ -1151,13 +1174,14 @@ static int draw_to_scene_blit(const struct vkp_draw *d, int scene_w, int scene_h
     return map_draw(d, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, (float)scene_w, (float)scene_h, blit);
 }
 
-/* A translucent draw needs source-over blending; every other draw keeps the existing blit path. */
+/* A translucent draw needs source-over blending; linear images without linear blit support
+ * also need shader quad sampling; every other draw keeps the existing blit path. */
 static void record_draw(VkCommandBuffer cmd, const struct vkp_draw *d, const VkImageBlit *blit, VkImage target,
                         VkFormat target_fmt, int target_w, int target_h, VkFilter filter) {
     const struct vkp_image *im = d->img;
-    if (d->blend && im->sampled &&
+    if ((d->blend || !im->dmabuf) && im->sampled &&
         blendp_draw(cmd, im->image, im->fmt, im->w, im->h, !im->dmabuf, target, target_fmt, target_w, target_h,
-                    blit) == 0)
+                    blit, d->blend) == 0)
         return;
     g_vk.CmdBlitImage(cmd, im->image, im->dmabuf ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
                       target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, blit, filter);
@@ -1629,19 +1653,57 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
                 .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+        } else if (im->staging_buf) {
+            if (im->needs_upload) {
+                VkImageMemoryBarrier pre_copy = {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .oldLayout = im->in_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = im->image, .subresourceRange = range,
+                    .srcAccessMask = im->in_general ? VK_ACCESS_SHADER_READ_BIT : 0,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+                g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &pre_copy);
+
+                VkBufferImageCopy region = {
+                    .bufferOffset = 0,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {(uint32_t)im->w, (uint32_t)im->h, 1}};
+                g_vk.CmdCopyBufferToImage(cmd, im->staging_buf, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                VkImageMemoryBarrier post_copy = {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = im->image, .subresourceRange = range,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+                g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                        0, 0, NULL, 0, NULL, 1, &post_copy);
+                im->needs_upload = 0;
+                im->in_general = 1;
+            }
         } else if (!im->in_general) {
             bars[nb++] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
                 .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = im->image, .subresourceRange = range,
-                .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+                .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
             im->in_general = 1;
         }
     }
     g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                                  (pass ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0),
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
+                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                            0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
     free(bars);
 
     /* Clear the composition target to black (the letterbox on the direct path, the desktop's
@@ -1705,8 +1767,11 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g_images[img],
-            .subresourceRange = range, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
-        g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            .subresourceRange = range,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+        g_vk.CmdPipelineBarrier(cmd,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 0, 0, NULL, 0, NULL, 1, &b_present);
     } else {
         /* 2. Effects (the hook): scaling to the scene's mapped size, then the effects, in the X11

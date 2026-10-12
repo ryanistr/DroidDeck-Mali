@@ -21,8 +21,9 @@ void blendp_begin_frame(void);
 
 /* Record one surface over `dst`. `dst` is in TRANSFER_DST_OPTIMAL before and after. `src` was created
  * with SAMPLED usage and is in GENERAL (src_general) or TRANSFER_SRC_OPTIMAL, and is left there.
- * `blit` is the draw as the blit path maps it. 0 = recorded, -1 = unavailable (nothing recorded). */
+ * `blit` is the draw as the blit path maps it. `blend` specifies whether alpha blending is enabled.
+ * 0 = recorded, -1 = unavailable (nothing recorded). */
 int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, int src_h, int src_general,
-                VkImage dst, VkFormat dst_fmt, int dst_w, int dst_h, const VkImageBlit *blit);
+                VkImage dst, VkFormat dst_fmt, int dst_w, int dst_h, const VkImageBlit *blit, int blend);
 
 #endif

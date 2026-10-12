@@ -10,6 +10,7 @@ cd "$WORK"
 # pacman's download sandbox (Landlock + the alpm user) cannot be set up inside the runner's
 # container; the packages still come signed from Arch Linux ARM's mirrors.
 grep -q '^DisableSandbox' /etc/pacman.conf || sed -i 's/^\[options\]/[options]\nDisableSandbox/' /etc/pacman.conf
+printf '#!/bin/bash\nexec /usr/bin/pacman --noconfirm "$@"\n' > /usr/local/bin/pacman && chmod 755 /usr/local/bin/pacman
 # The geo-redirecting mirror answered 500s and connection resets mid-transaction; name a few
 # concrete mirrors ahead of it so pacman has somewhere to fall over to.
 { for m in https://ca.us.mirror.archlinuxarm.org https://fl.us.mirror.archlinuxarm.org https://de3.mirror.archlinuxarm.org https://nl.mirror.archlinuxarm.org; do echo "Server = $m/\$arch/\$repo"; done; cat /etc/pacman.d/mirrorlist; } > /etc/pacman.d/mirrorlist.new

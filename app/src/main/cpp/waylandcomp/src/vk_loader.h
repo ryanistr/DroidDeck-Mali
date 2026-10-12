@@ -38,7 +38,10 @@
     X(UpdateDescriptorSets) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) \
     X(CmdBindDescriptorSets) X(CmdPushConstants) X(CmdDraw) X(CmdSetViewport) X(CmdSetScissor) \
     /* frame generation (framegen_bridge.c / vk_present.c per-present sync slots) */ \
-    X(DestroySemaphore)
+    X(DestroySemaphore) \
+    /* staging buffers & transfer (vk_present.c optimal shm image upload) */ \
+    X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory) \
+    X(CmdCopyBufferToImage) X(FlushMappedMemoryRanges)
 
 struct vk_api {
 #define X(n) PFN_vk##n n;
