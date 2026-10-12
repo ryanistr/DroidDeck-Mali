@@ -49,6 +49,16 @@ const KBASE_IOCTL_MEM_FREE: u32      = _iow(KBASE_IOCTL_TYPE, 0x07, 8);    // 0x
 // Must be called after SET_FLAGS + mmap tracking to init memory zones
 const KBASE_IOCTL_MEM_EXEC_INIT: u32 = _iow(KBASE_IOCTL_TYPE, 0x0e, 8);   // 0x4008800e
 
+// GPU property ids from the kernel's uapi (mali_kbase_ioctl.h). Buffer entries are a u32 key whose
+// low 2 bits give the value's width and whose upper bits are the id.
+const KBASE_GPUPROP_PRODUCT_ID: u32 = 1;
+const KBASE_GPUPROP_RAW_GPU_ID: u32 = 55;
+
+/// Used when the kernel hands back no usable props and nothing overrides them: the value this
+/// backend reported before it read them, a G57 (Mesa names the GPU from it, so it is only right
+/// when it comes from the kernel).
+const FALLBACK_GPU_ID: u64 = 0x9091;
+
 // Tracking handle for mmap after open
 const BASE_MEM_MAP_TRACKING_HANDLE: u64 = 0x3000;
 
@@ -365,18 +375,31 @@ impl KbaseDevice {
 
         // Second call with allocated buffer
         let mut props_buf = vec![0u8; props_size];
-        props.buffer = props_buf.as_mut_ptr() as u64;
+        let buf_ptr = props_buf.as_mut_ptr() as u64;
+        props.buffer = buf_ptr;
         props.size = props_size as u32;
-        let gpu_id = unsafe {
+        let filled = unsafe {
             let ret = libc::ioctl(file.as_raw_fd(), KBASE_IOCTL_GET_GPUPROPS as _, &mut props);
             if ret < 0 {
                 eprintln!("GET_GPUPROPS (read) failed");
                 return Err(std::io::Error::last_os_error());
             }
-            let id = parse_u32_env("PANVK_KBASE_GPU_ID").unwrap_or(0x9091) as u64;
-            eprintln!("panvk-kbase: initialized GPU ID 0x{:x}", id);
-            id
+            ret as usize
         };
+
+        // Mesa names the GPU from this value, so a hardcoded one mislabels every device (0x9091 is
+        // a G57, 0x9080 the G77 this runs on). RAW_GPU_ID is the register the kernel also prints in
+        // gpuinfo; PRODUCT_ID is only its top half and is zero on this hardware, hence a fallback.
+        let (product_id, raw_gpu_id) = parse_gpu_props(&props_buf[..filled.min(props_size)]);
+        let gpu_id = parse_u32_env("PANVK_KBASE_GPU_ID")
+            .map(u64::from)
+            .or(raw_gpu_id)
+            .or_else(|| product_id.filter(|id| *id != 0).map(u64::from))
+            .unwrap_or(FALLBACK_GPU_ID);
+        eprintln!(
+            "panvk-kbase: initialized GPU ID 0x{:x} (product_id={:?}, raw_gpu_id={:?})",
+            gpu_id, product_id, raw_gpu_id
+        );
 
         Ok(Self {
             fd: file.into(),
@@ -602,6 +625,36 @@ fn event_code_str(code: u32) -> &'static str {
         BASE_JD_EVENT_JOB_CANCELLED => "JOB_CANCELLED",
         _ => "UNKNOWN_FAULT",
     }
+}
+
+/// The GPU identity out of a GET_GPUPROPS buffer: (product_id, raw_gpu_id).
+///
+/// The kernel packs `u32 key` then the value, tightly, with the width in the key's low two bits:
+/// 0 = u8, 1 = u16, 2 = u32, 3 = u64. Anything unrecognised is skipped by width, so a future
+/// property cannot desynchronise the walk.
+fn parse_gpu_props(buf: &[u8]) -> (Option<u32>, Option<u64>) {
+    let mut product_id = None;
+    let mut raw_gpu_id = None;
+    let mut at = 0usize;
+    while at + 4 <= buf.len() {
+        let key = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        at += 4;
+        let width = 1usize << (key & 0x3);
+        if at + width > buf.len() {
+            break;
+        }
+        let mut value: u64 = 0;
+        for byte in 0..width {
+            value |= (buf[at + byte] as u64) << (8 * byte);
+        }
+        at += width;
+        match key >> 2 {
+            KBASE_GPUPROP_RAW_GPU_ID => raw_gpu_id = Some(value),
+            KBASE_GPUPROP_PRODUCT_ID => product_id = Some(value as u32),
+            _ => {}
+        }
+    }
+    (product_id, raw_gpu_id)
 }
 
 fn parse_u32_env(name: &str) -> Option<u32> {
@@ -942,6 +995,23 @@ mod tests {
     fn test_core_req_defaults() {
         assert_eq!(get_frag_core_req(), 0x003);
         assert_eq!(get_vtc_core_req(), 0x016);
+    }
+
+    #[test]
+    fn test_parse_gpu_props() {
+        let mut buf = Vec::new();
+        // An unrecognised u16 first: the walk has to skip it by width and stay in sync.
+        buf.extend_from_slice(&((7u32 << 2) | 1).to_le_bytes());
+        buf.extend_from_slice(&0x1234u16.to_le_bytes());
+        buf.extend_from_slice(&((KBASE_GPUPROP_PRODUCT_ID << 2) | 2).to_le_bytes());
+        buf.extend_from_slice(&0x9080u32.to_le_bytes());
+        buf.extend_from_slice(&((KBASE_GPUPROP_RAW_GPU_ID << 2) | 3).to_le_bytes());
+        buf.extend_from_slice(&0x9080u64.to_le_bytes());
+        assert_eq!(parse_gpu_props(&buf), (Some(0x9080), Some(0x9080)));
+
+        // A short or empty buffer is what an old kernel returns; neither may panic.
+        assert_eq!(parse_gpu_props(&[]), (None, None));
+        assert_eq!(parse_gpu_props(&buf[..7]), (None, None));
     }
 }
 
