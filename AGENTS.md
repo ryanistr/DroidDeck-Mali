@@ -204,6 +204,7 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 - **Comments explain *why*, one short line, and are omitted when the code is self-evident.** Do not narrate the code or talk to the reader through comments.
 - **Commits:** conventional-ish prefixes (`feat:`, `fix:`, `perf:`, or a plain capitalized summary), often with the PR number (`(#NNN)`). No `Co-Authored-By` / agent attribution lines, ever.
 - **`droiddeckctl` gating:** `run`, `guest`, `cdp`, `env` mutations, `override`, and `prefs` require **Setup → Session → Debugging tools** (off by default, exit code 7 when refused). The bridge provider answers commands as JSON over `content://com.droiddeck.launcher.agent` and requires `android.permission.DUMP`. See `docs/agent-control.md` for commands, exit codes, and limits.
+- **Every new Mali/PanVK/device finding updates `docs/development/panvk-mali-g77-bringup.md` in the same commit/change that produced it.** If a discovery is left only in chat or session logs it is effectively lost; the doc is the durable memory. This covers driver builds, CI gotchas, on-device measurements, dead ends, and fixes.
 - **Never work in `/tmp`** (host machine rule: it is RAM-backed; use the repo or `~/` for scratch).
 
 ### Storage and paths
@@ -266,6 +267,7 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 | `docs/agent-control.md` | `droiddeckctl` commands, state schema, test tags, scenarios |
 | `docs/releases/*.md` | Per-version release notes (first line is the release title) |
 | `docs/development/*.md` | Deep dives: stores, proot performance, Steam focus/display/touch, added games, flatpak, game environment, Windows components, storage |
+| `docs/development/panvk-mali-g77-bringup.md` | Live PanVK/Mali bring-up knowledge: driver pipeline/pins, dma-heap, CEF GPU, WSI dead-ends, hashes. **Update it in the same change as any new Mali/device finding** — never let a discovery live only in session history |
 | `docs/testing/*.md` | Device validation notes for specific features |
 | `tools/*/PATCHES.md` | What each patch to proot / gamescope does |
 

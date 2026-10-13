@@ -41,8 +41,13 @@ public final class PanvkDriver {
     /** Bundled drivers the user deleted: hidden from the list, their unpacked copy removed. */
     private static final String PREFS = "graphics_driver_panvk";
     private static final String KEY_HIDDEN = "hiddenBundled";
-    /** No bundled PanVK drivers in the APK yet. */
-    public static final List<String> BUNDLED = Collections.emptyList();
+    /** Bundled driver id (unpacked on demand from the matching tzst asset). */
+    public static final String BUNDLED_PANVK = "panvk-android-24.3.0";
+    /** Version of the bundled asset; bumping it re-unpacks the file over a copy already on the
+     * device, which matters because the id is stable across rebuilds. */
+    public static final String BUNDLED_VERSION = "1.2.0";
+    public static final List<String> BUNDLED = Collections.unmodifiableList(
+            Collections.singletonList(BUNDLED_PANVK));
     /** Stored choice meaning "pick by GPU" - the default, and what a removed import falls back to. */
     public static final String AUTO = "";
 
@@ -252,11 +257,17 @@ public final class PanvkDriver {
         String id = choose();
         if (id == null) return null;
         File dir = new File(contentDir, id);
-        if (!new File(dir, "meta.json").isFile()) {
+        boolean bundled = BUNDLED.contains(id);
+        // A bundled driver whose version on disk is not the one this apk ships must be unpacked
+        // again: the id is stable across rebuilds, so an older copy would otherwise live on.
+        boolean stale = bundled && !BUNDLED_VERSION.equals(driverVersion(id));
+        if (stale || !new File(dir, "meta.json").isFile()) {
             FileUtils.delete(dir);
-            // No bundled PanVK drivers yet - would need to extract from assets
-            Log.w(TAG, "No bundled PanVK driver available for " + id);
-            return null;
+            if (!bundled || !TarZst.extractAsset(context, "graphics_driver/" + id + ".tzst", dir)) {
+                Log.e(TAG, "could not unpack " + id);
+                FileUtils.delete(dir);
+                return null;
+            }
         }
         String library = libraryName(id);
         if (library == null || !new File(dir, library).isFile()) {
@@ -287,12 +298,14 @@ public final class PanvkDriver {
             Log.i(TAG, "driver forced by " + override + ": " + forced);
             if (forced.startsWith("system")) return null;
         }
-        // Check for Mali Vulkan driver on the system
+        // A Mali device wants the bundled PanVK: the system driver is the vendor blob, which the
+        // compositor process cannot load (it is not an ICD we ship, and on this SoC it is not
+        // reachable), so returning "system-mali" left the compositor with no driver at all.
         String model = gpuModel();
         Log.i(TAG, "gpu model: " + (model == null ? "unknown" : model));
         if (model != null && model.toLowerCase().contains("mali")) {
-            // System Mali driver available
-            return "system-mali";
+            Log.i(TAG, "mali device: using bundled " + BUNDLED_PANVK);
+            return BUNDLED_PANVK;
         }
         // Nothing to go on
         return null;

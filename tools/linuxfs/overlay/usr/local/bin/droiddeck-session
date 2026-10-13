@@ -992,10 +992,20 @@ BUSCONF
         /usr/local/bin/droiddeck-steam-desktop-ui &
         desktop_ui_pid=$!
       fi
-      _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan )
-      if [ "${XWAYLAND_NO_GLAMOR:-0}" = 1 ] || [ "${GALLIUM_DRIVER:-}" = llvmpipe ] || [ "${BL_GPU_FAMILY:-}" = mali ]; then
-        _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu )
-      fi
+      # Big Picture is Chromium: with the GPU disabled it rasterizes every frame on the CPU and the
+      # UI sits at a few fps painting almost nothing (measured: gpu_utilization 0%, screen static).
+      # Mali now has a working PanVK, so the client is allowed the GPU; llvmpipe and the Xwayland
+      # without glamor still have to fall back to software. BL_CEF_GPU overrides for bring-up.
+      case "${BL_CEF_GPU:-auto}" in
+        disable|off) _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu ) ;;
+        force|angle) _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan ) ;;
+        *)
+          _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan )
+          if [ "${XWAYLAND_NO_GLAMOR:-0}" = 1 ] || [ "${GALLIUM_DRIVER:-}" = llvmpipe ]; then
+            _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu )
+          fi
+          ;;
+      esac
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
         "${_cef_gpu_args[@]}" "$@"
       rc=$?
