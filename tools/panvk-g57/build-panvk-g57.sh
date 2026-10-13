@@ -44,11 +44,14 @@ test -f builddir/src/panfrost/vulkan/libvulkan_panfrost.so
 
 mkdir -p "$WORK/out/usr/lib" "$WORK/out/usr/share/vulkan/icd.d"
 cp builddir/src/panfrost/vulkan/libvulkan_panfrost.so "$WORK/out/usr/lib/libvulkan_panvk.so"
-strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
-# v9 backend present? A driver without it is exactly what this component exists to replace.
+# v9 backend present? A driver without it is exactly what this component replaces, so fail
+# here rather than ship one. Checked before stripping: these are local symbols, and
+# --strip-unneeded drops them.
 readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v9_' \
     || { echo "built driver has no v9 backend" >&2; exit 1; }
+
+strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
 # The fork gates the external memory/semaphore fd group on this; gamescope requires
 # VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf and VK_KHR_external_semaphore_fd,
