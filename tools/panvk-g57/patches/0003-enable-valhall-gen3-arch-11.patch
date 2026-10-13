@@ -1,3 +1,21 @@
+diff --git a/src/panfrost/genxml/decode.h b/src/panfrost/genxml/decode.h
+index e5829b0..412b2aa 100644
+--- a/src/panfrost/genxml/decode.h
++++ b/src/panfrost/genxml/decode.h
+@@ -120,6 +120,13 @@ void pandecode_cs_binary_v10(struct pandecode_context *ctx, uint64_t bin,
+ void pandecode_cs_trace_v10(struct pandecode_context *ctx, uint64_t trace,
+                             uint32_t trace_size, uint64_t gpu_id);
+ 
++void pandecode_interpret_cs_v11(struct pandecode_context *ctx, uint64_t queue,
++                                uint32_t size, uint64_t gpu_id, uint32_t *regs);
++void pandecode_cs_binary_v11(struct pandecode_context *ctx, uint64_t bin,
++                             uint32_t bin_size);
++void pandecode_cs_trace_v11(struct pandecode_context *ctx, uint64_t trace,
++                            uint32_t trace_size, uint64_t gpu_id);
++
+ void pandecode_interpret_cs_v12(struct pandecode_context *ctx, uint64_t queue,
+                                 uint32_t size, uint64_t gpu_id, uint32_t *regs);
+ void pandecode_cs_binary_v12(struct pandecode_context *ctx, uint64_t bin,
 diff --git a/src/panfrost/genxml/decode_common.c b/src/panfrost/genxml/decode_common.c
 index 26a8026..96ee55b 100644
 --- a/src/panfrost/genxml/decode_common.c
@@ -2743,10 +2761,18 @@ index 1267d06..23985a1 100644
  #define panvk_per_arch(name) panvk_arch_name(name, v12)
  #elif PAN_ARCH == 13
 diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
-index 88c1e22..f1419dc 100644
+index 88c1e22..0118559 100644
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
-@@ -1140,6 +1140,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+@@ -77,6 +77,7 @@ PER_ARCH_FUNCS(6);
+ PER_ARCH_FUNCS(7);
+ PER_ARCH_FUNCS(9);
+ PER_ARCH_FUNCS(10);
++PER_ARCH_FUNCS(11);
+ PER_ARCH_FUNCS(12);
+ PER_ARCH_FUNCS(13);
+ PER_ARCH_FUNCS(14);
+@@ -1140,6 +1141,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
  
     case 9:
     case 10:
@@ -2754,7 +2780,7 @@ index 88c1e22..f1419dc 100644
     case 12:
     case 13:
        break;
-@@ -1271,6 +1272,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+@@ -1271,6 +1273,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
  
     case 9:
     case 10:
