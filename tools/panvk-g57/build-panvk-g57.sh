@@ -22,6 +22,10 @@ for p in "$WORK/tools/panvk-g57/patches"/*.patch; do
     [ -f "$p" ] && patch -p1 --no-backup-if-mismatch < "$p"
 done
 
+# The fork's v1.2.0 arch lists stop at Valhall arch 10 and its model table has no arch-11 entry,
+# so a Mali-G615 (Valhall gen3) enumerates nothing; 0003 ports arch 11 back in (genxml schema,
+# per-arch build lists, arch dispatch and the G615/G715 models).
+#
 # -Dpanfrost-kmds=kbase is what defines HAVE_PAN_KMOD_KBASE; the fork's own bionic build script
 # uses -Dpanvk-use-kbase=true alongside it, and both are required.
 # wayland is the WSI the session's gamescope presents through. -Dgallium-drivers= is left empty on
@@ -45,11 +49,13 @@ test -f builddir/src/panfrost/vulkan/libvulkan_panfrost.so
 mkdir -p "$WORK/out/usr/lib" "$WORK/out/usr/share/vulkan/icd.d"
 cp builddir/src/panfrost/vulkan/libvulkan_panfrost.so "$WORK/out/usr/lib/libvulkan_panvk.so"
 
-# v9 backend present? A driver without it is exactly what this component replaces, so fail
-# here rather than ship one. Checked before stripping: these are local symbols, and
-# --strip-unneeded drops them.
+# v9 and v11 backends present? A driver without v9 is exactly what this component replaces, and
+# arch 11 (Mali-G615/G715) only exists behind 0003, so fail here rather than ship one. Checked
+# before stripping: these are local symbols, and --strip-unneeded drops them.
 readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v9_' \
     || { echo "built driver has no v9 backend" >&2; exit 1; }
+readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v11_' \
+    || { echo "built driver has no v11 backend (0003 not applied?)" >&2; exit 1; }
 
 strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
