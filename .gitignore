@@ -21,6 +21,9 @@ app/src/main/jniLibs/arm64-v8a/libdirectaudiorelay.so
 app/src/main/rust/stores/target/
 # The kbase backend crate builds the same way; its cargo tree is not source either.
 app/src/main/rust/panvk-kbase-jm/target/
+# A Mesa checkout kept at the root to build the PanVK drivers locally; the driver builds clone
+# their own, so this is never source (and as a nested repo it would become a bogus gitlink).
+/mesa/
 app/src/main/assets/droiddeck-esync/
 
 # Kotlin compiler session files (build-tool state, never source).
