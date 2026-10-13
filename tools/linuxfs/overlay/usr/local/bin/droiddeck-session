@@ -994,14 +994,14 @@ BUSCONF
       fi
       # Big Picture is Chromium: with the GPU disabled it rasterizes every frame on the CPU and the
       # UI sits at a few fps painting almost nothing (measured: gpu_utilization 0%, screen static).
-      # Mali now has a working PanVK, so the client is allowed the GPU; llvmpipe and the Xwayland
-      # without glamor still have to fall back to software. BL_CEF_GPU overrides for bring-up.
+      # Mali now has a working PanVK and CEF renders through ANGLE-on-Vulkan, which needs no Xwayland
+      # GL, so only llvmpipe (software Vulkan) still forces software CEF. BL_CEF_GPU overrides.
       case "${BL_CEF_GPU:-auto}" in
         disable|off) _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu ) ;;
         force|angle) _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan ) ;;
         *)
           _cef_gpu_args=( -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan )
-          if [ "${XWAYLAND_NO_GLAMOR:-0}" = 1 ] || [ "${GALLIUM_DRIVER:-}" = llvmpipe ]; then
+          if [ "${GALLIUM_DRIVER:-}" = llvmpipe ]; then
             _cef_gpu_args=( -no-cef-sandbox -cef-ozone-platform=x11 -cef-disable-gpu )
           fi
           ;;

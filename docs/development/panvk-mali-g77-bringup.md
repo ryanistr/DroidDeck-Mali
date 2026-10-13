@@ -1,8 +1,13 @@
 # PanVK / Mali-G77 bring-up on X6739 (GT 10 Pro) — everything we learned
 
-Status as of 2026-10-13: **blank screen FIXED, Steam's UI now renders** (Steam logo +
-login screen appeared on device after the CEF-GPU change). Remaining: make it durable
-through an APK rebuild + clean install, then confirm steam fully usable.
+Status as of 2026-10-13: **blank screen FIXED, durable in APK**. Rebuilt via
+`./gradlew :app:assembleRelease` (with `b5c77f0d` + `droiddeck-session` removing
+`XWAYLAND_NO_GLAMOR=1` fallback), verified on device `102562537K104189` in session
+`2026-10-13-20-steam` (`READY`, `firstFrame: True`, `-cef-force-gpu` live in cmdline,
+GPU util 45–55%). Remaining QoS defects documented in
+`docs/development/steam-ui-logo-pingpong-bug.md`: Defect A (CEF startup latency /
+stuck at logo until dpad interaction) and Defect B (2-frame ping-pong on MIT-SHM
+present path).
 
 This doc exists so none of this is ever re-derived from scratch. Every claim below was
 observed on-device or in CI logs on 2026-10-13 unless marked otherwise.
@@ -114,7 +119,7 @@ either (a) a kbase present path that works from glibc without libandroid (dma-bu
 or (b) an app-side compositor that imports gamescope's dma-buf zero-copy instead of copying it into
 the screen swapchain. The baseline remains the best known state: **UI visible, flickering.**
 
-## 5. THE actual blank/stuck screen cause — Chrome UI had GPU disabled
+### 4a. Summary of raw-path / WSI gates
 
 `panvk_wsi.c` gates: `PANVK_KBASE_DRI3=raw|termux` (or `WSI_X11_TERMUX=1`) →
 `kbase_dmabuf=1 sw_device=0 raw_fd_modifier=1` (native dma-buf/DRI3 present).
@@ -145,12 +150,17 @@ specific and does not survive Steam's zink clients (+ Xwayland GLX) here.
   client had no GPU.
 - Fix (in `droiddeck-session`, near "starting the Steam client"): Mali is now allowed
   the GPU — default is `-cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle
-  -cef-use-angle=vulkan`; software fallback only for `XWAYLAND_NO_GLAMOR=1` /
-  `GALLIUM_DRIVER=llvmpipe`. `BL_CEF_GPU=disable|off|force|angle` overrides for
-  bring-up. (bash syntax-checked.)
-- On-device result AFTER this change: session 13 READY/firstFrame within 30 s,
-  **gpu_utilization 47 0 53** (was 0), and the user saw the Steam logo + login screen
-  appear (session then ended only because my restart script stopped it).
+  -cef-use-angle=vulkan`. Commit `b5c77f0d` removed `BL_GPU_FAMILY=mali`, but on Mali
+  Xwayland runs without glamor acceleration (`XWAYLAND_NO_GLAMOR=1`), which was still
+  triggering the software fallback. Because CEF renders through ANGLE-on-Vulkan directly
+  and requires no Xwayland GL, `XWAYLAND_NO_GLAMOR=1` was also removed from the fallback
+  condition, leaving only `GALLIUM_DRIVER=llvmpipe`. `BL_CEF_GPU=disable|off|force|angle`
+  overrides for bring-up. (bash syntax-checked.)
+- On-device verification: session `2026-10-13-20-steam` on `102562537K104189` started
+  `READY`/`firstFrame: True` with `-cef-force-gpu` active in cmdline with zero env
+  overrides. GPU utilization reached **45–55%** during active UI painting.
+  Remaining quality-of-service issues (startup logo stall and 2-frame ping-pong) are
+  tracked in `docs/development/steam-ui-logo-pingpong-bug.md`.
 
 ## 6. Also measured, not the blocker
 
