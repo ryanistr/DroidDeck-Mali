@@ -38,6 +38,7 @@ struct vkp_image {
     VkBuffer staging_buf;
     VkDeviceMemory staging_mem;
     int needs_upload;
+    uint32_t hash;                        /* FNV-1a of the last uploaded pixels (same-frame skip) */
 };
 
 static ANativeWindow *g_window;  /* the window frames go to; compositor thread only */
@@ -1096,14 +1097,22 @@ struct vkp_image *vkp_image_create_shm(int w, int h) {
 }
 
 /* Renders are synchronous (we wait for the frame's fence), so writing between frames
- * never races the GPU. */
+ * never races the GPU. The upload's XOR checksum (img->hash) lets the compositor skip
+ * re-presenting a frame whose pixels are byte-identical to the one on screen (Steam's SHM
+ * ring re-presents the same two frames at idle; without this every commit re-arms the copy
+ * path and the display alternates the ring's slots). */
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
     if (!img || !img->map || !data) return;
     size_t rowbytes = (size_t)img->w * 4;
     if ((size_t)stride < rowbytes) rowbytes = (size_t)stride;
-    for (int y = 0; y < img->h; y++)
-        memcpy((uint8_t *)img->map + (size_t)y * img->row_pitch,
-               (const uint8_t *)data + (size_t)y * stride, rowbytes);
+    uint32_t h = 2166136261u;
+    for (int y = 0; y < img->h; y++) {
+        const uint8_t *src = (const uint8_t *)data + (size_t)y * stride;
+        uint8_t *dst = (uint8_t *)img->map + (size_t)y * img->row_pitch;
+        for (size_t x = 0; x < rowbytes; x++) { h ^= src[x]; h *= 16777619u; }
+        memcpy(dst, src, rowbytes);
+    }
+    img->hash = h;
     if (g_vk.FlushMappedMemoryRanges) {
         VkMappedMemoryRange range = {
             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -1118,6 +1127,7 @@ void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
 
 int vkp_image_width(const struct vkp_image *img) { return img ? img->w : 0; }
 int vkp_image_height(const struct vkp_image *img) { return img ? img->h : 0; }
+uint32_t vkp_image_hash(const struct vkp_image *img) { return img ? img->hash : 0; }
 
 void vkp_image_destroy(struct vkp_image *img) {
     if (!img) return;

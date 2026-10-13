@@ -524,6 +524,7 @@ static int take_free_slot(struct layer *l, int w, int h, uint32_t fmt, int *wait
 /* ---- public --------------------------------------------------------------------------------- */
 
 int sc_layer_available(void) { return load_api() == 0; }
+int sc_layer_showing(void) { return layer_of(SC_LAYER_GAME)->shown; }
 
 void sc_layer_probe_dmabuf_fd(int fd) {
     static int done;

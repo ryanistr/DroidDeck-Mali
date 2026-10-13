@@ -68,6 +68,10 @@ int vkp_image_is_dmabuf(const struct vkp_image *img);
 // Create a host-visible image and copy BGRA/XRGB8888 pixels into it. NULL on failure.
 struct vkp_image *vkp_image_create_shm(int w, int h);
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride);
+/* The FNV-1a hash of the last pixels uploaded into `img` (by vkp_image_upload_shm), for the
+ * compositor's same-frame skip: an identical frame re-presented by a client's SHM ring must not
+ * re-arm the copy path. */
+uint32_t vkp_image_hash(const struct vkp_image *img);
 
 int vkp_image_width(const struct vkp_image *img);
 int vkp_image_height(const struct vkp_image *img);

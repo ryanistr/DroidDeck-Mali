@@ -79,6 +79,10 @@ enum sc_layer_id { SC_LAYER_GAME = 0, SC_LAYER_OVERLAY = 1, SC_LAYER_COUNT = 2 }
 /* 1 when this device has the SurfaceControl API the layers need (Android 10+, libnativewindow's
  * getNativeHandle); the reason is logged (tag `layer`) the first time it is missing. */
 int sc_layer_available(void);
+/* 1 when the GAME layer currently shows a frame (set by present, cleared by sc_layer_hide / a
+ * window change). The copy path's same-frame guard skips re-presenting only while this is true:
+ * a hidden layer must always take the next frame even if it is the same one re-committed. */
+int sc_layer_showing(void);
 
 /* One-shot: does the kernel export a sync_file from the game's dma-buf (DMA_BUF_IOCTL_EXPORT_SYNC_FILE)?
  * Decides where a zero-copy acquire fence can come from; result goes to the session log. */

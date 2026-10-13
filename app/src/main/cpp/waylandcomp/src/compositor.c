@@ -240,6 +240,15 @@ struct surface {
     struct wl_listener dmabuf_destroy;
     int buf_w, buf_h, has_content;
     int buf_alpha;
+    /* How many times this surface committed a NEW buffer (take_dmabuf / take_shm). The copy path's
+     * "same frame again" guard: a layer present sets presented_gen = commit_gen, so a repeat commit
+     * (a client re-sending the buffer it already shows - Steam's SHM ring at idle) does not re-blit
+     * or re-present, and the display holds the last changed frame instead of alternating the ring's
+     * two slots. Mirrors the zero-copy path's token == cur_token guard (sc_layer_present_ahb). */
+    unsigned commit_gen, presented_gen;
+    struct wl_resource *last_shm_res;     /* last wl_shm buffer resource uploaded (ring reuse: same res again) */
+    struct wl_resource *last_mmap_res;    /* last dma-buf buffer resource uploaded via mmap fallback (ring reuse) */
+    uint32_t last_hash;                   /* FNV of the content current on the layer (same-pixels skip) */
     int opaque[4], pending_opaque[4], pending_opaque_set; /* x, y, w, h; w = 0: none */
     int src_set, dst_set;
     float src[4];
@@ -721,10 +730,24 @@ static void fire_frames(struct wl_list *frames) {
     }
 }
 
-/* Copy a committed wl_shm buffer into the surface's image and release the buffer. */
+/* Copy a committed wl_shm buffer into the surface's image and release the buffer. A re-commit of
+ * the same buffer resource (the client re-presenting the buffer the screen already shows - Steam's
+ * SHM ring at idle) is skipped: the image is unchanged, and re-uploading it would only re-arm the
+ * copy path and feed the guest's present cadence back to the display (the 2-frame alternation). */
 static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_resource *buffer) {
     int32_t w = wl_shm_buffer_get_width(shm), h = wl_shm_buffer_get_height(shm);
     int32_t stride = wl_shm_buffer_get_stride(shm);
+
+    if (buffer == s->last_shm_res && s->shm_img &&
+        vkp_image_width(s->shm_img) == w && vkp_image_height(s->shm_img) == h) {
+        /* Same buffer the display already holds: no content change, keep it on screen. */
+        wl_buffer_send_release(buffer);
+        s->buf_w = w;
+        s->buf_h = h;
+        s->has_content = 1;
+        return;
+    }
+    s->last_shm_res = buffer;
 
     if (s->shm_img && (vkp_image_width(s->shm_img) != w || vkp_image_height(s->shm_img) != h)) {
         vkp_image_destroy(s->shm_img);
@@ -741,6 +764,13 @@ static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_res
     s->buf_h = h;
     s->buf_alpha = wl_shm_buffer_get_format(shm) == WL_SHM_FORMAT_ARGB8888;
     s->has_content = s->shm_img != NULL;
+    /* Same pixels as the frame the layer already shows (Steam's SHM ring re-presents two
+     * unchanged frames at idle): do not re-arm the copy path - the present guard then keeps
+     * the display on the last changed frame instead of alternating the ring's slots. */
+    if (s->shm_img && vkp_image_hash(s->shm_img) != s->last_hash) {
+        s->last_hash = vkp_image_hash(s->shm_img);
+        s->commit_gen++;
+    }
     g_stat_shm++;
     struct client_info *ci = client_info_of(wl_resource_get_client(s->resource));
     if (ci && ci->asked_feedback) ci->shm_frames++;  /* since it asked for GPU buffers */
@@ -791,6 +821,11 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
         b->import_failed = 1;
     }
     if (b->img) {
+        { static unsigned g_dbg_dmabuf;
+          droiddeck_log("framedbg", "#%u DMABUF res=%p b=%p img=%p (%dx%d fmt=0x%08x) gen=%u",
+                        ++g_dbg_dmabuf, (void *)buffer, (void *)b, (void *)b->img,
+                        b->width, b->height, b->format, s->commit_gen);
+        }
         if (s->dmabuf != buffer || s->dmabuf_buf != b) {
             drop_dmabuf(s, 1);
             s->dmabuf = buffer;
@@ -798,10 +833,24 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
             b->refs++;
             s->dmabuf_destroy.notify = on_dmabuf_destroyed;
             wl_resource_add_destroy_listener(buffer, &s->dmabuf_destroy);
+            s->commit_gen++;
         }
         if (s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
     } else if (b->n_planes >= 1 && b->fd[0] >= 0) {
         if (s->dmabuf) drop_dmabuf(s, 0);
+        /* Ring reuse: the same dma-buf buffer resource re-committed (Steam's SHM ring at idle)
+         * holds the frame the display already has - skip re-uploading it, or the copy path
+         * re-presents at the guest's cadence and the screen alternates the ring's two slots. */
+        if (buffer == s->last_mmap_res && s->shm_img &&
+            vkp_image_width(s->shm_img) == b->width && vkp_image_height(s->shm_img) == b->height) {
+            for (int i = 0; i < b->n_planes; i++) { if (b->fd[i] >= 0) { close(b->fd[i]); b->fd[i] = -1; } }
+            wl_buffer_send_release(buffer);
+            s->has_content = 1;
+            { static unsigned g_dbg_dedupe; droiddeck_log("framedbg", "#%u DEDUPE-SKIP res=%p same-as-last gen=%u hash=%08x",
+                  ++g_dbg_dedupe, (void *)buffer, s->commit_gen, (unsigned)s->last_hash); }
+            return;
+        }
+        s->last_mmap_res = buffer;
         uint32_t page_mask = (uint32_t)sysconf(_SC_PAGESIZE) - 1;
         uint32_t align_offset = b->offset[0] & ~page_mask;
         uint32_t off_in_page = b->offset[0] & page_mask;
@@ -830,6 +879,12 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                 b->fd[i] = -1;
             }
         }
+        if (s->shm_img && vkp_image_hash(s->shm_img) != s->last_hash) {
+            s->last_hash = vkp_image_hash(s->shm_img);
+            s->commit_gen++;
+        }
+        { static unsigned g_dbg_take; droiddeck_log("framedbg", "#%u TAKE res=%p hash=%08x gen=%u %dx%d",
+              ++g_dbg_take, (void *)buffer, (unsigned)s->last_hash, s->commit_gen, b->width, b->height); }
         wl_buffer_send_release(buffer);
     } else {
         if (s->dmabuf) drop_dmabuf(s, 0);
@@ -1317,6 +1372,9 @@ static const struct wl_region_interface region_impl = {
 static void compositor_create_surface(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct surface *s = calloc(1, sizeof(*s));
     if (!s) { wl_client_post_no_memory(c); return; }
+    /* Never-presented: the first committed buffer must present even though commit_gen == 0
+     * (a fresh surface has presented_gen 0 too); present it immediately. */
+    s->presented_gen = ~0u;
     s->resource = wl_resource_create(c, &wl_surface_interface, wl_resource_get_version(r), id);
     if (!s->resource) { free(s); wl_client_post_no_memory(c); return; }
     wl_list_init(&s->pending_frames);
@@ -2220,11 +2278,27 @@ static void render_scene(void) {
          * skipped, said once above). */
         if (!(fx_on && li >= 0) && ls && ls->dmabuf_buf && ahb_swapchain_has_ahb(ls->dmabuf_buf))
             r = ahb_swapchain_present(ls->dmabuf_buf, ls, w, h);
-        if (r != 0 && li >= 0)
-            r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
-                      : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
+        if (r != 0 && li >= 0) {
+            /* Copy-path "same frame again" guard (the zero-copy path has its own, token ==
+             * cur_token in sc_layer_present_ahb): when the surface presenting this draw has not
+             * committed a new buffer since the last time its content was put on the layer, the
+             * layer already shows it and re-blitting + re-presenting would only feed the guest's
+             * SHM ring cadence back to the display - which is the 2-frame alternation the screen
+             * shows at idle. The effects pass must still run (its result can change with a Look's
+             * settings), so the guard only short-circuits the plain one-blit path. */
+            const int same = ls && sc_layer_showing() &&
+                             ls->commit_gen == ls->presented_gen && !fx_on && !framegen;
+            { static unsigned g_dbg_pres; droiddeck_log("framedbg", "#%u PRESENT same=%d commit_gen=%u presented_gen=%u hash=%08x",
+                  ++g_dbg_pres, same, ls ? ls->commit_gen : 0, ls ? ls->presented_gen : 0,
+                  (unsigned)(ls ? ls->last_hash : 0)); }
+            if (!same)
+                r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
+                         : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
+            else
+                r = 0; /* already on the layer: the display keeps the last changed frame; skip */
+        }
         if (r == 0) {
-            if (ls) ls->drawn = 1;
+            if (ls) { ls->drawn = 1; ls->presented_gen = ls->commit_gen; }
             /* The one window above the game keeps the game off the copy path entirely: it goes on
              * its own layer, cropped and placed by the display. */
             int go[8], ov = 0;
@@ -2254,6 +2328,10 @@ static void render_scene(void) {
         sc_layer_hide();
         rendered = vkp_render(w, h, dl.d, dl.n) == 0;
         copy = 1;
+        { static unsigned g_dbg_rend;
+          droiddeck_log("framedbg", "#%u RENDER-COPY n=%d img0=%p",
+                        ++g_dbg_rend, dl.n, dl.n > 0 ? (void *)dl.d[0].img : NULL);
+        }
         hdr_copy = ov_blocks ? "a window is above it and this display cannot compose a second layer in hardware"
                  : fx_blocks ? "a window is above it and screen effects need the whole scene"
                  : !g_zero_copy ? "zero-copy presentation is off"
