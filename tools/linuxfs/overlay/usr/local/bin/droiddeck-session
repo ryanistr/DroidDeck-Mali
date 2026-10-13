@@ -107,6 +107,12 @@ if [ -n "${BL_VK_DRIVER:-}" ]; then
   fi
   unset bl_icd_lib
 fi
+# PanVK advertises the external memory/semaphore fd group only when this is set, and gamescope
+# refuses to start without VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf and
+# VK_KHR_external_semaphore_fd: it reports each as a missing required extension and then dies on
+# a segfault, which is the blank screen this exists to fix. Nothing but PanVK reads the variable,
+# so it is left set for every driver rather than matched against the manifest path.
+export PANVK_FD_INTEROP=1
 # The app's gamescope build (tools/gamescope) asks for realtime-priority Vulkan queues on this
 # switch instead of on CAP_SYS_NICE, which proot never has; it falls back to normal priority
 # where the driver refuses, and the runtime's own build ignores it. On KGSL Turnip (Mesa 26.2) it
