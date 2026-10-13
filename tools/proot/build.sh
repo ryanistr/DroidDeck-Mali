@@ -23,13 +23,25 @@ fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 fetch() {
-  curl -fsSL --retry 3 -o "$WORK/$1" "$2"
-  echo "$3  $WORK/$1" | shasum -a 256 -c -
-  mkdir -p "$WORK/${1%%.*}"
-  tar -xzf "$WORK/$1" -C "$WORK/${1%%.*}" --strip-components=1
+  local name=$1 sum=$3
+  local fetched=
+  for url in "$2" "${@:4}"; do
+    if curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
+        -o "$WORK/$name" "$url" && echo "$sum  $WORK/$name" | shasum -a 256 -c -; then
+      fetched=1
+      break
+    fi
+    rm -f "$WORK/$name"
+  done
+  [ -n "$fetched" ] || { echo "could not fetch $name from any mirror" >&2; exit 1; }
+  mkdir -p "$WORK/${name%%.*}"
+  tar -xzf "$WORK/$name" -C "$WORK/${name%%.*}" --strip-components=1
 }
 fetch proot.tar.gz "https://github.com/termux/proot/archive/${PROOT_COMMIT}.tar.gz" "$PROOT_SHA256"
-fetch talloc.tar.gz "https://www.samba.org/ftp/talloc/talloc-${TALLOC_VERSION}.tar.gz" "$TALLOC_SHA256"
+# www.samba.org drops connections from CI runners; the official mirrors serve the same tarball.
+fetch talloc.tar.gz "https://www.samba.org/ftp/talloc/talloc-${TALLOC_VERSION}.tar.gz" "$TALLOC_SHA256" \
+  "https://download.samba.org/pub/talloc/talloc-${TALLOC_VERSION}.tar.gz" \
+  "https://ftp.samba.org/pub/talloc/talloc-${TALLOC_VERSION}.tar.gz"
 for patch in "$HERE"/patches/*.patch; do
   patch -d "$WORK/proot" -p1 --forward --quiet < "$patch"
 done
