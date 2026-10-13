@@ -179,16 +179,85 @@ specific and does not survive Steam's zink clients (+ Xwayland GLX) here.
   Any session restart re-stages the APK copy over it — durable work still needs the
   rebuild.
 
-## 8. GameHub / DXVK (the loop task, partial)
+## 8. GameHub GPU passthrough — analysed 2026-10-13, and what actually adapts
 
-- GameHub's Mali recipe (from its env-builder): vendor bionic ICD
-  `libGameScopeV2.so`, `GALLIUM_DRIVER=zink`, and `dxvk-v1.11.1-mali-fix`
-  (3,383,310 B). Inspected, not yet wired into DroidDeck as default DXFV for Mali.
-- The glibc guest cannot load the bionic ICD directly; the vendor blob route needs
-  `/vendor` bind (currently Adreno/KGSL-only) — a known gap, not solved at doc time.
-- Order of operations from here: (1) rebuild APK with the CEF fix + PanvkDriver
-  changes (stage script first), (2) verify session renders Steam login on a fresh
-  install, (3) then revisit GameHub/DXVK-mali as the game-side default.
+Evidence: `/mnt/project/Misc/ReverseEngineer/GameHub/GameHub-6.3.1-GPU-PASSTHROUGH-AND-0-GPU-FORENSICS.md`
+(every claim there is `[E]` with the command and output quoted) plus the measurements below.
+
+**What GameHub's "GPU Passthrough" (显卡直通模式) actually is.** Not a driver switch, not a
+driver load. It switches how the guest's finished frame reaches the Android Surface:
+
+| mode | path | cost |
+|---|---|---|
+| OFF | guest frame → POSIX shm file (`shmfd-XXXXXX`, MIT-SHM) → `memcpy` → upload | one full-frame CPU copy per present |
+| ON  | guest frame → **AHardwareBuffer** → imported into Vulkan (`VK_ANDROID_external_memory_android_hardware_buffer`) → direct present | no CPU copy |
+
+Their live heartbeat: `x11vk heartbeat: passthrough=1 kind=user directPresents=2387 (+63) import=1
+src=1280x720` — ~60 direct presents/s. Toggled by `XServer.setGpuPassthroughEnabled(boolean)` on
+`libxserver.so`; stored per game as `key_native_rendering_enabled`.
+
+**Their driver path never changed.** DXVK → winevulkan → `GameScopeVK_icd.json` →
+`libGameScopeV2.so` (their own **bionic** ICD shim) → `dlopen("vulkan."+ro.hardware.vulkan+".so")`
+→ `/vendor/lib64/hw/vulkan.mali.so` → Mali. They kept the vendor blob and worked around Mali with
+`dxvk-v1.11.1-mali-fix`, SPIR-V passes inside the shim (`MaliCompositeConstantFixPass`,
+`MaliArithmeticShiftFixPass`) and BCN emulation. DroidDeck deliberately does NOT do this — we
+rebuilt the driver as PanVK, and PanVK already renders Steam (§5). Nothing to adopt here.
+
+**The geometry is already in DroidDeck.** Our compositor has the same two paths, chosen per frame:
+- copy path — import the guest dma-buf as a `VkImage` and blit it into the screen swapchain
+  (`compositor.c` "dma-buf: copied into the screen swapchain"),
+- zero-copy — put the guest's buffer straight on an `ASurfaceControl` layer (`sc_layer.c`), no blit.
+The switch is `ahb_swapchain_has_ahb(b)` (`compositor.c:863-868`): the guest must present **gralloc
+AHB** buffers through our private `banner_ahb_v1` protocol. Raw dma-bufs always take the copy path.
+**DroidDeck's zero-copy layer path *is* GameHub's "passthrough=1".**
+
+**Why it does not light up on Mali (the real blocker).** The glibc guest cannot allocate gralloc
+AHBs: `AHardwareBuffer_*` lives in bionic `libnativewindow.so`, and PanVK's AHB path `dlopen`s
+`libandroid.so` (`panvk_device_memory.c:119`) — absent in the guest. Neither shipped half exports any
+`AHardwareBuffer_*` symbol, and `PANVK_AHB_WSI=1` is a no-op that then breaks zink (§4).
+
+**The one viable adaptation — compositor-owned AHB pool (spike-doc option (c)).** The app side is
+bionic and *can* allocate gralloc AHBs, so invert who allocates:
+1. the compositor allocates the AHBs for the guest's swapchain (`ahb_swapchain.c` already carries a
+   pool; `ZERO_COPY_SPIKE.md` option (c)),
+2. hands `fd + modifier + pitch + size` over a protocol before `vkCreateSwapchainKHR`,
+3. the guest WSI **imports** them (PanVK already does `VK_EXT_external_memory_dma_buf`, proven every
+   frame) instead of exporting its own,
+4. the compositor puts them straight on the SurfaceControl layer → zero copy.
+Cost per the spike doc: ~2-4 days (a `create_mem` that imports + the protocol + realloc on swapchain
+rebuild). This is the genuine "adapt GameHub's passthrough" work; everything cheaper is already done.
+
+**Exact state of the two halves (measured this session).**
+- *App side: done.* `compositor.c:3590` calls `ahb_swapchain_init()` — the `banner_ahb_v1` global
+  (version 2) is advertised whenever a display layer is possible; `ahb_swapchain.c`+`sc_layer.c`
+  implement `present` / `defer_release` / fences; `protocols/banner-ahb-v1.xml` + generated stubs
+  exist. `ahb_swapchain_set_mode()` is the live zero-copy switch (drawer / `DROIDDECK_WAYLAND_ZERO_COPY=1`).
+- *Guest side: Turnip only.* `ahb_swapchain.h:5-16` names the WSI patch —
+  `banners-turnip-wayland, patches/wayland/banner_ahb_wsi.py` — which binds `banner_ahb_v1` v2 and
+  makes **Turnip** allocate each swapchain image as a gralloc AHardwareBuffer. There is **no PanVK
+  equivalent**, and the glibc guest cannot allocate gralloc AHBs at all (`libnativewindow.so` is
+  bionic). So on Mali the guest never attaches an AHB, `ahb_swapchain_has_ahb()` is false, and the
+  compositor takes the copy path.
+- **Therefore the adaptation = write the PanVK/glibc half as option (c), not (a)**: the compositor
+  sends the AHB's dma-buf **to** the guest (direction inverted vs the Turnip patch) and the guest
+  imports it. That is the single missing piece; the app side needs only the send-side plumbing.
+
+**DXVK: do NOT overlay GameHub's build.**
+- GameHub ships `dxvk-v1.11.1-mali-fix` (a **v1.11.0-line** build of `zeyadadev/DXVK-Sarek`); its
+  Mali fix is a code-level `0x13B5` (ARM vendor id) gate in DXVK's DXBC compiler.
+- DroidDeck's Proton (`proton-cachyos-11.0-20261005-slr-arm64`) ships **dxvk v3.1.1**
+  (`files/lib/wine/dxvk/version` → `dxvk (v3.1.1-47-g6853015)`), three arch dirs
+  (`x86_64-windows/`, `i386-windows/`, `aarch64-windows/`). An x86_64 game loads
+  `files/lib/wine/dxvk/x86_64-windows/`.
+- Measured 2026-10-13: Proton's x86_64 `dxgi.dll` (4,460,544 B) and `d3d11.dll` (6,291,456 B) hold
+  **no** `mali`/`Mali` string and **no** u32 `0x13B5` constant — the Sarek Mali gate is not in them.
+  (u16 `0x13B5` occurs 19x in d3d11.dll: coincidental byte pairs, not a vendor-id compare.)
+- Overlaying the 1.11.1-line DLLs would drop DXVK three major lines for one workaround. Not worth it
+  without a demonstrated game-side failure. If one appears, build DXVK-Sarek ≥ **v1.14.1** (Mali fix
+  merged upstream) and overlay only `x86_64-windows/` + `i386-windows/`, backing up first.
+- Artifacts already on hand: `~/.hermes/cache/scratch/ghsrc/rel/dxvk-sarek-v1.11.1-mali-fix.tar.gz`
+  (7.9 MB, `x64/`+`x32/`: d3d8/9/10core/11 + dxgi) and the deploy plan
+  `~/.hermes/cache/scratch/dxvk-deploy-plan.md`.
 
 ### 8a. Related repos surveyed 2026-10-13 (do not re-discover)
 
