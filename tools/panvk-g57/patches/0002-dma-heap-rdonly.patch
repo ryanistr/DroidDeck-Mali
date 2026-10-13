@@ -1,0 +1,31 @@
+From: Hermes (DroidDeck-Mali)
+Date: 2026-10-13
+Subject: kbase: open the dma-heap O_RDONLY when O_RDWR is denied
+
+Android ships every /dev/dma_heap node 0444 root:system, so an O_RDWR open fails
+for any app uid. DroidDeck's proot guest runs its syscalls as the app's real uid,
+so PanVK's kbase backend could never open the heap, kbase_kmod_supports_dmabuf
+returned false, exportable allocations came back ENOSYS and gamescope aborted in
+vulkan_create_flat_texture with VK_ERROR_INVALID_EXTERNAL_HANDLE.
+
+DMA_HEAP_IOCTL_ALLOC only needs any open fd on the node, not write access:
+verified live on MT6893 (Mali-G77) as the app uid - O_RDONLY opens, ALLOC
+returns a dmabuf fd and mmap(PROT_READ|PROT_WRITE) on it works.
+
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1339,7 +1339,14 @@
+    if (!dma_heap || !dma_heap[0])
+       dma_heap = "/dev/dma_heap/system";
+ 
++   /* Android ships dma-heaps 0444 root:system, so O_RDWR fails for any app uid,
++    * including under proot where the app's real uid makes the syscalls. The
++    * heap's ioctls (DMA_HEAP_IOCTL_ALLOC returns an fd, MAP, etc.) do not need
++    * write access to the node itself, so fall back to O_RDONLY. Verified on a
++    * live MT6893 (Mali-G77): O_RDONLY opens and DMA_HEAP_IOCTL_ALLOC succeeds. */
+    kbase_dev->dma_heap_fd = open(dma_heap, O_RDWR | O_CLOEXEC);
++   if (kbase_dev->dma_heap_fd < 0)
++      kbase_dev->dma_heap_fd = open(dma_heap, O_RDONLY | O_CLOEXEC);
+    if (kbase_dev->dma_heap_fd < 0)
+       mesa_logd("kbase: dma-heap unavailable at %s: %s", dma_heap,
+                 strerror(errno));
