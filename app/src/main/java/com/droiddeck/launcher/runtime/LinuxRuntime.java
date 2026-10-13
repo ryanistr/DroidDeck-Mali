@@ -116,6 +116,15 @@ public final class LinuxRuntime {
         ensureLavapipeIcd(root, icdDir);
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
+        // A manifest whose driver library the runtime does not carry is worse than none: pointing
+        // VK_ICD_FILENAMES at it leaves the loader with zero drivers, so vkCreateInstance returns
+        // VK_ERROR_INCOMPATIBLE_DRIVER and gamescope aborts on its instance assertion.
+        List<File> usable = new ArrayList<>();
+        for (File manifest : manifests) {
+            if (icdIsUsable(root, manifest)) usable.add(manifest);
+        }
+        manifests = usable.toArray(new File[0]);
+        if (manifests.length == 0) return null;
         com.droiddeck.launcher.gpu.GpuInfo gpu = com.droiddeck.launcher.gpu.GpuInfo.detect();
         com.droiddeck.launcher.gpu.GpuInfo.Family family = gpu.getFamily();
         boolean isMali = family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_VALHALL ||
@@ -151,6 +160,23 @@ public final class LinuxRuntime {
             if (manifest.getName().contains("lvp")) return manifest;
         }
         return null;
+    }
+
+    /** True when a manifest's own driver library exists and is readable inside the runtime. */
+    private static boolean icdIsUsable(File root, File manifest) {
+        try {
+            String text = com.droiddeck.launcher.core.FileUtils.readString(manifest);
+            if (text == null) return false;
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"library_path\"\\s*:\\s*\"([^\"]+)\"").matcher(text);
+            if (!m.find()) return false;
+            String lib = m.group(1).replace("\\/", "/");
+            File file = lib.startsWith("/") ? new File(root, lib.substring(1))
+                                            : new File(manifest.getParentFile(), lib);
+            return file.isFile() && file.canRead();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static void ensureLavapipeIcd(File root, File icdDir) {

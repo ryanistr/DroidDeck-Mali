@@ -64,9 +64,15 @@ class GpuMaliFamilyTest {
         assertEquals(GpuInfo.Support.UNTESTED, g77.support)
         assertTrue(g77.panvkBackend)
 
-        // The tester's GT 30 Pro: PanVK has no v11 backend, so the session must not be pointed at it.
-        val g615 = mali(615, 11)
-        assertEquals(GpuInfo.Support.UNSUPPORTED, g615.support)
-        assertFalse(g615.panvkBackend)
+        // The tester's GT 20 Pro (G610) and GT 30 Pro (G615): v10 and v11 backends are built in.
+        assertEquals(GpuInfo.Support.UNTESTED, mali(610, 10).support)
+        assertTrue(mali(610, 10).panvkBackend)
+        assertEquals(GpuInfo.Support.UNTESTED, mali(615, 11).support)
+        assertTrue(mali(615, 11).panvkBackend)
+
+        // Fifth-gen Valhall has no backend in this driver, so the session must not be pointed at it.
+        val g720 = mali(720, 12)
+        assertEquals(GpuInfo.Support.UNSUPPORTED, g720.support)
+        assertFalse(g720.panvkBackend)
     }
 }

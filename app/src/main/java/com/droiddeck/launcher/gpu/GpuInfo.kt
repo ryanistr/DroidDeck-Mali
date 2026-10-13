@@ -118,11 +118,11 @@ data class GpuInfo(
 
         /**
          * The Mali architectures this build carries a PanVK backend for. The kbase layer under this
-         * fork is a Job Manager implementation, which is what v6, v7 and v9 submit through; v10 and
-         * newer hand work to the firmware through CSF instead, and Mesa hides v6/v7 behind
-         * PAN_I_WANT_A_BROKEN_VULKAN_DRIVER, which a session does not set.
+         * fork drives v9 through Job Manager and v10/v11 through CSF, and it implements all three;
+         * v6/v7 sit behind PAN_I_WANT_A_BROKEN_VULKAN_DRIVER, which a session does not set, and v12
+         * and newer have no per-arch backend in this driver at all.
          */
-        internal val PANVK_ARCHS = intArrayOf(9)
+        internal val PANVK_ARCHS = intArrayOf(9, 10, 11)
 
         /** The Mali families PanVK drives, when its backend for the architecture is built. */
         internal val MALI_PANVK_FAMILIES = listOf(Family.MALI_VALHALL, Family.MALI_BIFROST)

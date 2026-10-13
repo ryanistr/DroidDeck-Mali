@@ -341,3 +341,115 @@ rebuild). This is the genuine "adapt GameHub's passthrough" work; everything che
   byte-for-byte identical, alternating with `frame3.png` (sign-in with keyboard open).
   The display swapchain oscillates strictly between two buffer states. Full details in
   `docs/development/ping-pong-frame-handoff.md`.
+
+## 12. GT 20 Pro (G610 v10) and GT 30 Pro (G615 v11) testers — two distinct failures
+
+Tester bundles: `DroidDeck-2026-10-13-01-steam-GT-20.zip` (X6871) and
+`DroidDeck-2026-10-13-05/07-steam-GT30-Pro.zip` (X6873). Both report app 0.3.2 (12).
+GT-20 has the post-`2d2cd010` detection; GT 30 Pro does not. [E]
+
+### 12a. GT 30 Pro still prints "Mali-G77 MC9 · Mali" — stale APK, already fixed in HEAD
+
+`2d2cd010` (2026-10-12) is the fix: before it `MTK_PLATFORMS` mapped `mt6897` to model 77
+and `familyOf()` compared Mali numbers against Adreno ranges, so X6873 reported
+`Mali-G77 MC9 · Mali` (`MALI_UNKNOWN`). Session 07 (2026-10-13 20:11) still prints exactly
+that string, and the installed native lib dir is identical in sessions 05 and 07
+(`~~GmVbNfU1Rc3oW30o56m3Uw==/...-1gU83qVdpNW-JrgSJCVX5w==`), so the tester never installed a
+post-fix APK. Current HEAD prints `Mali-G615 MC6 · Mali Valhall · No PanVK backend for this
+Mali generation (v11)`. Redistribute a freshly built APK; the detection defect is not in HEAD.
+
+### 12b. GT 30 Pro: "failed to find physical device" (gamescope exit 1)
+
+The stale APK classes the GPU as an unknown Mali, and `LinuxRuntime.vulkanIcd()` takes its
+`arch == 0 -> panvk` branch, so the guest loads `panvk_icd.aarch64.json`. Session 07:
+`vulkan: failed to find physical device` -> `SDL_Vulkan_CreateSurface failed:
+VK_KHR_wayland_surface extension is not enabled` -> `gamescope exited with code: 1`. The
+pinned driver (`panvk-linux-g57-1.2.0-p3`) carries only a **v9** JM backend
+(`build-panvk-g57.sh` fails the build unless `panvk_v9_` is present), and X6873 is MT6897 =
+Mali-G615 (Valhall **v11**, CSF), so that driver can never create a physical device here.
+Fixed by §13 (`panvk-linux-g57-1.2.0-p4`).
+
+### 12c. GT 20 Pro: `vkCreateInstance failed (VkResult: -9)` -> SIGABRT 134
+
+X6871 is MT6896 = Mali-G610 MC6 (**v10**). Detection is correct (session 01: `Mali-G610 MC6 ·
+Mali Valhall · No PanVK backend for this Mali generation (v10) yet: the session runs on
+software rendering`), so `SessionService` routes the guest to the software path and sets
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json`; gamescope then dies at
+`vkCreateInstance failed (VkResult: -9)` = `VK_ERROR_INCOMPATIBLE_DRIVER` (rendervulkan.cpp:299
+assert) and the guest exits 134. `-9` at **instance creation** means the loader loaded **zero**
+ICDs: the lvp manifest is present, but `libvulkan_lvp.so` is neither in
+`app/src/main/assets/linuxfs/` nor in `SessionFiles.stage()`'s list nor built by any `tools/`
+script, and `LinuxRuntime.ensureLavapipeIcd()` writes the manifest only when the library
+already exists. Hypothesis: the downloaded r9 base rootfs ships no `libvulkan_lvp.so`. The
+app-side compositor is unaffected — GT-20's wayland.log shows it rendering on Mali-G610
+through the system Vulkan driver.
+
+### 12d. What the APK carries (and what it does not)
+
+The APK **does** bundle the updated drivers: the built `app-release.apk` contains
+`assets/linuxfs/usr/lib/libvulkan_panvk.so`, `.../libpanvk_kbase_jm.so`,
+`usr/share/vulkan/icd.d/{panvk,lvp}_icd.aarch64.json`, `usr/local/bin/{gamescope,droiddeck-session}`
+and every preload, and `SessionFiles.stage()` refreshes all of them into `files/linuxfs` at
+**every launch** through an atomic rename. An unrooted tester therefore needs no `su` or adb to
+pick up a new PanVK/kbase/compositor/script. The one driver the APK does **not** carry is
+`libvulkan_lvp.so` — the exact library the unsupported-generation fallback needs.
+
+Checked live on X6739 2026-10-13 (rooted, `adb shell su -c`): the installed r9 rootfs **does**
+have `files/linuxfs/usr/lib/libvulkan_lvp.so` (14,435,320 B, `root:root`, mtime 2026-10-11
+23:03) and `libLLVM.so.23.1` (171,229,352 B, same date), both **manually installed** — the base
+rootfs only ships `libLLVM.so.22.1` (u0_a311, 2026-10-10). `strings` on the library reports
+`mesa26.2.4-arch1.1` / `llvmpipe (LLVM 23.1.1)`. So the by-hand install is what makes lavapipe
+work here; a tester who never did it, or whose install predates it, reaches the GT-20 `-9` in
+12c with the lvp manifest present but its library absent. `LinuxRuntime.icdIsUsable()` now
+refuses a manifest whose `library_path` does not resolve under the rootfs, so the loader gets
+`null` (caller falls back) instead of a manifest pointing at nothing.
+
+Caveat: lvp being present on X6739 says nothing about a GT 20 Pro's rootfs. That the `-9` is a
+loader-with-zero-ICDs result is inference from the value (`VK_ERROR_INCOMPATIBLE_DRIVER` at
+`vkCreateInstance`), not a measurement on the tester's device. [I]
+
+## 13. Valhall gen3 (arch 11) ported into the pinned driver — `panvk-linux-g57-1.2.0-p4`
+
+Why a patch and not a fork bump: `apexspan-svg/mesa-panvk-mali-g57` is not ours (read-only), and
+`tools/panvk-g57/patches/0003-enable-valhall-gen3-arch-11.patch` is exactly the mechanism the
+component already uses for its other two fixes, so the pinned tag stays untouched.
+
+What the fork's v1.2.0 (Mesa 26.3.0-devel, commit `66306ebd`) actually lacked — this is the whole
+list, and it is *only* wiring, not code: `src/panfrost/model/meson.build`-side tables were fine,
+but the **genxml schema** (`genxml/meson.build`, `gen_macros.h`), the **per-arch build lists**
+(`vulkan/meson.build` device-prefix, `valhall_archs`, `csf_archs`, `foreach arch`,
+`lib/meson.build`, `libpan/meson.build`), the **arch dispatch** (`panvk_macros.h`,
+`panvk_physical_device.c`'s two `switch (arch)` gates and its `PER_ARCH_FUNCS` list), the
+**pandecode entry points** (`genxml/decode.h`, `decode_common.c`), the **libpan/include chains**
+(`libpan.h`, `libpan_shaders.h`) and the **model table** (`pan_model.c`, `pan_get_fallback_model`
++ the G615/G715 `VALHALL_MODEL` rows) all omitted 11. `csf/*.c`, `genxml/cs_builder.h`,
+`decode_csf.c`, `lib/pan_format.c` and `compiler/pan_compiler.c` already carry the
+`PAN_ARCH >= 11` branches, which is what made this a wiring job.
+
+Evidence used: upstream Mesa main's `src/panfrost/genxml/v11.xml` (the fork has no `v11.xml` at
+all; its `v10.xml` differs from upstream main's by only 55 line-level edits, so main's v11 schema
+is compatible with the fork's 26.3.0-devel code) and main's `pan_model.c` rows
+
+```
+VALHALL_MODEL(PAN_PROD_ID(11, 8, 2), 4, "G715", "G715", ... MODEL_RATES_X(4, 8, 32, 64, 128, 16))
+VALHALL_MODEL(PAN_PROD_ID(11, 8, 3), 4, "G615", "G715", ... MODEL_RATES_X(4, 8, 32, 64, 128, 16))
+```
+
+(pinned from `https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/panfrost/...`; note
+`https://github.com/Mesa3D/mesa` does not carry `panfrost` at those paths).
+
+Local iteration is possible and worth it: `src/panfrost/model/meson.build` never needed it, but the
+build needs Python `mako`, which this host no longer has installed for python3.14. It *is* in the
+uv cache, so no install is needed, e.g.
+`PYTHONPATH=$(fd -t d -i '^mako-[0-9]' ~/.cache/uv/archive-v0 | head -1 | xargs dirname) ninja -C builddir src/panfrost/vulkan/libvulkan_panfrost.so`.
+A host x86_64 build reaches the shipped driver and caught both `-Werror=missing-prototypes`
+failures before CI did. The local build links `libSPIRV-Tools.so` (CachyOS ships it shared) while
+the CI driver does not (Ubuntu's copy is static there), so `build-panvk-g57.sh`'s "must not link
+LLVM/SPIRV" guard only holds on the CI runner — do not read its local failure as a regression.
+
+Shipped `panvk-linux-g57-1.2.0-p4` (sha256 `dc6503e3e9aa649387e01022c6337276c6e150ca4093b05c07f3226fef97fd88`):
+21,871,824 B, a build-time assertion proves `panvk_v11_` is present pre-strip (like the existing
+`panvk_v9_` check; `--strip-unneeded` removes both from the shipped library afterwards),
+`Mali-G615`/`Mali-G715` are in the model table, and its NEEDED list is unchanged
+(libdrm/libz/libzstd/libwayland-client/libxcb*/libexpat/libstdc++/libm/libc, no LLVM family).
+Build workflow runs: `38411817925` (compile) and `38412415983` (publish p4).
