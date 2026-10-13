@@ -56,6 +56,14 @@ readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v9_' \
 strings -a "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'PANVK_FD_INTEROP' \
     || { echo "built driver predates the PANVK_FD_INTEROP gate" >&2; exit 1; }
 
+# LLVM, libclc and the SPIR-V translator are only needed to build mesa_clc, which compiles
+# libpoly's shaders during the build. Nothing of that may end up in the driver the runtime loads.
+if readelf -dW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -qiE 'libLLVM|libclc|libLLVMSPIRV|libSPIRV'; then
+    echo "driver links LLVM/SPIRV, which it must not" >&2
+    readelf -dW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -iE 'NEEDED' >&2
+    exit 1
+fi
+
 cat > "$WORK/out/usr/share/vulkan/icd.d/panvk_icd.aarch64.json" <<ICD
 {
     "file_format_version": "1.0.1",
