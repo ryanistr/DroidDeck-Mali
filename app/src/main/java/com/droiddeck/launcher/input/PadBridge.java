@@ -296,6 +296,24 @@ public final class PadBridge {
         publish();
     }
 
+    /** Pulse button A to dismiss completed boot movies and reveal the Steam UI. */
+    public synchronized void nudge() {
+        if (!open && !start()) return;
+        if (state.isDown(PadState.A)) return;
+        state.press(PadState.A, true);
+        publish();
+        Log.i(TAG, "nudge: pulsed Button A down");
+        mainHandler.postDelayed(() -> {
+            synchronized (PadBridge.this) {
+                if (state.isDown(PadState.A)) {
+                    state.press(PadState.A, false);
+                    publish();
+                    Log.i(TAG, "nudge: pulsed Button A up");
+                }
+            }
+        }, 120);
+    }
+
     /** Touch-only Steam and QAM buttons, merged with physical input without changing its state. */
     public synchronized void setSystemButtons(boolean guidePressed, boolean qamPressed) {
         if (systemGuidePressed == guidePressed && systemQamPressed == qamPressed) return;

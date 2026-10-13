@@ -325,3 +325,19 @@ rebuild). This is the genuine "adapt GameHub's passthrough" work; everything che
 - On device 102562537K104189 (X6739, MT6893, Mali-G77 MC9, Android 16, slot _a):
   app uid 10311, pkg com.droiddeck.launcher, signed AOSP testkey (CN=Android,
   sha256 a40da80a…) — install -r preserves data (firstInstallTime 2026-10-10).
+
+## 11. Session 27/28 findings: Boot logo stall & 2-frame ping-pong reproduction
+
+- **The "stuck logo" is Steam's StartupMovie (`bigpicture_startup.webm`):**
+  Staged to `root/.local/share/Steam/config/uioverrides/movies/bigpicture_startup.webm` and
+  configured in `config.vdf`. Steam plays this 6.35s video while CEF initializes.
+  Because CEF on Mali takes ~60s, the video completes early and freezes on its last frame.
+  Once CEF reaches `https://steamloopback.host/index.html`, Steam does NOT auto-dismiss
+  the finished movie layer until an input event (D-pad/button) is received.
+- **Empirical 2-frame ping-pong proof (Session 28):**
+  Four consecutive screenshots taken at 200ms intervals without user input:
+  `frame2.png` (md5 `f22fb099b9fdc7e6bf01a52d003dd033`, sign-in without keyboard) and
+  `frame4.png` (md5 `f22fb099b9fdc7e6bf01a52d003dd033`, sign-in without keyboard) were
+  byte-for-byte identical, alternating with `frame3.png` (sign-in with keyboard open).
+  The display swapchain oscillates strictly between two buffer states. Full details in
+  `docs/development/ping-pong-frame-handoff.md`.

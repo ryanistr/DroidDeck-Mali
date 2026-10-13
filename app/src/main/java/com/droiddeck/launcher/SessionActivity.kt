@@ -389,6 +389,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             lastPadInputMs = android.os.SystemClock.uptimeMillis()
             uiHandler.removeCallbacks(cursorHide)
             cursorVisible = false
+            stopSteamWakeNudges("player pad input")
         }
         onScreenControls = OnScreenControls(this, bridge, onKeyboard = ::togglePcKeyboard).also { root.addView(it) }
         keyboard = KeyboardHost(this).also { root.addView(it) }
@@ -1366,6 +1367,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE ->
                 return super.dispatchKeyEvent(event)
         }
+        if (event.action == KeyEvent.ACTION_DOWN) stopSteamWakeNudges("hardware key")
         if (pipUi) return true
         val fromController = PadBridge.isControllerKey(event)
         if (fromController && event.action == KeyEvent.ACTION_DOWN) {
@@ -2149,6 +2151,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun onPause() {
+        stopSteamWakeNudges("onPause")
         if (runtimeRemovalBlocked) { super.onPause(); return }
         sessionClipboard.stop()
         // Do not carry transient session UI across an app/display transition. In particular, the
@@ -2211,9 +2214,42 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     /** Ours, so a finishing activity never unhooks the one that replaced it. */
     private val endListener: (Int) -> Unit = { status -> onSessionEnded(status) }
+
+    private var steamWakeNudgeCount = 0
+    private val steamWakeNudgeRunnable = object : Runnable {
+        override fun run() {
+            if (isDestroyed || isFinishing) return
+            if (SessionState.mode != SessionService.MODE_STEAM) return
+            Log.i(TAG, "steamWakeNudgeRunnable pulse #$steamWakeNudgeCount")
+            padBridge?.nudge()
+            steamWakeNudgeCount++
+            if (steamWakeNudgeCount < 50) {
+                uiHandler.postDelayed(this, 2500L)
+            }
+        }
+    }
+
+    private fun startSteamWakeNudges() {
+        steamWakeNudgeCount = 0
+        Log.i(TAG, "startSteamWakeNudges scheduled")
+        uiHandler.removeCallbacks(steamWakeNudgeRunnable)
+        uiHandler.postDelayed(steamWakeNudgeRunnable, 8000L)
+    }
+
+    private fun stopSteamWakeNudges(reason: String = "") {
+        if (steamWakeNudgeCount < 50) {
+            steamWakeNudgeCount = 50
+            Log.i(TAG, "stopSteamWakeNudges: $reason")
+            uiHandler.removeCallbacks(steamWakeNudgeRunnable)
+        }
+    }
+
     private val firstFrameListener = Runnable {
         SessionEvents.firstFrame()
-        if (SessionState.mode == SessionService.MODE_STEAM) SteamRepair.clientShown(this)
+        if (SessionState.mode == SessionService.MODE_STEAM) {
+            SteamRepair.clientShown(this)
+            startSteamWakeNudges()
+        }
         runOnUiThread {
             loading.visible = false
             hud.start()
@@ -2221,6 +2257,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        stopSteamWakeNudges("onDestroy")
         uiHandler.removeCallbacks(steamTouchRetry)
         if (runtimeRemovalBlocked) { super.onDestroy(); return }
         // Deliberately does NOT end the session: this activity can be destroyed while the user is
