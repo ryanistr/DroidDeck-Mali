@@ -9,6 +9,47 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-14 - Mali: 0005 was inert without 0008, and the guest rootfs was half-upgraded underneath
+
+- **Why:** pin the published PanVK build, rebuild, test on the X6739, and continue on the frame
+  ping-pong. The first two went as expected; the third found a driver bug and a device bug before it
+  found anything about frames.
+- **The runtime driver is p5.** `tools/panvk/release.env` pins
+  `panvk-linux-g57-1.2.0-p5` (`cadf9e54…`), the build carrying 0004-0007. The APK built from that pin
+  (GitHub run `38532381487`) stages it as `assets/linuxfs/usr/lib/libvulkan_panvk.so`, and the
+  device's runtime copy hash matches the published library exactly (`fe00b3f9…`), which is how we
+  know the session was running p5 and not the old p4.
+- **The guest was broken before the driver could be judged.** Every session from `-26-steam` (14:19)
+  to `-32-steam` died at `dlmopen steamui.so failed: libharfbuzz.so.0`. The guest rootfs is a
+  half-applied package upgrade: `var/cache/pacman/pkg` holds an 11:55 upgrade set (libdrm, libx11,
+  libxcb, wayland, vulkan-*), `llvm-libs-….pkg.tar.xz.part` never finished, and `usr/lib` is full of
+  symlinks whose targets were never installed. `libharfbuzz.so.0 -> libharfbuzz.so.0.61460.0` is one
+  of them. A device-local repoint at the older `…61440.0` plus `chcon -h` (a root-created entry gets
+  `app_data_file:s0` with no categories and the app cannot open it - `EPERM`, not `ENOENT`) got
+  session `-34-steam` to a working Steam UI. Not a driver matter, but it blocked every measurement.
+- **0005 does not do what the docs expected of it.** With the render node the app fabricates now
+  present (`/dev/dri/renderD110`, char `10,110`, same `st_rdev` as `/dev/mali0`), p5 still logs
+  `kbase_dmabuf=0 sw_device=1` and gamescope still says `physical device doesn't support
+  VK_EXT_physical_device_drm`. Cause: `.EXT_physical_device_drm` is a hard-coded `false` in the
+  fork's physical-device extension table, so the `drmRenderMajor/Minor` 0005 fills can never be read.
+  0008 (`tools/panvk-g57/patches/0008-advertise-physical-device-drm.patch`) derives the flag from the
+  same rdev values. 0005 and 0008 are one change in two files.
+- **`kbase_dmabuf` is a third gate, and it is an environment variable.** It is only true when
+  `PANVK_KBASE_DRI3` is set and is not `0` (`panvk_wsi.c:112-118`); `droiddeck-session` sets neither
+  it nor `WSI_X11_TERMUX`, so `sw_device=1` is by configuration regardless of what the driver knows.
+  The doc's earlier prediction ("the log should show a `kbase_dmabuf=1` line") conflated the
+  matcher's requirement with the WSI's. Bringup §22 has the measurements.
+- **Lessons.** A property only exists through the extension that advertises it; a patch that fills
+  one without the other measures as a no-op and looks like "the driver ignores the node". And a
+  device that has been poked at inside the guest can fail for reasons that have nothing to do with
+  the code under test - read the guest's package manager state before blaming the driver.
+- **Still unmeasured:** 0004/0006/0007 (CSF-only paths; the only device on `adb` is a G77 JM part)
+  and now 0008, which has not been compiled yet.
+
+---
+
+---
+
 ## 2026-10-14 - Mali: one rynx build already carries v9 JM and CSF, and the CSF fork's register file is merged in
 
 - **Why:** the ask was to clone the PanVK *CSF* driver and merge it so "our driver rynx can support

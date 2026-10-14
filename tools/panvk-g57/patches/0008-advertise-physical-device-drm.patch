@@ -1,0 +1,46 @@
+From: DroidDeck-Mali
+Date: 2026-10-14
+Subject: panvk: advertise VK_EXT_physical_device_drm when the node's numbers are known
+
+0005 fills drm.render_rdev/drm.primary_rdev from the kbase node's st_rdev, and
+the DRM properties are computed from those values - but the extension itself is
+a hard-coded false in this fork's physical-device extension table, so the
+properties are never readable and every rdev matcher still sees nothing.
+Measured on the X6739 (MT6893, Mali-G77, arch 9, JM) with the driver build that
+carries 0005: the session log still says
+
+  [gamescope] [Warn] vulkan: physical device doesn't support VK_EXT_physical_device_drm
+  PANVKDBG WSI: uses_kbase=1 termux_raw=0 raw_dri3=0 kbase_dmabuf=0 sw_device=1 ...
+
+which is exactly the state 0005 was meant to change, and it cannot: with the
+extension unadvertised, VkPhysicalDeviceProperties2 never reaches
+panvk_get_physical_device_properties and the numbers stay invisible to the WSI.
+
+Derive the flag from the same values the properties are. Reporting a device and
+offering the extension that carries its device numbers are the same statement;
+leaving them disagreed is what made 0005 a no-op. The bionic half still sees
+both rdevs at zero (its DRM numbers come from the platform, not this path), so
+the flag stays off there without needing the __ANDROID__ guard that 0005 uses.
+
+The extension table is built after the kbase initializer runs - the rdev
+assignment is at panvk_physical_device.c:1300, get_physical_device_extensions is
+dispatched later in the same function - so the values are already there when the
+table is filled.
+
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -195,7 +195,13 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_non_seamless_cube_map = true,
+       .EXT_mutable_descriptor_type = PAN_ARCH >= 9,
+       .EXT_multisampled_render_to_single_sampled = true,
+-      .EXT_physical_device_drm = false,
++      /* Reporting the node's device numbers is only useful if the extension is
++       * actually offered, and the two properties are read only through it. The
++       * kbase initializer is what fills them in, and only on glibc: the bionic
++       * half puts frames on a real Android surface and leaves them zero, so this
++       * stays off there without needing a build-time guard of its own. */
++      .EXT_physical_device_drm =
++         device->drm.primary_rdev != 0 || device->drm.render_rdev != 0,
+       .EXT_pipeline_creation_cache_control = true,
+       .EXT_pipeline_creation_feedback = true,
+       .EXT_pipeline_robustness = true,

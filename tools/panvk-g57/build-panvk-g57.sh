@@ -73,6 +73,11 @@ readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v11_' \
 # objects are missing them cannot be told apart by symbols; the patch loop above is what guarantees
 # them, and release.env pins the tag they were built into.
 #
+# 0005 (report the kbase node's rdev as the DRM device) and 0008 (advertise
+# VK_EXT_physical_device_drm when those numbers are known) are one change in two files: filling the
+# numbers without offering the extension leaves them unreadable, which is what a p5 session
+# measured (see docs/development/panvk-mali-g77-bringup.md §22). Keep them together.
+#
 # The same binary also carries the fifth-gen CSF backends (v12/v13/v14, the arch list at
 # src/panfrost/vulkan/meson.build:159 covers 6, 7, 9 through 14 and csf_archs starts at 10), so
 # "one build, every Mali generation this fork drives" is already true here. gpuArch stops at 11 on

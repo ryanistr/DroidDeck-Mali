@@ -1199,3 +1199,125 @@ one.
 The patch was verified the way the build applies it: a `git worktree` at the pinned tag with
 `tools/panvk-g57/patches/*.patch` applied in glob order, then `diff` against the two files this
 change touches — identical. It has not been compiled: the driver only builds on an arm64 runner.
+
+## 22. 0005 was inert: the DRM extension is never advertised (measured, 2026-10-14)
+
+### 22.1 The measurement that settles §19.5's prediction
+
+§19.5 / §7.2a predicted that with a real render node and a driver that reports the node's
+`st_rdev`, the session log would show "a `/dev/dri/renderD*` and a `kbase_dmabuf=1` WSI line". Half
+of that is now true and the other half cannot follow from the driver.
+
+Session `2026-10-14-34-steam`, X6739 (MT6893, Mali-G77, arch 9, JM), APK built at `9a37329a` so its
+`assets/linuxfs/usr/lib/libvulkan_panvk.so` is p5 (`fe00b3f9…`, the build carrying 0005), session
+log on device:
+
+```
+== panvk dma-heap: /dev/dma_heap/mtk_mm
+PANVKDBG WSI: uses_kbase=1 termux_raw=0 raw_dri3=0 kbase_dmabuf=0 sw_device=1 raw_fd_modifier=0
+PANVKDBG WSI host-import diagnostic enabled
+[gamescope] [Warn] vulkan: physical device doesn't support VK_EXT_physical_device_drm
+```
+
+and the guest really does have the node the app fabricates (`droiddeckctl guest`):
+
+```
+crw-rw-rw- 1 root root 10, 110 /dev/dri/renderD110
+crw-rw-rw- 1 root root 10, 110 /dev/mali0
+```
+
+So the app-side half of §7.2 works (`LinuxRuntime.bindGpuNode()` binds `/dev/mali0` as
+`/dev/dri/renderD110`), `/dev/mali0` is a character device whose `st_rdev` is `makedev(10, 110)`,
+and `stat()` in 0005's block therefore succeeds and is not gated out — yet gamescope still reports
+the extension unsupported and the WSI line is unchanged from §3.4.
+
+### 22.2 Why: the extension flag is a hard-coded false
+
+`panvk_vX_physical_device.c:198` in the fork's tree:
+
+```c
+      .EXT_physical_device_drm = false,
+```
+
+The DRM **properties** are derived from `device->drm.{primary,render}_rdev`
+(`panvk_vX_physical_device.c:1388-1398`), but they are only ever readable through
+`VkPhysicalDeviceProperties2` when the extension is in the physical device's extension table. With
+the flag pinned false, 0005 fills two fields nothing can see, which is exactly the observed
+"doesn't support VK_EXT_physical_device_drm". 0005 and the flag are two halves of one statement and
+only 0005 was ever written.
+
+Ordering is not the problem: in `panvk_physical_device_init_kbase()` the assignment runs at
+`panvk_physical_device.c:1300`, and `get_physical_device_extensions` is dispatched further down the
+same function, after `get_core_masks`/`get_device_heaps`/`get_device_sync_types_kbase`. The table
+sees the values.
+
+### 22.3 0008, and what it does and does not change
+
+`tools/panvk-g57/patches/0008-advertise-physical-device-drm.patch` derives the flag from the same
+values the properties are:
+
+```c
+      .EXT_physical_device_drm =
+         device->drm.primary_rdev != 0 || device->drm.render_rdev != 0,
+```
+
+The bionic half needs no `__ANDROID__` guard (unlike 0005): its rdevs stay zero, because on Android
+the DRM numbers come from the platform and not this path, so the flag stays off there by itself.
+
+What this does **not** do: set `kbase_dmabuf`. That is a separate gate further down the same file
+(`panvk_wsi.c:112-118`):
+
+```c
+   const bool kbase_dmabuf =
+      uses_kbase &&
+      ((!dri3_option && termux_raw_dri3) ||
+       (dri3_option && strcmp(dri3_option, "0") != 0)) &&
+      kbase_kmod_supports_dmabuf(physical_device->kmod.dev);
+```
+
+with `dri3_option = getenv("PANVK_KBASE_DRI3")`. `droiddeck-session` sets neither
+`PANVK_KBASE_DRI3` nor `WSI_X11_TERMUX` (grep of `tools/linuxfs/overlay/` and the app: no hits), so
+`kbase_dmabuf` is false by configuration no matter what the driver knows. `kbase_kmod_supports_dmabuf()`
+(`lib/kmod/kbase_kmod.c:172`) is only `kbase_dev->dma_heap_fd >= 0`, and the session's own
+`== panvk dma-heap: /dev/dma_heap/mtk_mm` line says that heap opened, so the heap half is already
+satisfied.
+
+§19.5's prediction therefore conflated two independent gates. The render node and the reported
+device numbers are what a *matcher* needs; `kbase_dmabuf` is what the *WSI* needs to leave the
+MIT-SHM copy path, and it is switched by an environment variable. Testing `sw=0` needs both, and
+`PANVK_KBASE_DRI3` is the knob §8 recorded as crashing the session (`GLXBadCurrentWindow`) when set
+to `raw` — but that was measured before the app fabricated a render node, so it is worth one more
+run on a driver that reports its device numbers. Note `raw`/`termux` are not the only settings:
+any value other than `0` turns `kbase_dmabuf` on, and only `raw`/`termux` also set
+`x11_use_raw_fd_modifier`, which is the part that takes the modifier-matching path instead of the
+raw-fd one.
+
+### 22.4 The device was also broken underneath this (not a driver issue)
+
+Every session from `2026-10-14-26-steam` (14:19) through `-34-steam` failed at Steam startup with
+
+```
+dlmopen /root/.local/share/Steam/steamrtarm64/steamui.so failed: libharfbuzz.so.0: cannot open
+shared object file: No such file or directory
+Failed to load steamui.so - dlerror(): (null)
+```
+
+The guest rootfs is in a half-applied package upgrade: `/var/cache/pacman/pkg/` holds the packages
+of an upgrade run at 11:55 today (`libdrm`, `libx11`, `libxcb`, `wayland`, `vulkan-icd-loader`,
+`vulkan-mesa-implicit-layers`, `vulkan-swrast`, `spirv-tools`, …) with
+`llvm-libs-23.1.1-1-aarch64.pkg.tar.xz.part` never finishing, and `usr/lib` is full of symlinks
+whose targets were never installed (`libKF6I18n.so.6 -> libKF6I18n.so.6.30.0`, …). One of them is
+`libharfbuzz.so.0 -> libharfbuzz.so.0.61460.0`, and `libharfbuzz.so.0.61460.0` is not there while
+the older `libharfbuzz.so.0.61440.0` is. That is what `steamui.so` loads through.
+
+A device-local fix unblocked it: repoint `usr/lib/libharfbuzz.so.0` at
+`libharfbuzz.so.0.61440.0` and set the symlink's SELinux label (`chcon -h` with the sibling's
+context — a root-created entry lands as `app_data_file:s0` with no categories and the app's
+`untrusted_app` domain gets `EPERM` opening it, which is a *different* error from the original
+`ENOENT` and is worth knowing: "Operation not permitted" from the loader means the label, not the
+path). With that, session `-34-steam` reached CEF with `[Gamescope WSI] Created swapchain for
+xid: 0xc00002`.
+
+The proper fix is to let the guest's `pacman` finish the upgrade, or to reinstall the runtime; the
+symlink is a stopgap that a runtime reinstall replaces. Do not read the ping-pong findings from
+sessions 26-33: none of them ever got a Steam UI.

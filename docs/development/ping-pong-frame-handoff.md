@@ -515,6 +515,29 @@ second one is the strongest lead in this file for *this* device.
    gates that code on `PAN_ARCH >= 10`, and a G77 submits through JM). Full write-up and the source
    reads: bringup §19. **[I]** until measured.
 
+### 7.2b Measured: the node is there, and the extension is not (2026-10-14)
+
+Both halves of 7.2a were put on the device and the prediction in 7.2a was **half wrong**. On
+session `2026-10-14-34-steam` (APK at `9a37329a`, so the runtime's `libvulkan_panvk.so` is p5 — the
+build carrying 0005):
+
+- The guest has the render node: `crw-rw-rw- 1 root root 10, 110 /dev/dri/renderD110`, the same
+  `st_rdev` as `/dev/mali0` (`droiddeckctl guest`). Half 1 of 7.2a is confirmed working. [E]
+- 0005 alone changes nothing observable. The log still reads
+  `PANVKDBG WSI: uses_kbase=1 … kbase_dmabuf=0 sw_device=1` and gamescope still warns
+  `physical device doesn't support VK_EXT_physical_device_drm`. [E]
+- Cause: `.EXT_physical_device_drm = false` is hard-coded at
+  `src/panfrost/vulkan/panvk_vX_physical_device.c:198` in the fork, so the `drm*Major/Minor`
+  properties 0005 fills are unreachable. 0005 is half of one change; 0008
+  (`tools/panvk-g57/patches/0008-advertise-physical-device-drm.patch`) is the other. [E: source]
+- `kbase_dmabuf` is a **third**, independent gate: it needs `PANVK_KBASE_DRI3` non-empty and not
+  `0` (`panvk_wsi.c:112-118`), and the session sets neither it nor `WSI_X11_TERMUX`. So even a
+  driver that reports its DRM device will keep `sw_device=1` until that knob is set. See bringup
+  §22.3.
+
+The 7.2a prediction should be read as two predictions, not one: the DRM device numbers need 0005 +
+0008; leaving the SHM ring needs `PANVK_KBASE_DRI3` as well.
+
 ### 7.3 Defect A: don't rely on the movie being dismissed
 
 - Cheapest test of the hypothesis: blank/remove `StartupMovie` (`SessionFiles.kt:224-232`,
