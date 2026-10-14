@@ -264,7 +264,7 @@ public final class PanvkDriver {
                 if (in == null) throw new IOException("cannot open " + tzst);
                 if (!TarZst.extract(in, tree)) throw new IOException("cannot unpack the driver");
             }
-            File so = find(tree, "libvulkan_panvk.so");
+            File so = findPanvk(tree);
             File metaFile = find(tree, "meta.json");
             if (so == null || metaFile == null) throw new IllegalArgumentException(context.getString(R.string.turnip_reject_no_meta));
             JSONObject meta = readMetaFile(metaFile);
@@ -279,6 +279,21 @@ public final class PanvkDriver {
             FileUtils.delete(tree);
             if (!keep) FileUtils.delete(tmpDir);
         }
+    }
+
+    /** The first PanVK library anywhere under [dir], or null: a build nests it under usr/lib. */
+    private static File findPanvk(File dir) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return null;
+        for (File f : entries) {
+            if (f.isDirectory()) {
+                File hit = findPanvk(f);
+                if (hit != null) return hit;
+            } else if (LinuxPanvkDriverManager.isPanvkLibrary(f.getName())) {
+                return f;
+            }
+        }
+        return null;
     }
 
     /** First file named [name] anywhere under [dir], or null: a release build nests it under usr/lib. */

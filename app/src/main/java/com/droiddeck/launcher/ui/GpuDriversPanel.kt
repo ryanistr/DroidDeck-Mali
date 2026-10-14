@@ -95,6 +95,8 @@ class GpuDriversState(
     val linuxDownloads: List<DownloadRow> = emptyList(),
     val androidDownloads: List<DownloadRow> = emptyList(),
     val canRestoreBundled: Boolean = false,
+    /** True on Mali: the import buttons name PanVK zips, not Turnip/AdrenoTools ones. */
+    val mali: Boolean = false,
     /** The Android + Linux bundle both drivers are set to ("DD-Turnip 0.1.0"), or null. */
     val activeBundle: String? = null,
 ) {

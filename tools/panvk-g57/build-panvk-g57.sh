@@ -1,15 +1,23 @@
 #!/usr/bin/bash
-# Builds the Mali-G57 fork's PanVK (v9 JM + kbase, dma-buf fd interop) for aarch64 glibc.
+# Builds the Mali-G57 fork's PanVK (Valhall v9 JM + v10/v11 CSF + kbase, dma-buf fd interop) for
+# aarch64 glibc: the runtime's PanVK on every Mali generation this fork drives. It is published as
+# "PanVK-rynx-<version>-<patch>", the code name that tells this fork's own build apart from any
+# other PanVK package when the driver names itself in the menus and the device report.
 #
 # The runtime's shipped PanVK has no v9 backend (panvk_v9 = 1 symbol) and upstream Mesa's JM
 # backend is Bifrost-only, so a Valhall device enumerates nothing and gamescope reports "failed to
 # find physical device". This fork carries a real v9 JM backend with its own kbase driver, so it
-# needs no libpanvk_kbase_jm.so beside it.
+# needs no libpanvk_kbase_jm.so beside it. Its CSF backends (v10 for a G610, v11 for a G615/G715)
+# come from the same build and the patches in tools/panvk-g57/patches/.
 #
 # Built natively on an arm64 runner. Outputs: panvk-linux-g57-<VERSION>.tzst + .sha256
 set -euxo pipefail
 
 VERSION=${PANVK_G57_VERSION:-1.2.0}
+# The published patch level, so the driver names itself the way its tag does
+# (panvk-linux-g57-1.2.0-p5 -> PanVK-rynx-1.2.0-p5). Empty for an unreleased build.
+PATCH=${PANVK_G57_PATCH:-}
+CODENAME="PanVK-rynx-$VERSION${PATCH:+-$PATCH}"
 G57_REPO=${PANVK_G57_REPO:-https://github.com/apexspan-svg/mesa-panvk-mali-g57.git}
 WORK="${GITHUB_WORKSPACE:-$PWD}"
 
@@ -49,13 +57,28 @@ test -f builddir/src/panfrost/vulkan/libvulkan_panfrost.so
 mkdir -p "$WORK/out/usr/lib" "$WORK/out/usr/share/vulkan/icd.d"
 cp builddir/src/panfrost/vulkan/libvulkan_panfrost.so "$WORK/out/usr/lib/libvulkan_panvk.so"
 
-# v9 and v11 backends present? A driver without v9 is exactly what this component replaces, and
-# arch 11 (Mali-G615/G715) only exists behind 0003, so fail here rather than ship one. Checked
-# before stripping: these are local symbols, and --strip-unneeded drops them.
+# v9, v10 and v11 backends present? A driver without v9 is exactly what this component replaces;
+# v10 is the CSF backend a G610 (the GT 20 Pro) needs and v11 the one a G615/G715 needs, and arch
+# 11 only exists behind 0003. Fail here rather than ship a driver that enumerates nothing on the
+# generation it was published for. Checked before stripping: these are local symbols, and
+# --strip-unneeded drops them.
 readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v9_' \
     || { echo "built driver has no v9 backend" >&2; exit 1; }
+readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v10_' \
+    || { echo "built driver has no v10 CSF backend" >&2; exit 1; }
 readelf -sW "$WORK/out/usr/lib/libvulkan_panvk.so" | grep -q 'panvk_v11_' \
     || { echo "built driver has no v11 backend (0003 not applied?)" >&2; exit 1; }
+# 0004/0006/0007 are the CSF fixes (provoking-vertex fn address, single merged CSG, register file
+# sized from the uAPI). They land in the CSF command files and in kbase_kmod.c, so a build whose
+# objects are missing them cannot be told apart by symbols; the patch loop above is what guarantees
+# them, and release.env pins the tag they were built into.
+#
+# The same binary also carries the fifth-gen CSF backends (v12/v13/v14, the arch list at
+# src/panfrost/vulkan/meson.build:159 covers 6, 7, 9 through 14 and csf_archs starts at 10), so
+# "one build, every Mali generation this fork drives" is already true here. gpuArch stops at 11 on
+# purpose: v12+ has never been run on device from this tree, and gpuArch is what PanvkDriver's
+# Mali auto-selection keys on, so advertising it would hand a G720-family device a driver nobody
+# has measured.
 
 strip --strip-unneeded "$WORK/out/usr/lib/libvulkan_panvk.so"
 
@@ -88,10 +111,12 @@ cat > "$WORK/out/meta.json" <<META
 {
     "schemaVersion": 1,
     "kind": "linux-vulkan-icd",
-    "name": "Mesa PanVK $VERSION (Mali-G57 fork, v9 JM kbase)",
-    "driverVersion": "$VERSION",
+    "name": "$CODENAME",
+    "description": "Mesa PanVK $VERSION from the Mali-G57 fork, glibc: Valhall v9 through Job Manager and v10/v11 through CSF, on this fork's own kbase driver. Built by tools/panvk-g57/build-panvk-g57.sh with its patches applied.",
+    "driverVersion": "$VERSION${PATCH:+-$PATCH}",
     "libc": "glibc",
     "minGlibc": "2.35",
+    "gpuArch": [9, 10, 11],
     "sourceLibraryName": "libvulkan_panvk.so",
     "importedAt": 0
 }

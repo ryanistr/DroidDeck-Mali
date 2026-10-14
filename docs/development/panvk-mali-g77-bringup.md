@@ -972,3 +972,230 @@ What to measure, in order: (1) whether the guest session log now shows a `/dev/d
 X6739; (2) whether `PANVKDBG` now prints non-zero DRM device numbers for the physical device (0005);
 (3) the G615 on the GT 30 Pro for 0004, since the X6739's G77 submits through JM and is untouched by
 it.
+
+## 20. The runtime importer only knew one soname (GT 20 Pro report, 2026-10-14)
+
+The GT 20 Pro bundle `DroidDeck-2026-10-14-11-steam.zip` (Infinix X6871, MT6896, **Mali-G610 MC6**,
+arch v10, kbase **CSF 1.18**) reports one failure plainly: the PanVK build the tester wanted for the
+runtime could not be imported at all, so the session fell back to the pinned driver.
+
+### 20.1 What the report proves
+
+`device.txt`:
+
+```
+GPU                     Mali-G610 MC6 · Mali Valhall · Experimental
+Driver mode             manual
+Display driver (chosen) PanVK_G720   Mesa 26.3.0-devel / PanVK G720 0.1.0-beta.2   (imported)
+Linux driver (PanVK)    Mesa PanVK 1.2.0 (Mali-G57 fork, v9 JM kbase) 1.2.0 (glibc 2.35+)
+```
+
+`session.log`:
+
+```
+== uid=10352 size=1624x720 fps=0 icd=/usr/share/vulkan/icd.d/panvk_icd.aarch64.json
+== vulkan driver: imported .../linux_panvk_drivers/Mesa_PanVK_1.2.0_Mali-G57_fork_v9_JM_kbase_/libvulkan_panvk.so
+PANVKDBG kbase uAPI: CSF 1.18
+PANVKDBG kbase props: js_present=0x0 jsf=0,0,0 num_cg=1 cg0=0x130013 shader_present=0x130013
+PANVKDBG WSI: uses_kbase=1 termux_raw=0 raw_dri3=0 kbase_dmabuf=0 sw_device=1 raw_fd_modifier=0
+```
+
+`js_present=0x0` with `kbase uAPI: CSF 1.18` confirms the G610 is **CSF**, not JM, and that the
+pinned `panvk-linux-g57-1.2.0-p4` does create a device on it (`CREATE_DEVICE AFTER_INIT result=0`).
+The *display* half is a third-party PanVK (wonderkast02's G720 CSF fork, bionic) and imported fine.
+The failure is specific to the runtime half.
+
+### 20.2 Root cause: `LinuxPanvkDriverManager` matched one library name, and said "freedreno"
+
+Upstream Mesa's PanVK soname is **`libvulkan_panfrost.so`**; this fork renames it to
+`libvulkan_panvk.so` only for the runtime. The bionic importer keys off `meta.json`'s `libraryName`
+and so accepted the G720 package; the glibc importer matched a hardcoded prefix instead:
+
+- `LinuxPanvkDriverManager.java` — `LIB_NAME = "libvulkan_panvk.so"`, the zip path required
+  `base.startsWith("libvulkan_panvk")`, the tzst path `find(tree, LIB_NAME)`.
+- A PanVK build keeping the upstream name matched neither, so the import failed with
+  `R.string.lvd_no_library` — the **Turnip** string, which reads
+  *"No libvulkan_freedreno*.so in this zip…"*. That wording is what the report called "our app …
+  expect[s] a freedreno.so instead of being able to import a panvk driver as a runtime driver".
+
+Measured on the actual G720 package (`PanVK-G720-0.1.0-beta.2.zip`, sha256 `fc1d6964…`, from
+`wonderkast02/panvk-g720-kbase-csf`): it contains exactly `libvulkan_panfrost.so` (21497392 B) and
+`meta.json`, nothing named `libvulkan_panvk*`.
+
+**Fix:** `isPanvkLibrary()` accepts `libvulkan_panvk*` and `libvulkan_panfrost*` (with an optional
+`.so.1` suffix); both import paths use it, the library is copied in as `LIB_NAME` whatever it was
+called, and the refusals are PanVK-worded (`lvd_no_panvk_library`, `lvd_panvk_not_glibc`). The bionic
+tzst path got the same predicate. Pinned by `LinuxPanvkDriverManagerTest`.
+
+### 20.3 The built-in driver against the release-page one (byte comparison, 2026-10-14)
+
+The staged runtime driver (`app/src/main/assets/linuxfs/usr/lib/libvulkan_panvk.so`), the build
+cache's copy, and the release-page asset `panvk-linux-g57-1.2.0.tzst` from tag
+`panvk-linux-g57-1.2.0-p4` are **the same bytes**:
+
+```
+sha256 .scratch/releasepage/panvk-linux-g57-1.2.0.tzst
+  dc6503e3e9aa649387e01022c6337276c6e150ca4093b05c07f3226fef97fd88   == PANVK_SHA256 in release.env
+sha256 <staged>/usr/lib/libvulkan_panvk.so == <release-page>/usr/lib/libvulkan_panvk.so
+  21871824 bytes, identical; meta.json identical byte for byte
+```
+
+So the apk's "built-in" runtime PanVK *is* the release-page p4 asset by construction (fetched by tag
+and checksum). They are not two different builds; the only way to tell which build a device runs was
+the driver's own name, which is [20.4].
+
+Against a third-party bionic PanVK (the G720 CSF fork) the differences are the ABI and the platform
+layer, not the GPU table — both are Mesa 26.3.0-devel and both list the same models
+(G57/-G310/-G510/-G610/-G615/-G710/-G715/-G720/-G725/-G1-*):
+
+| | our glibc build (p4) | wonderkast02 G720 (bionic) |
+|---|---|---|
+| NEEDED | `libc.so.6`, `ld-linux-aarch64.so.1`, `libdrm.so.2`, `libwayland-client.so.0`, `libxcb*`, `libxshmfence.so.1`, `libexpat.so.1`, `libz/zstd`, `libstdc++.so.6` | `libc.so`, `liblog.so`, `libhardware.so`, `libnativewindow.so`, `libsync.so`, `libdl.so`, `libm.so`, `libz.so` |
+| SONAME | `libvulkan_panfrost.so` (file renamed `libvulkan_panvk.so`) | `libvulkan_panfrost.so` |
+| Mesa | `26.3.0-devel (git-66306ebde5)` | `26.3.0-devel` |
+| fd interop | `PANVK_FD_INTEROP`, `/dev/dma_heap/system` | `/dev/dma_heap/system` only (no gate string) |
+
+Neither can stand in for the other: the bionic one cannot be `dlopen`ed by a glibc Steam client at
+all, which is the check `adopt()` still makes (`libc.so.6` present, or it is refused).
+
+### 20.4 The built-in driver now names itself — `PanVK-rynx-<version>-<patch>`
+
+A driver that only says "Built-in" cannot be compared against anything.
+`tools/panvk-g57/build-panvk-g57.sh` now takes `PANVK_G57_PATCH` (the tag's own suffix,
+`panvk-linux-g57-1.2.0-p5` → `p5`), names the driver **`PanVK-rynx-<version>-<patch>`**
+(e.g. `PanVK-rynx-1.2.0-p5`), sets `driverVersion` to `<version>-<patch>` and declares
+`gpuArch: [9, 10, 11]` so an imported copy does not need the tag to be recognised.
+`LinuxPanvkDriverManager.getBuiltinName()/getBuiltinVersion()` read that meta from
+`<filesDir>/linuxfs/meta.json` (where `tar -xf` of the tzst leaves it), and the runtime-default row
+in the driver list and the device report's `Linux driver (PanVK)` line show it.
+
+The workflow derives the patch in its own step and exports `PANVK_G57_PATCH` through `$GITHUB_ENV`;
+the release note uses the same code name.
+
+### 20.5 What this does not yet do
+
+The p5 build carrying 0004/0005/0006 (19.1, 19.2) is still only *prepared*: `release.env` pins p4.
+Until that workflow is dispatched, a CSF device runs a driver with the provoking-vertex truncation
+and the old merged-CSG behaviour, and `kbase_dmabuf=0 sw_device=1` remains the reason nothing
+presents.
+
+## 21. "Merge the CSF driver into rynx" — surveyed 2026-10-14
+
+The ask was to clone the PanVK **CSF** driver and merge it into ours "so our driver rynx can support
+both v9 JM and CSF dynamically without requiring to compile separately". Two separate questions are
+hiding in that sentence, and they have different answers.
+
+### 21.1 One build already carries v9 JM *and* the CSF backends
+
+Nothing has to be merged for this half, and it is not a claim from reading the patch list — it is in
+the build log of the workflow run that produced the pinned asset. `.scratch/p3run.log`, the arm64
+runner's own output for the p3 build, compiles every arch's objects into the one library:
+
+```
+[937/1082] Compiling C object src/panfrost/vulkan/libpanvk_v12.a.p/...libpan_shaders_v12.c.o
+[954/1082] Compiling C object src/panfrost/vulkan/libpanvk_v10.a.p/csf_panvk_vX_exception_handler.c.o
+[963/1082] Compiling C object src/panfrost/vulkan/libpanvk_v12.a.p/csf_panvk_vX_cmd_buffer.c.o
+[971/1082] Compiling C object src/panfrost/vulkan/libpanvk_v12.a.p/csf_panvk_vX_instr.c.o
+```
+
+and the meson that generates those lists is
+`src/panfrost/vulkan/meson.build:159` — `foreach arch : [6, 7, 9, 10, 11, 12, 13, 14]`, with
+`jm_archs = [6, 7, 9]` at :95, `csf_archs = [10, 11, 12, 13, 14]` at :115 and
+`valhall_archs = [9, 10, 11]` at :87 (arch 11 is what 0003 adds). Every arch is a static library
+(`libpanvk_v@0@`, :183) linked into the single `libvulkan_panfrost.so`, and PanVK picks the backend
+from the GPU id at runtime. There is no "JM build" and "CSF build" to reconcile.
+
+The on-device receipt is the GT 20 Pro report (2026-10-14, §20.1): a CSF-only G610
+(`js_present=0x0`, `kbase uAPI: CSF 1.18`) reached
+`PANVKDBG CREATE_DEVICE AFTER_INIT result=0` — that print lives in `panvk_vX_device.c`
+`panvk_per_arch(create_device)`, so the v10 CSF backend was selected dynamically out of the same
+binary that also contains v9 JM.
+
+### 21.2 What is in `wonderkast02/panvk-g720-kbase-csf`, and what is not
+
+The repository is **not** a Mesa fork. `gh repo view` gives "Experimental Mesa/PanVK for Mali-G720 on
+Android Kbase/CSF", and a `--depth 1` clone is 988 KB / 49 files: docs, kbase UAPI headers,
+standalone test programs (`test_gpu_write.c`, `test_gpu_copy_v2.c`), and **two file snapshots** of
+the Mesa tree they build:
+
+```
+mesa-snapshot/src/panfrost/lib/kmod/kbase_kmod.c          1966 lines
+mesa-snapshot/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c 3231 lines
+patches/0001-panvk-kbase-g720-register-count.patch
+```
+
+Our tree's siblings of those two files are 2516 and 3141 lines and share their lineage: the same
+`kbase_query_csif_info()` comment, the same `kbase_subqueue_emit_job()` / `kbase_subqueue_wait_seqno()`
+/ `kbase_try_destroy_retired_heap()` decomposition. So this is not two implementations to fuse; it
+is two divergences of one. Diffing theirs against ours (`diff -u`, then dropping the
+logging-only lines) leaves **three** substantive items in their column:
+
+1. `.cs_reg_count = (stream_features & 0xff) + 1` in `kbase_query_csif_info()`, where ours has a
+   hardcoded `96`.
+2. `.nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4)` in
+   `kbase_subqueue_emit_job()`'s `cs_builder_conf`, which ours omits there.
+3. A `to_kbase_mem_flags()` helper where ours inlines the same flag computation.
+
+Everything else in their column is unconditional `mesa_logi()`/`pandecode_*` diagnostics that ours
+either already has or reaches behind `PANVK_DEBUG(KBASE_DIAG)`; ours is the quieter tree. And the
+reverse direction is much larger: ours carries things theirs does not have at all, in particular the
+**single merged CSG** (`kbase_kmod_csf_group_create(dev->kmod.dev, PANVK_SUBQUEUE_COUNT, ...)`, one
+CSG holding every subqueue's CSI, with the destroy path moved to the queue) and the fence-wait
+generation reclaim in `kbase_wait_sync_targets()` — i.e. 0006. Their bionic drop binary does not
+have 0004's provoking-vertex fix either.
+
+### 21.3 Merged: 0007, the register file sized from the uAPI
+
+Of the three, items 1 and 2 are real defects in ours, so they are now
+`tools/panvk-g57/patches/0007-csf-reported-register-count.patch`.
+
+The register count: a comment in our `kbase_query_csif_info()` argued the stream-feature encoding is
+unreliable (a Pixel 7 kbase 1.38 reports a work-register value below the file the CS compiler was
+sized against) and hardcoded `96`. That is right for the under-reporting case and wrong for the
+other one: this tree's own drm-shim says the file is not always 96 —
+
+```c
+src/panfrost/drm-shim/panfrost_noop.c:203
+      csif_info->cs_reg_count = arch >= 12 ? 128 : 96;
+```
+
+— and a 96-register allocation under-runs a 128-register 5th-gen part, which is precisely the defect
+`0001-panvk-kbase-g720-register-count.patch` fixes on a G720. The merge takes both behaviours
+instead of picking one:
+
+```c
+      .cs_reg_count = CLAMP((stream_features & 0xff) + 1, 96, 128),
+```
+
+A stale under-report still floors at the 96 panthor assumes below 5th-gen, a 5th-gen report now
+reaches 128, and a bogus high report cannot push the register allocator past the file (the
+`assert(reg + size <= nr_registers - nr_kernel_registers)` in `cs_builder.h:437` is what a too-large
+value would otherwise walk into).
+
+The second half of 0007 is `kbase_subqueue_emit_job()`'s `cs_builder_conf`. Every other CS builder
+in the tree sets `.nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4)`
+(`csf/panvk_vX_cmd_draw.c:103`, `csf/panvk_vX_exception_handler.c:124`, `csf/panvk_vX_utrace.c:245`,
+`csf/panvk_vX_cmd_buffer.c:793`, and the file's own two other `cs_builder_conf` sites); this one did
+not, and `cs_builder_init()` floors the field at 3 (`cs_builder.h:251`), so the allocator was free
+to hand the stream one register the kernel clobbers.
+
+Item 3 is deliberately not taken: `to_kbase_mem_flags()` is a pure refactor of code ours already
+executes inline, and churning a file for style would make the next diff against either fork harder
+to read.
+
+### 21.4 What 0007 does not do
+
+It does not advertise arch 12. `gpuArch` stays `[9, 10, 11]` in the driver's `meta.json`, and that
+field is load-bearing: `PanvkDriver.autoSelect()` (`gpu/PanvkDriver.java:459`) returns the first
+driver whose `gpuArch` contains the device's arch (`canDrive(id, arch)`), so adding 12 would hand a
+G720-family device a driver no one has run on that hardware. The fifth-gen CSF backend is compiled
+into the same binary and is now sized correctly, but "compiled and sized correctly" is not
+"measured", so the claim stops where the measurements do.
+
+Nor does it change the CSF session's remaining dead end: `kbase_dmabuf=0 sw_device=1` (§19.5,
+§20.5) is still why a CSF device presents nothing, and that is a WSI question, not a register-file
+one.
+
+The patch was verified the way the build applies it: a `git worktree` at the pinned tag with
+`tools/panvk-g57/patches/*.patch` applied in glob order, then `diff` against the two files this
+change touches — identical. It has not been compiled: the driver only builds on an arm64 runner.

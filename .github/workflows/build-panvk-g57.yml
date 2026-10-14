@@ -63,6 +63,21 @@ jobs:
           python3 -m pip install --break-system-packages -U 'meson>=1.4'
           meson --version
           meson --version | awk -F. '{ exit !($1 > 1 || ($1 == 1 && $2 >= 4)) }'
+      - name: Name the build after its tag
+        # The driver names itself "PanVK-rynx-<version>-<patch>", the code name that tells this
+        # fork's build apart from any other PanVK package, and the patch is the tag's own suffix
+        # (panvk-linux-g57-1.2.0-p5 -> p5). Nothing is exported for a push build, which publishes
+        # no release and so has no tag.
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${TAG:-}" =~ -p([0-9]+)$ ]]; then
+            echo "PANVK_G57_PATCH=p${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+            echo "code name: PanVK-rynx-${{ inputs.version || '1.2.0' }}-p${BASH_REMATCH[1]}"
+          else
+            echo "no -p<n> suffix in '${TAG:-}'; the build names itself without a patch level"
+          fi
       - name: Build PanVK (Mali-G57 fork, glibc)
         env:
           PANVK_G57_VERSION: ${{ inputs.version || '1.2.0' }}
@@ -82,7 +97,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "PanVK Mali-G57 fork (v9 JM kbase, fd interop) staged by the apk into linuxfs/usr/lib. sha256 $(cut -d' ' -f1 panvk-linux-g57-*.tzst.sha256)" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 --clobber
+          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "PanVK-rynx-${PANVK_G57_VERSION:-1.2.0}${PANVK_G57_PATCH:+-$PANVK_G57_PATCH} - the Mali-G57 fork's glibc PanVK (Valhall v9 JM + v10/v11 CSF on its own kbase driver), staged by the apk into linuxfs/usr/lib. sha256 $(cut -d' ' -f1 panvk-linux-g57-*.tzst.sha256)" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 --clobber
           # A component the apk fetches by tag, never something users install: it must not become
           # the repo's Latest release or appear as a pre-release, also when re-uploaded.
           gh release edit "${{ inputs.tag }}" --latest=false --prerelease=false

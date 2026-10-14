@@ -1,0 +1,120 @@
+From: DroidDeck-Mali, after MineGraph-bilibili/panvk-Android db4a962
+Date: 2026-10-14
+Subject: CSF: run every subqueue in one merged CSG instead of one CSG each
+
+The stock per-subqueue topology (one CSG per subqueue) leaves the whole
+VT/fragment/compute dependency graph cross-CSG, and this generation's kbase
+firmware deschedules groups whose progress depends on another group: the
+groups bind but stream progress never advances, and every subqueue times out
+with no error flag. That is the hang the other Mali fork met on this same
+kind of tree with its multi-GPU build (fragment subqueue stuck on the
+vertex/tiler sync object after ~50 presented frames), and the topology its
+successor runs DX12 on. Keeping the graph intra-CSG removes the cross-group
+stall; the sync path already emits plain stores with CSG scope, which matches
+this layout.
+
+Each subqueue still gets its own ring buffer, mapped VA and doorbell page;
+only the group is shared, with one CSI per subqueue (VT/FRAG/COMPUTE =
+CSI 0/1/2), and the group is destroyed once instead of once per subqueue.
+
+Reference: MineGraph-bilibili/panvk-Android (mcghjbcg's multi-GPU fork),
+commit db4a962 ("panvk: BCn emulation, XFB stream queries, gl_DrawID and
+kbase CSF stability"), the kbase_create_group hunk. Ported to this tree's
+naming (queue->group_handle, subq->kbase.group_handle) and with its destroy
+path updated to match; the upstream hunk it replaces is identified in that
+commit as the "beta.9" layout.
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 552ce50..65cb569 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -919,11 +919,13 @@ kbase_destroy_group(struct panvk_gpu_queue *queue)
+       subq->kbase.ringbuf_bo = NULL;
+       subq->kbase.user_io = NULL;
+ 
+-      if (subq->kbase.group_handle != UINT32_MAX) {
+-         kbase_kmod_csf_group_destroy(dev->kmod.dev,
+-                                      subq->kbase.group_handle);
+-         subq->kbase.group_handle = UINT32_MAX;
+-      }
++      subq->kbase.group_handle = UINT32_MAX;
++   }
++
++   /* Every subqueue shares the one merged CSG, so destroy it once. */
++   if (queue->group_handle != UINT32_MAX) {
++      kbase_kmod_csf_group_destroy(dev->kmod.dev, queue->group_handle);
++      queue->group_handle = UINT32_MAX;
+    }
+ }
+ 
+@@ -938,16 +940,26 @@ kbase_create_group(struct panvk_gpu_queue *queue)
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+       queue->subqueues[i].kbase.group_handle = UINT32_MAX;
+ 
++   /* One CSG carrying every subqueue's CSI (VT/FRAG/COMPUTE = CSI 0/1/2).
++    * The stock per-subqueue topology (one CSG each) leaves the whole
++    * dependency graph cross-CSG, and kbase firmware of this generation
++    * deschedules groups whose progress depends on another group: the groups
++    * bind but stream progress never advances, and every subqueue times out
++    * with no error flag. The merged layout keeps the graph intra-CSG. */
++   if (kbase_kmod_csf_group_create(dev->kmod.dev, PANVK_SUBQUEUE_COUNT,
++                                   &queue->group_handle)) {
++      result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
++                            "Failed to create the kbase queue group");
++      goto err_destroy_group;
++   }
++   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
++      queue->subqueues[i].kbase.group_handle = queue->group_handle;
++   mesa_logd("kbase: single merged CSG %u carrying %u CSIs",
++             queue->group_handle, PANVK_SUBQUEUE_COUNT);
++
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+       struct panvk_subqueue *subq = &queue->subqueues[i];
+ 
+-      if (kbase_kmod_csf_group_create(dev->kmod.dev, 1,
+-                                      &subq->kbase.group_handle)) {
+-         result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+-                               "Failed to create a kbase queue group");
+-         goto err_destroy_group;
+-      }
+-
+       subq->kbase.ringbuf_bo =
+          pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, KBASE_RINGBUF_SIZE,
+                            0);
+@@ -986,7 +998,7 @@ kbase_create_group(struct panvk_gpu_queue *queue)
+       subq->kbase.ringbuf_dev = op.va.start;
+ 
+       subq->kbase.user_io = kbase_kmod_csf_queue_bind(
+-         dev->kmod.dev, subq->kbase.group_handle, 0,
++         dev->kmod.dev, subq->kbase.group_handle, i,
+          subq->kbase.ringbuf_dev,
+          KBASE_RINGBUF_SIZE);
+       if (!subq->kbase.user_io) {
+@@ -997,9 +1009,9 @@ kbase_create_group(struct panvk_gpu_queue *queue)
+ 
+       subq->kbase.insert = 0;
+       subq->kbase.emitted_jobs = 0;
+-      mesa_logd("kbase: bound subqueue %u to group %u CSI0, ring CPU %p, "
++      mesa_logd("kbase: bound subqueue %u to group %u CSI%u, ring CPU %p, "
+                 "ring VA 0x%" PRIx64 ", user_io %p",
+-                i, subq->kbase.group_handle, subq->kbase.ringbuf_cpu,
++                i, subq->kbase.group_handle, i, subq->kbase.ringbuf_cpu,
+                 subq->kbase.ringbuf_dev,
+                 subq->kbase.user_io);
+    }
+@@ -2570,6 +2582,15 @@ kbase_wait_sync_targets(
+          return result;
+    }
+ 
++   /* Fence-wait reclaim: a successful wait proves the waited entries retired,
++    * which is exactly the destroy gate of every generation retired before
++    * those entries. Reclaim here instead of leaving retired generations
++    * pinned until the next heap rotation: each idle generation keeps its
++    * grown chunks resident. The guard keeps the empty case to one load; the
++    * lock inside serializes with the submit thread. */
++   if (queue->kbase_retired_heap.ctx)
++      kbase_try_destroy_retired_heap(queue);
++
+    return VK_SUCCESS;
+ }
+ 

@@ -7,6 +7,7 @@ import android.util.Log;
 import com.droiddeck.launcher.R;
 import com.droiddeck.launcher.core.FileUtils;
 import com.droiddeck.launcher.core.TarZst;
+import com.droiddeck.launcher.runtime.LinuxRuntime;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -38,7 +39,7 @@ import java.util.zip.ZipInputStream;
  * <p>Layout (under the app's files dir, which the session sees by its full host path):
  * <pre>
  *   files/linux_panvk_drivers/<id>/
- *       libvulkan_panvk.so      the driver
+ *       libvulkan_panvk.so      the driver, renamed to this from whatever the build called it
  *       icd.json                generated Vulkan ICD manifest; library_path = the .so's ABSOLUTE path
  *       meta.json               name / driverVersion / minGlibc, our own schema
  * </pre>
@@ -51,6 +52,21 @@ public class LinuxPanvkDriverManager {
     public static final String LIB_NAME = "libvulkan_panvk.so";
     public static final String ICD_NAME = "icd.json";
     public static final String META_NAME = "meta.json";
+
+    /**
+     * Whether [base] is a library a PanVK build carries. Upstream's soname is
+     * {@code libvulkan_panfrost.so}; this fork renames it to {@code libvulkan_panvk.so} for the
+     * runtime. Both are accepted - a build is identified by being PanVK, not by a name we chose -
+     * and whatever it was called is copied in as {@link #LIB_NAME}, which the ICD manifest points at.
+     * A versioned suffix ({@code .so.1}) is the same library.
+     */
+    static boolean isPanvkLibrary(String base) {
+        if (!(base.startsWith("libvulkan_panvk") || base.startsWith("libvulkan_panfrost"))) return false;
+        int so = base.indexOf(".so");
+        if (so < 0) return false;
+        String trailing = base.substring(so + 3);
+        return trailing.isEmpty() || trailing.matches("\\.\\d+");
+    }
 
     private final Context context;
     private final File rootDir;
@@ -113,6 +129,34 @@ public class LinuxPanvkDriverManager {
         return m != null ? m.optString("minGlibc", "") : "";
     }
 
+    /**
+     * The code name the PanVK built into the runtime carries, from the meta.json the staged driver
+     * leaves at the rootfs root ("PanVK-rynx-<version>-<patch>"), or "" when the runtime is absent
+     * or its root carries no PanVK meta. This is the driver the session falls back to when no
+     * imported one is chosen, so the menus and the report can name it instead of saying "Built-in".
+     */
+    public String getBuiltinName() {
+        JSONObject m = builtinMeta();
+        return m != null ? m.optString("name", "") : "";
+    }
+
+    /** The version of the built-in PanVK, as {@link #getBuiltinName} reads it ("" when unknown). */
+    public String getBuiltinVersion() {
+        JSONObject m = builtinMeta();
+        return m != null ? m.optString("driverVersion", "") : "";
+    }
+
+    private JSONObject builtinMeta() {
+        try {
+            File meta = new File(LinuxRuntime.rootDir(context), META_NAME);
+            if (!meta.isFile()) return null;
+            JSONObject m = new JSONObject(FileUtils.readString(meta));
+            return "linux-vulkan-icd".equals(m.optString("kind", "")) ? m : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public void removeDriver(String id) {
         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return;
         Log.d(TAG, "removing imported Linux PanVK driver " + id);
@@ -148,8 +192,8 @@ public class LinuxPanvkDriverManager {
                     // Flatten: only the base name matters, and it also defeats zip-slip paths.
                     String base = new File(entry.getName()).getName();
                     if (base.isEmpty()) continue;
-                    if (base.startsWith("libvulkan_panvk") && base.endsWith(".so")) {
-                        if (soName != null) Log.w(TAG, "zip has several libvulkan_panvk*.so; using the first (" + soName + ")");
+                    if (isPanvkLibrary(base)) {
+                        if (soName != null) Log.w(TAG, "zip has several PanVK libraries; using the first (" + soName + ")");
                         else {
                             Files.copy(zis, new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
                             soName = base;
@@ -204,8 +248,8 @@ public class LinuxPanvkDriverManager {
         boolean keep = false;
         try {
             if (!TarZst.extract(source, tree)) throw new IOException("cannot unpack the driver");
-            File so = find(tree, LIB_NAME);
-            if (so == null) throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
+            File so = findPanvk(tree);
+            if (so == null) throw new IllegalArgumentException(context.getString(R.string.lvd_no_panvk_library));
             Files.copy(so.toPath(), new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
             JSONObject meta = null;
             File metaFile = find(tree, META_NAME);
@@ -223,6 +267,21 @@ public class LinuxPanvkDriverManager {
             FileUtils.delete(tree);
             if (!keep) FileUtils.delete(tmpDir);
         }
+    }
+
+    /** The first library a PanVK build can carry anywhere under [dir], or null. */
+    private static File findPanvk(File dir) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return null;
+        for (File f : entries) {
+            if (f.isDirectory()) {
+                File hit = findPanvk(f);
+                if (hit != null) return hit;
+            } else if (isPanvkLibrary(f.getName())) {
+                return f;
+            }
+        }
+        return null;
     }
 
     /** First file named [name] anywhere under [dir], or null: a release build nests it under usr/lib. */
@@ -261,7 +320,7 @@ public class LinuxPanvkDriverManager {
     String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName, int[] gpuArch) throws IOException {
         try {
             if (soName == null) {
-                throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
+                throw new IllegalArgumentException(context.getString(R.string.lvd_no_panvk_library));
             }
             File so = new File(tmpDir, LIB_NAME);
             if (!isAarch64Elf(so)) {
@@ -271,7 +330,7 @@ public class LinuxPanvkDriverManager {
             // are in the driver's .dynstr, so a byte scan is enough and needs no ELF parsing:
             // glibc's is versioned ("libc.so.6"), bionic's is not ("libc.so").
             if (!containsAscii(so, "libc.so.6")) {
-                throw new IllegalArgumentException(context.getString(R.string.lvd_not_glibc, soName));
+                throw new IllegalArgumentException(context.getString(R.string.lvd_panvk_not_glibc, soName));
             }
             String kind = zipMeta != null ? zipMeta.optString("kind", "") : "";
             if (!kind.isEmpty() && !"linux-vulkan-icd".equals(kind)) {

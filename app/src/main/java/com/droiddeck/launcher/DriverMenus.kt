@@ -75,7 +75,7 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         autoStatus = autoStatus, releaseStatus = releaseStatus.ifEmpty { activity.getString(R.string.drivers_not_checked) }, checking = releaseChecking,
         linuxRows = linuxRows, linuxSelected = linuxSelected, androidRows = androidRows, androidSelected = androidSelected,
         linuxDownloads = linuxDownloads, androidDownloads = androidDownloads, canRestoreBundled = canRestoreBundled,
-        activeBundle = activeBundle,
+        mali = mali, activeBundle = activeBundle,
     )
     var androidRows by mutableStateOf<List<DriverRow>>(emptyList())
     var androidSelected by mutableStateOf("")
@@ -94,7 +94,10 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         }
         linuxRows = if (isMali) {
             LinuxPanvkDriver.optionValues(activity).map { id ->
-                if (id.isEmpty()) DriverRow("", activity.getString(R.string.gpu_runtime_default), activity.getString(R.string.drivers_runtime_builtin), false)
+                if (id.isEmpty()) DriverRow(
+                    "", activity.getString(R.string.gpu_runtime_default),
+                    builtinDetail(), false,
+                )
                 else {
                     val mgr = LinuxPanvkDriverManager(activity)
                     bundleRow(id, linux = true) ?: DriverRow(
@@ -170,6 +173,19 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
     }
 
     /**
+     * What the runtime-default (built-in) row says: the code name the PanVK staged into the runtime
+     * gave itself ("PanVK-rynx-<version>-<patch>"), so the fallback driver can be told apart from a
+     * released one, or the generic line when the runtime has no such meta to read.
+     */
+    private fun builtinDetail(): String {
+        val builtin = LinuxPanvkDriverManager(activity)
+        val name = builtin.getBuiltinName()
+        if (name.isEmpty()) return activity.getString(R.string.drivers_runtime_builtin_panvk)
+        val version = builtin.getBuiltinVersion()
+        return listOfNotNull(name, version.takeIf { it.isNotEmpty() }).joinToString(" · ")
+    }
+
+    /**
      * A driver's detail line: its version, the glibc it asks for, the Mali generations it was built
      * with, and - when it names generations other than this GPU's - that it cannot drive this one,
      * which on Mali is the difference between a driver and a black screen.
@@ -215,10 +231,20 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
 
     private fun panvkStatus(check: PanvkReleases.Check?): String = when (check) {
         null -> activity.getString(R.string.drivers_not_checked)
-        else -> activity.getString(
-            R.string.drivers_release_status,
-            check.assets.map { it.tag }.distinct().joinToString(" · "), ago(check.checkedAt),
-        )
+        else -> {
+            // Both published builds are runtime (glibc) halves; say so, or the display tab's
+            // empty list reads as "found drivers, offering none". The display half stays on the
+            // bundled build until a bionic PanVK is published.
+            val linux = check.assets.filter { it.linux }.map { it.tag }.distinct()
+            val android = check.assets.filter { !it.linux }.map { it.tag }.distinct()
+            val found = listOfNotNull(
+                activity.getString(R.string.drivers_release_runtime, linux.joinToString(" · "))
+                    .takeIf { linux.isNotEmpty() },
+                activity.getString(R.string.drivers_release_display, android.joinToString(" · "))
+                    .takeIf { android.isNotEmpty() },
+            ).joinToString("; ").ifEmpty { activity.getString(R.string.drivers_release_none) }
+            activity.getString(R.string.drivers_release_status, found, ago(check.checkedAt))
+        }
     }
 
     /** The pairs the last check found, with what is installed and in use; this GPU's first. */
@@ -255,12 +281,20 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
      * [force]d (refresh), or when the last check is a day old - Banners-Turnip rebuilds hourly, and
      * a new pair a day is plenty - otherwise works from the last check. Once per app start on its
      * own; the pair it replaces is removed, anything the user imported or picked is left alone.
+     *
+     * On Mali there are no pairs, only the two Advanced lists, so Auto has nothing to install: it
+     * checks this fork's PanVK releases (the downloads the two lists offer) and says what the two
+     * lists hold, instead of the Adreno "no drivers" line.
      */
     fun ensureAuto(force: Boolean) {
         mode = SessionPrefs.gpuDriverMode(activity)
         if (mode != SessionPrefs.GPU_DRIVERS_AUTO || pairBusy != null || releaseChecking) return
         if (!force && autoCheckedThisProcess) return
         autoCheckedThisProcess = true
+        if (mali) {
+            ensureMaliAuto(force)
+            return
+        }
         if (DriverPairs.recommendedKey(gpu, emptyList()) == null) {
             autoStatus = activity.getString(R.string.drivers_none_to_set, gpu.supportText(activity).lowercase())
             return
@@ -289,6 +323,37 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
                 }
             }
         }, "gpu-driver-auto").start()
+    }
+
+    /** Auto on Mali: refresh this fork's PanVK releases and say what the two Advanced lists hold. */
+    private fun ensureMaliAuto(force: Boolean) {
+        releaseChecking = true
+        autoStatus = activity.getString(R.string.drivers_checking_panvk)
+        Thread({
+            val cached = PanvkReleases.cached(activity)
+            val stale = cached == null || System.currentTimeMillis() - cached.checkedAt > 24 * 3_600_000L
+            val problem = if (force || stale) runCatching { PanvkReleases.refresh(activity) }.exceptionOrNull()?.message else null
+            ui.post {
+                releaseChecking = false
+                refreshReleaseRows()
+                autoStatus = problem?.let { activity.getString(R.string.upd_couldnt_check, it) }
+                    ?: maliAutoStatus()
+            }
+        }, "gpu-driver-auto-panvk").start()
+    }
+
+    /** What Auto reports on Mali: the runtime and display drivers the device picked, by generation. */
+    private fun maliAutoStatus(): String {
+        val linuxId = SessionPrefs.linuxDriver(activity)
+        val linuxName = if (linuxId.isEmpty()) activity.getString(R.string.gpu_runtime_default)
+        else LinuxPanvkDriverManager(activity).getDriverName(linuxId)
+        val pd = PanvkDriver(activity)
+        val androidId = pd.autoId()
+        val androidName = if (androidId == "system") activity.getString(R.string.drivers_system_vulkan)
+        else activity.getString(R.string.drivers_bundled, pd.displayName(androidId))
+        val backend = PanvkReleases.backendOf(gpu.arch).takeIf { it.isNotEmpty() }
+            ?.let { activity.getString(R.string.drivers_uses_backend, it) + " · " }.orEmpty()
+        return activity.getString(R.string.drivers_mali_auto, backend, linuxName, androidName)
     }
 
     /** Manual: install (if need be) and set both halves of a pair. */

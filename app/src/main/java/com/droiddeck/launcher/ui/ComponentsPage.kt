@@ -128,7 +128,8 @@ fun ComponentsPage(
             DriverPage(
                 title = stringResource(R.string.comp_runtime_driver), hint = stringResource(R.string.comp_runtime_driver_hint),
                 rows = gpu.linuxRows, selected = gpu.linuxSelected, downloads = gpu.linuxDownloads,
-                status = gpu.releaseStatus, checking = gpu.checking, importLabel = stringResource(R.string.comp_import_turnip), canRestore = false,
+                status = gpu.releaseStatus, checking = gpu.checking,
+                importLabel = stringResource(if (gpu.mali) R.string.comp_import_panvk_linux else R.string.comp_import_turnip), canRestore = false,
                 onSelect = gpuActions.onSelectLinux, onDelete = gpuActions.onRemoveLinux, onRefresh = gpuActions.onRefresh,
                 onDownload = gpuActions.onDownloadDriver, onImport = gpuActions.onImportLinux, onRestore = {}, onBack = { driverPage = null },
             )
@@ -138,7 +139,8 @@ fun ComponentsPage(
             DriverPage(
                 title = stringResource(R.string.comp_display_driver), hint = stringResource(R.string.comp_display_driver_hint),
                 rows = gpu.androidRows, selected = gpu.androidSelected, downloads = gpu.androidDownloads,
-                status = gpu.releaseStatus, checking = gpu.checking, importLabel = stringResource(R.string.comp_import_adrenotools),
+                status = gpu.releaseStatus, checking = gpu.checking,
+                importLabel = stringResource(if (gpu.mali) R.string.comp_import_panvk_android else R.string.comp_import_adrenotools),
                 canRestore = gpu.canRestoreBundled,
                 onSelect = gpuActions.onSelectAndroid, onDelete = gpuActions.onRemoveAndroid, onRefresh = gpuActions.onRefresh,
                 onDownload = gpuActions.onDownloadDriver, onImport = gpuActions.onImportAndroid, onRestore = gpuActions.onRestoreBundled,

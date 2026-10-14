@@ -140,8 +140,17 @@ object DeviceReport {
             val lm = LinuxPanvkDriverManager(context)
             run {
                 val id = SessionPrefs.linuxDriver(context)
-                val label = if (id.isEmpty()) "runtime default (the PanVK built into the runtime)"
-                else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
+                val label = if (id.isEmpty()) {
+                    val builtinName = lm.getBuiltinName()
+                    val builtinVer = lm.getBuiltinVersion()
+                    if (builtinName.isNotEmpty() && builtinVer.isNotEmpty()) {
+                        "runtime default ($builtinName $builtinVer)"
+                    } else if (builtinName.isNotEmpty()) {
+                        "runtime default ($builtinName)"
+                    } else {
+                        "runtime default (the PanVK built into the runtime)"
+                    }
+                } else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
                     lm.getMinGlibc(id).let { if (it.isEmpty()) "" else " (glibc $it+)" } +
                     if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
                 k("Linux driver (PanVK)", label)

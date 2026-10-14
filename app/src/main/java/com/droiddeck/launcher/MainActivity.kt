@@ -117,6 +117,8 @@ class MainActivity : ComponentActivity() {
     private var lossless by mutableStateOf(Lossless.State.NONE)
     private var showRemove by mutableStateOf(false)
     private var showNonAdreno by mutableStateOf<LinuxRuntimeInstaller.Release?>(null)
+    /** A Mali whose runtime driver cannot drive it: a session would show nothing, so it is said first. */
+    private var showMaliNoDriver by mutableStateOf(false)
     private var glThread by mutableStateOf(true)
     private var noGlError by mutableStateOf(true)
     private var steamDeckMode by mutableStateOf(false)
@@ -849,6 +851,19 @@ class MainActivity : ComponentActivity() {
                         onDismiss = { showNonAdreno = null },
                     )
                 }
+                if (showMaliNoDriver) ConfirmDialog(
+                    title = androidx.compose.ui.res.stringResource(R.string.main_mali_no_driver_title),
+                    text = androidx.compose.ui.res.stringResource(
+                        R.string.main_mali_no_driver_text,
+                        com.droiddeck.launcher.gpu.GpuInfo.detect().name,
+                    ),
+                    confirm = androidx.compose.ui.res.stringResource(R.string.main_mali_no_driver_open),
+                    onConfirm = {
+                        showMaliNoDriver = false
+                        openComponents(focusContent = true, tab = com.droiddeck.launcher.ui.GPU_TAB)
+                    },
+                    onDismiss = { showMaliNoDriver = false },
+                )
                 if (showRemove) ConfirmDialog(
                     title = androidx.compose.ui.res.stringResource(R.string.main_remove_runtime_title),
                     text = androidx.compose.ui.res.stringResource(R.string.main_remove_runtime_text),
@@ -1628,6 +1643,19 @@ class MainActivity : ComponentActivity() {
         }
         val warn = installed == null && !com.droiddeck.launcher.core.DeviceSupport.supportedGpu()
         if (warn && available != null) { showNonAdreno = available; return false }
+        // A Mali whose runtime driver cannot drive it starts a session that shows nothing: stop
+        // here, where the fix (another build under GPU drivers) is one tap away. The runtime's
+        // own driver is not refused - it is the PanVK the runtime shipped with.
+        if (com.droiddeck.launcher.core.DeviceSupport.mali()) {
+            val gpu = com.droiddeck.launcher.gpu.GpuInfo.detect()
+            val linuxId = com.droiddeck.launcher.session.SessionPrefs.linuxDriver(this)
+            if (linuxId.isNotEmpty() &&
+                !com.droiddeck.launcher.gpu.LinuxPanvkDriverManager(this).canDrive(linuxId, gpu.arch)
+            ) {
+                showMaliNoDriver = true
+                return false
+            }
+        }
         startActivity(intent)
         return true
     }

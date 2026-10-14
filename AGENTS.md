@@ -72,6 +72,11 @@ tools/droiddeckctl <state|start|stop|launch|input|ui|logs|screenshot|...>
 tools/droiddeck-scenario tools/scenarios/steam-game-focus.json --var appId=489830 --repeat 10
 ```
 
+**Never pass `--offline` to Gradle.** It reads only the local cache, so a newly added or bumped
+dependency silently resolves to whatever was cached (or fails with a confusing resolution error)
+instead of being fetched. The seconds saved do not come close to the cost of debugging a build that
+used the wrong artifact. Always run Gradle online.
+
 ### Environment variables worth knowing
 
 | Variable | Effect |
@@ -200,6 +205,7 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 - **The APK is signed with the public AOSP testkey** (`keystore/testkey.p12`, password `android`) so every build installs over the previous one. Release builds are re-signed with DroidDeck's own key (`tools/release/sign-apk.sh`) with a signed lineage from the testkey.
 - **`app/build.gradle` generates `BuildConfig` fields** (build label, source commit, PR number, CI flag, release signer, commit time, variant suffixes, SteamGridDB key, desktop-KDE pin) from git and CI env. The desktop-KDE pin is read from `tools/desktop-kde/release.env`; variants from `tools/release/variants.txt` (same APK, different package name — `standard`/`pubg`/`antutu`/`ludashi`).
 - **Gradle has `org.gradle.configuration-cache=true`.** Tasks that shell out (e.g. `buildRustStores`) must resolve everything eagerly at configuration time, not in `doFirst`.
+- **Never run Gradle with `--offline`.** It uses only the local cache, so a new or bumped dependency silently resolves to a stale artifact instead of being fetched. Always run it online; the time saved is never worth debugging a build that used the wrong library.
 - **Localization:** user-facing strings live in `app/src/main/res/values/strings.xml` and are translated in `values-{zh-rCN,zh-rTW,zh-rHK,ru,ko,ja,fr,es}`. Add new strings to `values/` at minimum.
 - **Comments explain *why*, one short line, and are omitted when the code is self-evident.** Do not narrate the code or talk to the reader through comments.
 - **Commits:** conventional-ish prefixes (`feat:`, `fix:`, `perf:`, or a plain capitalized summary), often with the PR number (`(#NNN)`). No `Co-Authored-By` / agent attribution lines, ever.
