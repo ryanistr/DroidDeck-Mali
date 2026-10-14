@@ -1361,3 +1361,44 @@ was. The name has to carry the patch, not just the tag.
 The app's update check has not been run against the retagged releases on device; what is verified is
 the parse (`PanvkReleasesTest`) and the release page itself.
 
+
+
+## 24. Which driver the device actually ran, verified rather than assumed (2026-10-14)
+
+Sessions 34-39 ran a mix of drivers and knobs, so "the p6 finding" is only worth anything if the
+device can be shown to have run the published p6 bytes. It can:
+
+- The runtime half is named by the session itself:
+  `== vulkan driver: imported …/files/linux_panvk_drivers/PanVK-rynx-1.2.0-p6/libvulkan_panvk.so
+  (via …/PanVK-rynx-1.2.0-p6/icd.json)`. The imported `libvulkan_panvk.so` and the staged
+  `files/linuxfs/usr/lib/libvulkan_panvk.so` both hash
+  `2aa4f1749ef98ebf542ee46c727d7b305113d4d05bd8340ca631106c7071df7c`, which is
+  `usr/lib/libvulkan_panvk.so` inside the release asset, and that asset hashes
+  `bafaaa402ce669a9a1fb3ca364b4dee3abab86803a55396c176541d6c92b1e5f` = the `PANVK_SHA256` in
+  `release.env`. The device ran the published bytes. [E]
+- **This fork's driver is self-contained**, which matters because the repo's own prose says the Mesa
+  patch makes `libvulkan_panvk.so` `dlopen("libpanvk_kbase_jm.so")` - true of the *other* Mesa line,
+  not this one. `readelf -dW` on the extracted p6 library shows 21 `NEEDED` entries (libdrm, the
+  libxcb family, expat, stdc++, libc, the loader), **no `RPATH`/`RUNPATH`**, and
+  `strings -a | grep -c libpanvk_kbase_jm` = **0**, while `strings -a | grep -c kbase` = **132**.
+  The kbase backend is compiled in and nothing is dlopened. The stale
+  `files/linuxfs/usr/lib/libpanvk_kbase_jm.so` (`291f9874…`, dated 2026-10-11) and the bionic
+  `lib/arm64/libpanvk_kbase_jm.so` in the APK are therefore irrelevant to this driver - do not blame
+  them, and do not "fix" their absence. `build-panvk-g57.sh:9` already said this; it is now
+  verified. [E]
+- **The knob does not persist.** `droiddeckctl env set PANVK_KBASE_DRI3=1` binds one session.
+  Session `-36-steam` read `kbase_dmabuf=1 sw_device=0`; `-37-steam` and `-39-steam`, same imported
+  p6 driver, read `kbase_dmabuf=0 sw_device=1` again. That is why the fix belongs in
+  `droiddeck-session` (`PANVK_KBASE_DRI3=${PANVK_KBASE_DRI3:-1}`), not in a per-session override. [E]
+- **The compositor half is not a PanVK at all right now.** `files/graphics_driver_panvk/` is empty,
+  `shared_prefs/graphics_driver_panvk.xml` holds `hiddenBundled = panvk-android-24.3.0`, no
+  `Download/droiddeck-panvk-driver` override exists, and the app's native lib dir has no
+  `libvulkan*.so`. So the Android side loads the system ICD - on this device
+  `/vendor/lib64/hw/vulkan.mali.so -> mt6893/vulkan.mali.so`, the vendor blob. The screen renders
+  (session `-36` capture `mean 71 std 34`), so that path works; just do not describe a compositor
+  PanVK driver as in use when reporting a measurement. [E]
+- Session `-38-steam` proves the app can be pointed somewhere else between runs: it imported
+  `Mesa_PanVK_1.2.0_Mali-G57_fork_v9_JM_kbase_` (the pre-§20.4 name), and read
+  `kbase_dmabuf=0 sw_device=1`. Read the session's own `== vulkan driver:` line before comparing
+  any two sessions. [E]
+

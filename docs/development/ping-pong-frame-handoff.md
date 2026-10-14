@@ -1,6 +1,6 @@
 # Handoff: Steam Big Picture on DroidDeck (Mali G77 / X6739) — boot stall + frame ping-pong
 
-**Updated:** 2026-10-14 (§7.2a, from the outside trees in bringup §19)
+**Updated:** 2026-10-14 (§7.2c: the p6 driver + `PANVK_KBASE_DRI3=1` leaves the SHM path)
 **Device:** Infinix GT 10 Pro `102562537K104189` — MT6893, Mali-G77 MC9, Android 16
 **Tool:** `python3 tools/droiddeckctl …` (run from `/mnt/project/DroidDeck`)
 **Report:** `docs/development/panvk-mali-g77-bringup.md` (driver bring-up). This file is the
@@ -22,6 +22,7 @@ Evidence tags used throughout: **[E]** = observed (command output, file:line, me
 | Ping-pong reproduced? | **Yes** — whole-screen cycling measured live in three separate content regimes (§3.8a). Cleanest evidence: session `2026-10-14-04-steam`, where the guest presented a frozen ring (`mean=85/67/67`) for **292 s / 1,046 commits** with nothing rendering [E] |
 | Root cause pinned to a layer? | **Yes: the guest.** All three gamescope output images are CPU-readable and were sampled directly; the compositor's output tracks its input. The compositor only draws what the guest hands it [E] |
 | Any verified fix? | **Partly — a mitigation, measured, with a measured hole.** The compositor content gate (§7.5) holds blank commits while a content frame is recent: gate on ⇒ spread **0.00**, gate off ⇒ **68.59** — but only while the stale frames are *dark*. When every ring image is `>= BLANK_MEAN` (the `85/67/67` regime) the gate is inert and the flicker survives (§7.5a) [E] |
+| Guest on the GPU present path? | **Yes, since p6 + `PANVK_KBASE_DRI3=1`** (`kbase_dmabuf=1 sw_device=0`, §7.2c): the WSI left MIT-SHM and the compositor draws ~57 frames/10 s where p5 drew 0. The ping-pong is unchanged by it, and Defect A still stalls until the §7.3 nudge [E] |
 | Guest-side root cause | **Narrowed (§9.1a)**: *not* "one image never updates" — all three do. The guest presents its 3-image ring **continuously** while the images hold content from different moments, and it updates them only in **bursts of 1-2**, so the ring rarely converges [E] |
 | Current session | `2026-10-14-04-steam` on the released test build `test-0.3.3-mali-frame-gate-20261014` (installed `base.apk` sha256 `10f842416f842acdba9069dbfcee893dd063f347a26dcea5c85bc5c6171f0702`); gate left at its shipped default (on), `frame-probe` marker still in place [E] |
 | Device claim | `/mnt/project/X6739/Status.md` — claimed by Antigravity; handoff details recorded below. |
@@ -537,6 +538,48 @@ build carrying 0005):
 
 The 7.2a prediction should be read as two predictions, not one: the DRM device numbers need 0005 +
 0008; leaving the SHM ring needs `PANVK_KBASE_DRI3` as well.
+
+### 7.2c Measured: the p6 driver + `PANVK_KBASE_DRI3=1` does leave the SHM path
+
+Both halves of the §7.2b reading were closed on a driver carrying 0005 **and** 0008 (the p6 build:
+`release.env` `PANVK-rynx-1.2.0-p6`, staged `assets/linuxfs/usr/lib/libvulkan_panvk.so` sha256
+`2aa4f1749ef98ebf542ee46c727d7b305113d4d05bd8340ca631106c7071df7c`), with the third gate set for one
+session by `droiddeckctl env set PANVK_KBASE_DRI3=1`. Session `2026-10-14-35-steam`:
+
+```
+PANVKDBG WSI: uses_kbase=1 termux_raw=0 raw_dri3=0 kbase_dmabuf=1 sw_device=0 raw_fd_modifier=0
+[gamescope] [Info] vulkan: physical device supports DRM format modifiers
+[gamescope] [Info] vulkan: selecting physical device 'Mali unknown 0x90800011 MC9': queue family 0
+[Gamescope WSI] Created swapchain for xid: 0xc00002 swapchain: 0x3000f573e0 - imageCount: 3
+PANVKDBG CREATE_DEVICE AFTER_INIT result=0 KHR_swapchain=1
+```
+
+- `kbase_dmabuf=1 sw_device=0` — the WSI left the MIT-SHM blit path. `WSI_BLIT_SHM`, `XSHM_GATE`
+  and `WSI_CPU_CONFIG` are each at **count 0** in the entire log, where p5 logged them per frame. [E]
+- The compositor's perf line moved from `0 ticks, 71 scenes, 0 on screen … sw` (p5, session -34) to
+  `1201 ticks, 57 scenes, 57 on screen (copy 57, zero-copy 0, layer copy 0)` at ~5.5 fps,
+  sustained. [E]
+- The screen left black (session -34 `std=0`): a capture of session `-35` read
+  `2400x1080 mean 71 std 32 colors 4354`. [E]
+
+So §7.2b's prediction is answered: the DRM extension needs 0005 + 0008, and leaving SHM needs
+`PANVK_KBASE_DRI3` as well. `tools/linuxfs/overlay/usr/local/bin/droiddeck-session` now exports
+`PANVK_KBASE_DRI3=${PANVK_KBASE_DRI3:-1}` next to `PANVK_FD_INTEROP`/`PANVK_KBASE_DMA_HEAP`, so a
+caller-set value still wins for an A/B against `0`.
+
+**This is not a ping-pong fix and it does not fix Defect A.** In the same session, 20 screencaps
+(raw pixels, 2400x600 crop starting at y=240) taken while the Steam UI was still on the startup
+movie's last frame returned **1 distinct state** — frozen, the §1 step-2 stall. The session then
+ended (`session stopped at 16:50:12`) with CDP still showing `SharedJSContext` on
+`https://steamloopback.host/routes/login` and the BPM page on `about:blank?createflags=6292738&…`;
+`~/.local/share/Steam/config/loginusers.vdf` has `RememberPassword 0`, so there is no account for the
+client to load. [E]
+
+The BPM page did leave `about:blank` (for `https://steamloopback.host/index.html?…`) after five
+non-selecting D-pad nudges — the §7.3 nudge — and the same crop then read 11 distinct pixel states
+across 20 captures with `mean` spanning `71…151` (including a `mean=151 std=0 colors=146` frame and a
+`mean=150 std=68 colors=93061` frame). That is the §1 step-5 ping-pong window, now reachable with the
+GPU present path live. [E]
 
 ### 7.3 Defect A: don't rely on the movie being dismissed
 

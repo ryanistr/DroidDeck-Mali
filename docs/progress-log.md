@@ -9,6 +9,42 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-14 - Mali: the kbase WSI leaves the SHM path at last, and the ping-pong is unchanged by it
+
+- **Why:** continue the frame ping-pong on the p6 driver, which carries both halves of the DRM
+  device report (0005 + 0008), and set the third gate the earlier sessions left at its default.
+- **The guest is off the software path.** With `PANVK_KBASE_DRI3=1` the WSI reads
+  `kbase_dmabuf=1 sw_device=0`, `WSI_BLIT_SHM`/`XSHM_GATE`/`WSI_CPU_CONFIG` count **0** for the whole
+  session, gamescope reports `physical device supports DRM format modifiers` and selects
+  `Mali unknown 0x90800011 MC9`, and the compositor moves from `0 ticks, 71 scenes, 0 on screen …
+  sw` to `1201 ticks, 57 scenes, 57 on screen (copy 57)` at ~5.5 fps. The screen leaves black
+  (`mean 71`). Bringup §22.3 predicted exactly this two-gate split, and it holds. (Doc §7.2c.)
+- **It does not fix the ping-pong, and it does not fix the stall.** 20 screencaps (raw pixels) in the
+  same session while Steam was still on its startup movie returned **one** distinct state - the
+  "stuck on the DroidDeck logo" stall, now with the GPU path live. CDP still had
+  `SharedJSContext` on `/routes/login` and the BPM page on `about:blank`; `loginusers.vdf` has
+  `RememberPassword 0`, so there is no account to load. Once the BPM page navigated to
+  `index.html` after five non-selecting D-pad nudges, the same crop read 11 distinct states over 20
+  captures with `mean` spanning 71-151: that is the ping-pong window, reachable and still open.
+- **Shipped:** `droiddeck-session` exports `PANVK_KBASE_DRI3=${PANVK_KBASE_DRI3:-1}` beside
+  `PANVK_FD_INTEROP`/`PANVK_KBASE_DMA_HEAP`, so no user has to know the knob; a caller-set value
+  still wins, which is what an A/B against `0` needs.
+- **Verified, not assumed (bringup §24):** the device ran the published p6 bytes
+  (`libvulkan_panvk.so` sha256 `2aa4f174…` = the asset's `usr/lib` copy, asset sha256 `bafaaa40…` =
+  `release.env`); this fork's driver is self-contained (`readelf -dW`: 21 `NEEDED`, no `RPATH`, zero
+  `libpanvk_kbase_jm` strings, 132 `kbase` strings), so the rootfs's stale `libpanvk_kbase_jm.so` is
+  irrelevant; a `droiddeckctl env set` override lasts **one** session (`-37`/`-39` were back on
+  `sw_device=1`), which is why the fix is in the script; and the compositor half is the vendor
+  `/vendor/lib64/hw/vulkan.mali.so`, not a PanVK, so a measurement must not claim a compositor
+  PanVK.
+- **Lessons.** A per-session environment override is not a fix, and it silently expires - check the
+  session's own `== vulkan driver:` and `PANVKDBG WSI:` lines before comparing two runs.
+- **Still unmeasured:** the ping-pong itself, and §23.4's on-device update check.
+
+---
+
+---
+
 ## 2026-10-14 - Mali: the release name was not the driver's name, and the app couldn't see a new patch
 
 - **Why:** every patch of the G57 line was published as the same asset, `panvk-linux-g57-1.2.0.tzst`,
