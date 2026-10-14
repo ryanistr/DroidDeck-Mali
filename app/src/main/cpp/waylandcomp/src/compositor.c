@@ -253,6 +253,14 @@ struct surface {
     struct wl_resource *last_mmap_res;    /* last dma-buf buffer resource uploaded via mmap fallback (ring reuse) */
     uint32_t last_hash;                   /* FNV of the content current on the layer (same-pixels skip) */
     int64_t content_ns;                   /* when a commit last carried real content (blank-frame hold) */
+    /* The damage the client declared for the commit being processed, and the pending damage of the
+     * commit in progress. Kept because "did this commit re-render anything" is the one question a
+     * re-attached stale swapchain image and a freshly rendered one answer differently, and this
+     * compositor otherwise throws the answer away. */
+    int damage_n;
+    long long damage_area;
+    int pending_damage_n;
+    long long pending_damage_area;
     int opaque[4], pending_opaque[4], pending_opaque_set; /* x, y, w, h; w = 0: none */
     int src_set, dst_set;
     float src[4];
@@ -813,8 +821,10 @@ static int g_dmabuf_import_unsupported = 0;
 /* ---- reading a committed frame on the CPU ----
  * The compositor advertises linear modifiers only, so the client's frames arrive as plain,
  * CPU-readable memory and no GPU readback is needed. out = {mean luma, max, count > 32, samples},
- * sampled on a 64x36 grid. -1 when the buffer cannot be read. */
-static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4]) {
+ * sampled on a 64x36 grid. -1 when the buffer cannot be read. When `fingerprint` is given it
+ * receives an FNV-1a hash of the same grid, which identifies the content well enough to tell the
+ * client's swapchain slots apart but costs nothing next to the mmap itself. */
+static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4], uint32_t *fingerprint) {
     if (b->fd[0] < 0 || b->stride[0] == 0 || b->width <= 0 || b->height <= 0) return -1;
     uint32_t page_mask = (uint32_t)sysconf(_SC_PAGESIZE) - 1;
     uint32_t align_offset = b->offset[0] & ~page_mask;
@@ -825,6 +835,7 @@ static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4]) {
     const uint8_t *base = (const uint8_t *)ptr + off_in_page;
     const int sx = b->width / 64 + 1, sy = b->height / 36 + 1;
     unsigned long sum = 0, hi = 0, max = 0, n = 0;
+    uint32_t fp = 2166136261u;
     for (int y = 0; y < b->height; y += sy) {
         const uint8_t *row = base + (size_t)y * b->stride[0];
         for (int x = 0; x < b->width; x += sx) {
@@ -834,10 +845,12 @@ static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4]) {
             if (l > max) max = l;
             if (l > 32) hi++;
             n++;
+            fp = (fp ^ l) * 16777619u;
         }
     }
     munmap(ptr, map_size);
     out[0] = n ? sum / n : 0; out[1] = max; out[2] = hi; out[3] = n;
+    if (fingerprint) *fingerprint = fp;
     return 0;
 }
 
@@ -856,16 +869,17 @@ static int frame_probe_on(void) {
     return access(marker, F_OK) == 0;
 }
 
-static void frame_probe(const struct dmabuf_buffer *b, struct wl_resource *buffer) {
+static void frame_probe(struct surface *s, const struct dmabuf_buffer *b, struct wl_resource *buffer) {
     static unsigned seq;
     unsigned long v[4];
-    if (dmabuf_sample(b, v) != 0) {
+    uint32_t fp = 0;
+    if (dmabuf_sample(b, v, &fp) != 0) {
         droiddeck_log("probe", "#%u res=%p fd=%d unreadable", ++seq, (void *)buffer, b->fd[0]);
         return;
     }
-    droiddeck_log("probe", "#%u res=%p fd=%d b=%p %dx%d stride=%u mean=%lu max=%lu hi=%lu/%lu",
+    droiddeck_log("probe", "#%u res=%p fd=%d b=%p %dx%d stride=%u mean=%lu max=%lu hi=%lu/%lu fp=%08x dmg=%d/%lld",
                   ++seq, (void *)buffer, b->fd[0], (void *)b, b->width, b->height, b->stride[0],
-                  v[0], v[1], v[2], v[3]);
+                  v[0], v[1], v[2], v[3], (unsigned)fp, s->damage_n, s->damage_area);
 }
 
 /* ---- blank-frame hold ----
@@ -896,7 +910,7 @@ static int blank_hold_off(void) {
 static int blank_frame_hold(struct surface *s, const struct dmabuf_buffer *b, struct wl_resource *buffer) {
     if (blank_hold_off()) return 0;
     unsigned long v[4];
-    if (dmabuf_sample(b, v) != 0) return 0;
+    if (dmabuf_sample(b, v, NULL) != 0) return 0;
     const int64_t now = now_ns();
     if (v[0] >= BLANK_MEAN) { s->content_ns = now; return 0; }
     if (!s->content_ns || now - s->content_ns > BLANK_HOLD_NS) return 0;
@@ -929,7 +943,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                         ++g_dbg_dmabuf, (void *)buffer, (void *)b, (void *)b->img,
                         b->width, b->height, b->format, s->commit_gen);
         }
-        if (frame_probe_on()) frame_probe(b, buffer);
+        if (frame_probe_on()) frame_probe(s, b, buffer);
         const int hold = blank_frame_hold(s, b, buffer);
         if (!hold && (s->dmabuf != buffer || s->dmabuf_buf != b)) {
             drop_dmabuf(s, 1);
@@ -1112,7 +1126,12 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
     }
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
-                           int32_t x, int32_t y, int32_t w, int32_t h) {}
+                           int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surface *s = wl_resource_get_user_data(r);
+    if (!s || w <= 0 || h <= 0) return;
+    s->pending_damage_n++;
+    s->pending_damage_area += (long long)w * (long long)h;
+}
 static void frame_callback_destroy(struct wl_resource *r) {
     wl_list_remove(wl_resource_get_link(r));
 }
@@ -1286,6 +1305,14 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         send_toplevel_configure(s);
     }
 
+    /* What the client declared it drew, taken before the attach is processed so the probe can
+     * report it alongside the pixels it read. Zero means the client re-attached a buffer without
+     * claiming any new content, which is what a stale swapchain image looks like from here. */
+    s->damage_n = s->pending_damage_n;
+    s->damage_area = s->pending_damage_area;
+    s->pending_damage_n = 0;
+    s->pending_damage_area = 0;
+
     if (s->pending_src_set) {
         s->src_set = s->pending_src[2] > 0;
         memcpy(s->src, s->pending_src, sizeof(s->src));
@@ -1370,7 +1397,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {}
 static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t s) {}
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
-                                  int32_t x, int32_t y, int32_t w, int32_t h) {}
+                                  int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surface *s = wl_resource_get_user_data(r);
+    if (!s || w <= 0 || h <= 0) return;
+    s->pending_damage_n++;
+    s->pending_damage_area += (long long)w * (long long)h;
+}
 static void surface_offset(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {}
 
 static const struct wl_surface_interface surface_impl = {
