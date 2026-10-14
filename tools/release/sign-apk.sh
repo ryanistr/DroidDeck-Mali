@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # sign-apk.sh <in.apk> <variant> <out.apk>
 #
-# Turns a CI build (signed with the public AOSP testkey) into one package of tools/release/variants.txt
-# signed with DroidDeck's own key, carrying the hand-over from the testkey:
-#   - v1 + v2 are signed by the testkey, v3 by our key, with a signed lineage testkey -> our key;
-#   - an install from before (testkey) updates to it and keeps its data;
-#   - the testkey loses its rollback right, so an apk signed with the testkey alone - which anyone
-#     can make - is refused as an update to it (device-proven on the Pocket FIT, 2026-09-24);
-#   - --rotation-min-sdk-version 28: the lineage applies from Android 9, not only from 13.
+# Turns a CI build (signed with the public AOSP testkey) into one package of tools/release/variants.txt:
+#   - with a release key (RELEASE_KEYSTORE set) it signs with that key, carrying the hand-over from
+#     the testkey:
+#       - v1 + v2 are signed by the testkey, v3 by our key, with a signed lineage testkey -> our key;
+#       - an install from before (testkey) updates to it and keeps its data;
+#       - the testkey loses its rollback right, so an apk signed with the testkey alone - which anyone
+#         can make - is refused as an update to it (device-proven on the Pocket FIT, 2026-09-24);
+#       - --rotation-min-sdk-version 28: the lineage applies from Android 9, not only from 13.
+#   - without one (this fork, which ships no release key) it signs with the debug key alone
+#     (keystore/testkey.p12): the public AOSP testkey signs the release apks, and every build installs
+#     over the last. keystore/release-signer.sha256 still names upstream's key, and the app's update
+#     catalog is upstream's, so that file - and in-app updates - are unaffected by this path.
 #
-# The key comes from the environment and is never written anywhere but the path given:
-#   RELEASE_KEYSTORE        path to the PKCS12 keystore
+# The release key comes from the environment and is never written anywhere but the path given:
+#   RELEASE_KEYSTORE        path to the PKCS12 keystore (unset or empty => sign with the debug key)
 #   RELEASE_STORE_PASSWORD  its password (the key has the same one: PKCS12)
 #   RELEASE_KEY_ALIAS       the key's alias
 #   BUILD_TOOLS             Android build-tools dir (zipalign, apksigner, aapt)
@@ -25,15 +30,29 @@ repo=$(cd "$here/../.." && pwd)
 
 pkg=$(awk -v v="$variant" '!/^#/ && $1 == v { print $2 }' "$here/variants.txt")
 [ -n "$pkg" ] || die "no variant '$variant' in tools/release/variants.txt"
-expected=${RELEASE_SIGNER_SHA256:-$(tr -d ' \n' < "$repo/keystore/release-signer.sha256" 2>/dev/null || true)}
-[[ $expected =~ ^[0-9a-f]{64}$ ]] \
-  || die "keystore/release-signer.sha256 is missing: make the key first (tools/release/make-release-key.sh)"
-: "${RELEASE_KEYSTORE:?}" "${RELEASE_STORE_PASSWORD:?}" "${RELEASE_KEY_ALIAS:?}" "${BUILD_TOOLS:?}"
-[ -s "$RELEASE_KEYSTORE" ] || die "the release keystore is empty - is the secret set for this environment?"
 
 TESTKEY="$repo/keystore/testkey.p12"
 TESTKEY_SHA256=a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc
 export TESTKEY_PASSWORD=android
+
+# Which key signs. A release key when one is configured (handed over from the testkey by a lineage),
+# else the debug key alone, so the pipeline is not blocked on a key this fork does not have.
+if [ -n "${RELEASE_KEYSTORE:-}" ]; then
+  mode=release
+  expected=${RELEASE_SIGNER_SHA256:-$(tr -d ' \n' < "$repo/keystore/release-signer.sha256" 2>/dev/null || true)}
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] \
+    || die "keystore/release-signer.sha256 is missing: make the key first (tools/release/make-release-key.sh)"
+  : "${RELEASE_STORE_PASSWORD:?}" "${RELEASE_KEY_ALIAS:?}"
+  [ -s "$RELEASE_KEYSTORE" ] || die "the release keystore is empty - is the secret set for this environment?"
+else
+  mode=debug
+  RELEASE_KEYSTORE=$TESTKEY
+  RELEASE_KEY_ALIAS=testkey
+  # Exported: apksigner takes it with `--ks-pass env:`, i.e. out of the environment.
+  export RELEASE_STORE_PASSWORD=$TESTKEY_PASSWORD
+  expected=$TESTKEY_SHA256
+fi
+: "${BUILD_TOOLS:?}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -58,22 +77,31 @@ fi
 
 "$BUILD_TOOLS/zipalign" -p -f 4 "$work/renamed.apk" "$work/aligned.apk"
 
-# The lineage: the testkey vouches for our key. Made fresh each time (it is two certificates and
-# a signature, nothing secret beyond the key that signs it).
-"$BUILD_TOOLS/apksigner" rotate --out "$work/lineage" \
-  --old-signer --ks "$TESTKEY" --ks-type PKCS12 --ks-pass env:TESTKEY_PASSWORD \
-    --ks-key-alias testkey --key-pass env:TESTKEY_PASSWORD --set-rollback false \
-  --new-signer --ks "$RELEASE_KEYSTORE" --ks-type PKCS12 --ks-pass env:RELEASE_STORE_PASSWORD \
-    --ks-key-alias "$RELEASE_KEY_ALIAS" --key-pass env:RELEASE_STORE_PASSWORD
+if [ "$mode" = release ]; then
+  # The lineage: the testkey vouches for our key. Made fresh each time (it is two certificates and
+  # a signature, nothing secret beyond the key that signs it).
+  "$BUILD_TOOLS/apksigner" rotate --out "$work/lineage" \
+    --old-signer --ks "$TESTKEY" --ks-type PKCS12 --ks-pass env:TESTKEY_PASSWORD \
+      --ks-key-alias testkey --key-pass env:TESTKEY_PASSWORD --set-rollback false \
+    --new-signer --ks "$RELEASE_KEYSTORE" --ks-type PKCS12 --ks-pass env:RELEASE_STORE_PASSWORD \
+      --ks-key-alias "$RELEASE_KEY_ALIAS" --key-pass env:RELEASE_STORE_PASSWORD
 
-"$BUILD_TOOLS/apksigner" sign \
-  --ks "$TESTKEY" --ks-type PKCS12 --ks-pass env:TESTKEY_PASSWORD \
-    --ks-key-alias testkey --key-pass env:TESTKEY_PASSWORD \
-  --next-signer --ks "$RELEASE_KEYSTORE" --ks-type PKCS12 --ks-pass env:RELEASE_STORE_PASSWORD \
-    --ks-key-alias "$RELEASE_KEY_ALIAS" --key-pass env:RELEASE_STORE_PASSWORD \
-  --lineage "$work/lineage" --rotation-min-sdk-version 28 \
-  --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false \
-  --out "$out" "$work/aligned.apk"
+  "$BUILD_TOOLS/apksigner" sign \
+    --ks "$TESTKEY" --ks-type PKCS12 --ks-pass env:TESTKEY_PASSWORD \
+      --ks-key-alias testkey --key-pass env:TESTKEY_PASSWORD \
+    --next-signer --ks "$RELEASE_KEYSTORE" --ks-type PKCS12 --ks-pass env:RELEASE_STORE_PASSWORD \
+      --ks-key-alias "$RELEASE_KEY_ALIAS" --key-pass env:RELEASE_STORE_PASSWORD \
+    --lineage "$work/lineage" --rotation-min-sdk-version 28 \
+    --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false \
+    --out "$out" "$work/aligned.apk"
+else
+  # The debug key alone: the build already carries this signer, so every build installs over the last.
+  "$BUILD_TOOLS/apksigner" sign \
+    --ks "$RELEASE_KEYSTORE" --ks-type PKCS12 --ks-pass env:RELEASE_STORE_PASSWORD \
+      --ks-key-alias "$RELEASE_KEY_ALIAS" --key-pass env:RELEASE_STORE_PASSWORD \
+    --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false \
+    --out "$out" "$work/aligned.apk"
+fi
 rm -f "$out.idsig"
 
 # What the apk must carry, checked rather than assumed.
@@ -87,14 +115,18 @@ certs=$("$BUILD_TOOLS/apksigner" verify --min-sdk-version 28 --print-certs "$out
 v3=$(sed -n 's/^.*Signer.* certificate SHA-256 digest: //p' <<<"$certs" | sort -u)
 if [ "$v3" != "$expected" ]; then
   echo "$certs" >&2
-  die "$variant: Android 9+ sees signer(s) [$(tr '\n' ' ' <<<"$v3")], not only DroidDeck's key $expected"
+  die "$variant: Android 9+ sees signer(s) [$(tr '\n' ' ' <<<"$v3")], not only the expected key $expected"
 fi
-lineage=$("$BUILD_TOOLS/apksigner" lineage --in "$out" --print-certs)
-grep -q "Signer #1 in lineage certificate SHA-256 digest: $TESTKEY_SHA256" <<<"$lineage" \
-  || die "$variant: the lineage does not start at the testkey - old installs could not update"
-grep -q "Signer #2 in lineage certificate SHA-256 digest: $expected" <<<"$lineage" \
-  || die "$variant: the lineage does not hand over to DroidDeck's key"
-rollback=$(awk '/Signer #1 in lineage/{s=1} /Signer #2 in lineage/{s=0} s && /rollback capability/' <<<"$lineage")
-grep -q false <<<"$rollback" \
-  || die "$variant: the testkey kept its rollback right - a testkey-signed apk could replace this one"
-echo "$variant ($pkg): signed, hand-over from the testkey, v3 signer $expected"
+if [ "$mode" = release ]; then
+  lineage=$("$BUILD_TOOLS/apksigner" lineage --in "$out" --print-certs)
+  grep -q "Signer #1 in lineage certificate SHA-256 digest: $TESTKEY_SHA256" <<<"$lineage" \
+    || die "$variant: the lineage does not start at the testkey - old installs could not update"
+  grep -q "Signer #2 in lineage certificate SHA-256 digest: $expected" <<<"$lineage" \
+    || die "$variant: the lineage does not hand over to DroidDeck's key"
+  rollback=$(awk '/Signer #1 in lineage/{s=1} /Signer #2 in lineage/{s=0} s && /rollback capability/' <<<"$lineage")
+  grep -q false <<<"$rollback" \
+    || die "$variant: the testkey kept its rollback right - a testkey-signed apk could replace this one"
+  echo "$variant ($pkg): signed, hand-over from the testkey, v3 signer $expected"
+else
+  echo "$variant ($pkg): signed with the debug key, v3 signer $expected"
+fi

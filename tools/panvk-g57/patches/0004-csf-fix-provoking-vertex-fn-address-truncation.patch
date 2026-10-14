@@ -1,0 +1,37 @@
+From: DroidDeck-Mali, after emir34-34/DroidDeck 8f18a5ad
+Date: 2026-10-14
+Subject: CSF: call the provoking-vertex helper with the full 64-bit address
+
+Only the CSF backend has this path, so it is wrong in every arch that submits
+through CSF (this tree: 10, 11, 12, 13, 14 - and 11 is the arch 0003 ports in
+for Mali-G615/G715). On Android's kbase the addresses are SAME_VA and sit above
+4 GB, so `fns_bo->addr.dev` does not fit in the uint32_t that held it: the
+command stream frontend prefetched from the truncated address and every group
+stopped (dmesg `TRANSLATION_FAULT ... source Command Stream Frontend, pref0`,
+client log `CSF group N fatal error ... exception 0xc1`), which shows up as
+queue timeouts, DEVICE LOST and a client whose memory grows without bound.
+
+`get_fb_descs()` only takes this path when a render pass starts before the
+provoking-vertex mode is known. Chromium on Zink does that on every pass and
+vkcube does not, which is why the Steam client (CEF) is what provokes it.
+
+Reported and fixed by emirvapur11 in emir34-34/DroidDeck, commit 8f18a5ad
+("panvk: fix the real cause of Steam's UI freezing on Mali"), patch 0002, with
+the fault and the fix measured on a Mali-G720 (MT6899) over ~5 minutes of Big
+Picture input. Verified here against the fork's own source: the same line is in
+wonderkast02/panvk-g720-kbase-csf g720-development ca16389 (line 2449).
+
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1849,7 +1849,10 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          uint32_t fn_idx = calc_fn_set_fbds_provoking_vertex_idx(cmdbuf);
+          uint32_t fn_stride =
+             dev->draw_ctx->fn_set_fbds_provoking_vertex_stride;
+-         uint32_t fn_addr =
++         /* 64-bit: kbase's SAME_VA addresses sit above 4 GB, so holding this
++          * one in a uint32_t truncated it and the command stream frontend
++          * prefetched from the wrong address. */
++         uint64_t fn_addr =
+             dev->draw_ctx->fns_bo->addr.dev + fn_idx * fn_stride;
+          cs_move64_to(b, addr_reg, fn_addr);
+          cs_move32_to(b, length_reg, fn_stride);

@@ -10,6 +10,7 @@ import com.droiddeck.launcher.core.FileUtils;
 import com.droiddeck.launcher.core.TarZst;
 import com.droiddeck.launcher.session.SessionPrefs;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -41,8 +42,17 @@ public final class PanvkDriver {
     /** Bundled drivers the user deleted: hidden from the list, their unpacked copy removed. */
     private static final String PREFS = "graphics_driver_panvk";
     private static final String KEY_HIDDEN = "hiddenBundled";
+    /** Driver id -> the Mali architectures it was built with, for the drivers that said. */
+    private static final String KEY_ARCHS = "driverArch";
     /** Bundled driver id (unpacked on demand from the matching tzst asset). */
     public static final String BUNDLED_PANVK = "panvk-android-24.3.0";
+    /**
+     * The Mali architectures each bundled build carries, read from the driver's own `panvk_vN_`
+     * symbols (the one bundled build has v9 and no v11 at all). A GPU of a generation a build does
+     * not carry enumerates nothing, so this is what decides whether the compositor has a driver
+     * for this device at all - the vendor blob is what renders when it does not.
+     */
+    private static final int[] BUNDLED_ARCHS = {9};
     /** Version of the bundled asset; bumping it re-unpacks the file over a copy already on the
      * device, which matters because the id is stable across rebuilds. */
     public static final String BUNDLED_VERSION = "1.2.0";
@@ -107,6 +117,48 @@ public final class PanvkDriver {
         return library != null && !library.isEmpty() && new File(new File(contentDir, driverId), library).isFile();
     }
 
+    /**
+     * The Mali architectures this driver was built with, empty when nobody said. A driver that is
+     * quiet is not thereby wrong: only one that names other generations is refused the device.
+     */
+    public int[] gpuArch(String driverId) {
+        if (BUNDLED.contains(driverId)) return BUNDLED_ARCHS;
+        String raw = prefs().getString(KEY_ARCHS, "{}");
+        try {
+            JSONArray archs = new JSONObject(raw).optJSONArray(driverId);
+            if (archs == null) return new int[0];
+            int[] out = new int[archs.length()];
+            for (int i = 0; i < out.length; i++) out[i] = archs.optInt(i);
+            return out;
+        } catch (Exception e) {
+            return new int[0];
+        }
+    }
+
+    /** Remember what an imported driver was built with, so the device picks by it later. */
+    public void setGpuArch(String driverId, int[] archs) {
+        if (driverId == null || archs == null || archs.length == 0) return;
+        try {
+            JSONObject all = new JSONObject(prefs().getString(KEY_ARCHS, "{}"));
+            all.put(driverId, new JSONArray(archs));
+            prefs().edit().putString(KEY_ARCHS, all.toString()).apply();
+        } catch (Exception e) {
+            Log.w(TAG, "could not record the architectures of " + driverId, e);
+        }
+    }
+
+    /** True when this driver can drive a Mali of architecture [arch]; a silent driver never refuses. */
+    public boolean canDrive(String driverId, int arch) {
+        int[] archs = gpuArch(driverId);
+        if (archs.length == 0 || arch == 0) return true;
+        for (int a : archs) if (a == arch) return true;
+        return false;
+    }
+
+    private android.content.SharedPreferences prefs() {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
     /** Imported drivers only - the bundled two are listed by {@link #BUNDLED}. */
     public List<String> enumerateImported() {
         ArrayList<String> ids = new ArrayList<>();
@@ -133,6 +185,20 @@ public final class PanvkDriver {
                 .getStringSet(KEY_HIDDEN, java.util.Collections.<String>emptySet()));
     }
 
+    /** "Delete" for the bundled driver: remove its unpacked copy and hide it from the list. */
+    public void hideBundled(String driverId) {
+        if (!BUNDLED.contains(driverId)) return;
+        FileUtils.delete(new File(contentDir, driverId));
+        java.util.Set<String> hidden = hiddenBundled();
+        hidden.add(driverId);
+        prefs().edit().putStringSet(KEY_HIDDEN, hidden).apply();
+        Log.i(TAG, "bundled driver " + driverId + " hidden by the user");
+    }
+
+    public void restoreBundled() {
+        prefs().edit().remove(KEY_HIDDEN).apply();
+    }
+
     /** The system driver the GPU would pick on its own, for the "Auto" row's label. */
     public String autoId() {
         String id = chooseByDevice();
@@ -143,6 +209,13 @@ public final class PanvkDriver {
         if (driverId == null || driverId.isEmpty() || driverId.contains("/") || driverId.contains("..")) return;
         Log.d(TAG, "removing imported PanVK driver " + driverId);
         FileUtils.delete(new File(contentDir, driverId));
+        try {
+            JSONObject all = new JSONObject(prefs().getString(KEY_ARCHS, "{}"));
+            all.remove(driverId);
+            prefs().edit().putString(KEY_ARCHS, all.toString()).apply();
+        } catch (Exception e) {
+            Log.w(TAG, "architectures of " + driverId + " left behind", e);
+        }
         if (driverId.equals(SessionPrefs.androidDriver(context))) SessionPrefs.setAndroidDriver(context, AUTO);
     }
 
@@ -173,6 +246,54 @@ public final class PanvkDriver {
         } finally {
             if (!keep) FileUtils.delete(tmpDir);
         }
+    }
+
+    /**
+     * Install a published bionic build straight from its release {@code .tzst}: the same archive
+     * shape as the runtime's half ({@code tools/panvk/build-panvk-android.sh} writes
+     * {@code usr/lib/libvulkan_panvk.so} beside a {@code meta.json}). The files are flattened and
+     * then go through {@link #adopt} like a picked zip, so a downloaded build lands as an ordinary
+     * imported driver. [gpuArch] are the Mali architectures it was built with, when the caller knows.
+     */
+    public String installFromTzst(Uri tzst, String displayName, int[] gpuArch) throws IOException {
+        File tree = newStagingDir();
+        File tmpDir = newStagingDir();
+        boolean keep = false;
+        try {
+            try (InputStream in = context.getContentResolver().openInputStream(tzst)) {
+                if (in == null) throw new IOException("cannot open " + tzst);
+                if (!TarZst.extract(in, tree)) throw new IOException("cannot unpack the driver");
+            }
+            File so = find(tree, "libvulkan_panvk.so");
+            File metaFile = find(tree, "meta.json");
+            if (so == null || metaFile == null) throw new IllegalArgumentException(context.getString(R.string.turnip_reject_no_meta));
+            JSONObject meta = readMetaFile(metaFile);
+            String library = meta != null ? meta.optString("libraryName", "") : "";
+            Files.copy(so.toPath(), new File(tmpDir, library.isEmpty() ? so.getName() : library).toPath(), StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(metaFile.toPath(), new File(tmpDir, "meta.json").toPath(), StandardCopyOption.REPLACE_EXISTING);
+            String id = adopt(tmpDir, displayName);
+            setGpuArch(id, gpuArch);
+            keep = true;
+            return id;
+        } finally {
+            FileUtils.delete(tree);
+            if (!keep) FileUtils.delete(tmpDir);
+        }
+    }
+
+    /** First file named [name] anywhere under [dir], or null: a release build nests it under usr/lib. */
+    private static File find(File dir, String name) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return null;
+        for (File f : entries) {
+            if (f.isDirectory()) {
+                File hit = find(f, name);
+                if (hit != null) return hit;
+            } else if (f.getName().equals(name)) {
+                return f;
+            }
+        }
+        return null;
     }
 
     /** An empty directory beside the installed drivers, for a driver's files before {@link #adopt}. */
@@ -298,17 +419,58 @@ public final class PanvkDriver {
             Log.i(TAG, "driver forced by " + override + ": " + forced);
             if (forced.startsWith("system")) return null;
         }
-        // A Mali device wants the bundled PanVK: the system driver is the vendor blob, which the
-        // compositor process cannot load (it is not an ICD we ship, and on this SoC it is not
-        // reachable), so returning "system-mali" left the compositor with no driver at all.
+        // A Mali device wants PanVK: the system driver is the vendor blob, which the compositor
+        // process cannot load (it is not an ICD we ship, and on this SoC it is not reachable), so
+        // returning null here left the compositor with no driver at all.
         String model = gpuModel();
         Log.i(TAG, "gpu model: " + (model == null ? "unknown" : model));
-        if (model != null && model.toLowerCase().contains("mali")) {
-            Log.i(TAG, "mali device: using bundled " + BUNDLED_PANVK);
-            return BUNDLED_PANVK;
+        if (model == null || !model.toLowerCase().contains("mali")) {
+            // Nothing to go on
+            return null;
         }
-        // Nothing to go on
-        return null;
+        // Which build is not a matter of taste on Mali: a build carries the backend of the
+        // generations it was built with, and a GPU of another generation enumerates nothing through
+        // it. The user's own imports are looked at first, then the bundled build.
+        int arch = GpuInfo.detect().getArch();
+        ArrayList<String> candidates = new ArrayList<>(enumerateImported());
+        candidates.addAll(visibleBundled());
+        String silent = null;
+        for (String id : candidates) {
+            int[] archs = gpuArch(id);
+            if (archs.length == 0) {
+                if (silent == null) silent = id;
+                continue;
+            }
+            if (arch == 0 || canDrive(id, arch)) {
+                Log.i(TAG, "mali v" + arch + ": " + id + " carries v" + join(archs));
+                return id;
+            }
+            Log.i(TAG, "mali v" + arch + ": " + id + " carries v" + join(archs) + " only");
+        }
+        if (silent != null) {
+            Log.i(TAG, "mali v" + arch + ": " + silent + " does not say which generations it carries; using it");
+            return silent;
+        }
+        // Nothing carries this generation - say so rather than let a session render through a
+        // driver that cannot drive the GPU and look like a frame-handoff bug.
+        int[] bundled = gpuArch(BUNDLED_PANVK);
+        if (arch > 0 && !canDrive(BUNDLED_PANVK, arch)) {
+            Log.w(TAG, "no installed PanVK display driver carries a Mali v" + arch + " backend (the bundled "
+                    + BUNDLED_PANVK + " carries v" + join(bundled) + "): the compositor has no driver for this GPU");
+        }
+        // A hidden bundled driver means "system Vulkan" here, as it does on Adreno.
+        if (hiddenBundled().contains(BUNDLED_PANVK)) {
+            Log.i(TAG, "the bundled PanVK driver is hidden: using the system Vulkan driver");
+            return null;
+        }
+        Log.i(TAG, "mali device: using bundled " + BUNDLED_PANVK);
+        return BUNDLED_PANVK;
+    }
+
+    private static String join(int[] archs) {
+        StringBuilder sb = new StringBuilder();
+        for (int a : archs) sb.append(sb.length() == 0 ? "" : ", ").append(a);
+        return sb.toString();
     }
 
     /** Check for Mali Vulkan driver on the system. */

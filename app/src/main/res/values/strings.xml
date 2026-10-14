@@ -1212,6 +1212,17 @@
     <!-- %1$s is the driver's name -->
     <string name="drivers_installed_pick_either">Installed %1$s - pick it in either list to set both drivers</string>
     <string name="drivers_installed_pick">Installed %1$s - pick it in the menu</string>
+    <string name="drivers_checking_panvk">Checking the PanVK builds…</string>
+    <!-- %1$s is one or more Mali architectures with the submission path each runs,
+         e.g. "9 (JM) + 10 (CSF) + 11 (CSF)" -->
+    <string name="drivers_valhall">Valhall %1$s</string>
+    <!-- %1$d is the Mali architecture number this device's GPU needs; %2$s is its submission
+         path (JM or CSF) -->
+    <string name="drivers_other_arch">no Valhall v%1$d backend</string>
+    <string name="drivers_other_arch_backend">no Valhall v%1$d (%2$s) backend</string>
+    <!-- %1$s is the submission path (JM or CSF) this GPU's own drivers run, e.g. "CSF" -->
+    <string name="drivers_uses_backend">uses the %1$s path</string>
+    <string name="drivers_for_this_gpu">for this GPU</string>
 
     <!-- Session (SessionActivity) -->
     <string name="session_wait_removal">Wait for runtime removal to finish</string>

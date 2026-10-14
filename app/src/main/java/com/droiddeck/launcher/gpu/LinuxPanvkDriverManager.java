@@ -6,7 +6,9 @@ import android.util.Log;
 
 import com.droiddeck.launcher.R;
 import com.droiddeck.launcher.core.FileUtils;
+import com.droiddeck.launcher.core.TarZst;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -124,6 +126,14 @@ public class LinuxPanvkDriverManager {
      *         Linux driver; {@link IOException} on read/extract failures.
      */
     public String installDriver(Uri zipUri, String displayName) throws IOException {
+        return installDriver(zipUri, displayName, null);
+    }
+
+    /**
+     * [installDriver] with the Mali architectures the driver was built with, when the caller knows
+     * them (a release build's line does; a zip picked by hand usually does not).
+     */
+    public String installDriver(Uri zipUri, String displayName, int[] gpuArch) throws IOException {
         File tmpDir = newStagingDir();
         boolean keep = false;
         try {
@@ -155,12 +165,79 @@ public class LinuxPanvkDriverManager {
                     // library_path is relative to itself, and adopt() writes an absolute one.
                 }
             }
-            String id = adopt(tmpDir, soName, zipMeta, displayName);
+            String id = adopt(tmpDir, soName, zipMeta, displayName, gpuArch);
             keep = true;
             return id;
         } finally {
             if (!keep) FileUtils.delete(tmpDir);
         }
+    }
+
+    /**
+     * Install a published build straight from its release {@code .tzst} - the shape
+     * {@code tools/panvk/build-panvk*.sh} produce and {@code tools/build_local.sh} unpacks into the
+     * runtime ({@code usr/lib/libvulkan_panvk.so} beside a {@code meta.json} the importer already
+     * writes). Same checks, layout and manifest as {@link #installDriver}, so a build downloaded
+     * from a release - or picked by hand - lands as an ordinary imported driver.
+     */
+    public String installFromTzst(Uri tzst, String displayName) throws IOException {
+        return installFromTzst(tzst, displayName, null);
+    }
+
+    /** [installFromTzst] with the Mali architectures the published build carries. */
+    public String installFromTzst(Uri tzst, String displayName, int[] gpuArch) throws IOException {
+        try (InputStream in = context.getContentResolver().openInputStream(tzst)) {
+            if (in == null) throw new IOException("cannot open " + tzst);
+            return installFromTzst(in, displayName, gpuArch);
+        }
+    }
+
+    /** [installFromTzst] for a driver already unpacking from a stream, such as a release download. */
+    public String installFromTzst(InputStream source, String displayName) throws IOException {
+        return installFromTzst(source, displayName, null);
+    }
+
+    /** [installFromTzst] with the Mali architectures the published build carries. */
+    public String installFromTzst(InputStream source, String displayName, int[] gpuArch) throws IOException {
+        File tree = newStagingDir();
+        File tmpDir = newStagingDir();
+        boolean keep = false;
+        try {
+            if (!TarZst.extract(source, tree)) throw new IOException("cannot unpack the driver");
+            File so = find(tree, LIB_NAME);
+            if (so == null) throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
+            Files.copy(so.toPath(), new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
+            JSONObject meta = null;
+            File metaFile = find(tree, META_NAME);
+            if (metaFile != null) {
+                try {
+                    meta = new JSONObject(FileUtils.readString(metaFile));
+                } catch (Exception e) {
+                    Log.w(TAG, "meta.json in the unpacked driver is unreadable, ignoring: " + e.getMessage());
+                }
+            }
+            String id = adopt(tmpDir, so.getName(), meta, displayName, gpuArch);
+            keep = true;
+            return id;
+        } finally {
+            FileUtils.delete(tree);
+            if (!keep) FileUtils.delete(tmpDir);
+        }
+    }
+
+    /** First file named [name] anywhere under [dir], or null: a release build nests it under usr/lib. */
+    private static File find(File dir, String name) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return null;
+        for (File f : entries) {
+            if (f.isDirectory()) {
+                File hit = find(f, name);
+                if (hit != null) return hit;
+            } else if (f.getName().equals(name)) {
+                return f;
+            }
+        }
+        return null;
     }
 
     /** An empty directory beside the installed drivers, for a driver's files before {@link #adopt}. */
@@ -177,6 +254,11 @@ public class LinuxPanvkDriverManager {
      * deletes {@code tmpDir} when this throws.
      */
     String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName) throws IOException {
+        return adopt(tmpDir, soName, zipMeta, displayName, null);
+    }
+
+    /** [adopt] with the Mali architectures the driver was built with, empty for an unnamed build. */
+    String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName, int[] gpuArch) throws IOException {
         try {
             if (soName == null) {
                 throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
@@ -225,6 +307,8 @@ public class LinuxPanvkDriverManager {
             meta.put("minGlibc", minGlibc);
             meta.put("sourceLibraryName", soName);
             meta.put("importedAt", System.currentTimeMillis());
+            int[] archs = declaredArchs(gpuArch, zipMeta);
+            if (archs.length > 0) meta.put("gpuArch", new org.json.JSONArray(archs));
             if (!FileUtils.writeString(new File(tmpDir, META_NAME), meta.toString(2))) throw new IOException("cannot write meta.json");
 
             if (!tmpDir.renameTo(dir)) throw new IOException("cannot move into " + dir);
@@ -240,6 +324,39 @@ public class LinuxPanvkDriverManager {
         int n = 2;
         while (getDriverDir(id).exists()) id = base + "-" + (n++);
         return id;
+    }
+
+    /**
+     * The Mali architectures an imported driver was built with, which the caller passed or its own
+     * meta.json named. Empty means "not said": the build is offered and picked anyway, because a
+     * driver that is quiet about it is not thereby wrong - only one that names other generations is.
+     */
+    public int[] getGpuArch(String id) {
+        JSONObject m = readMeta(id);
+        if (m == null) return new int[0];
+        JSONArray archs = m.optJSONArray("gpuArch");
+        if (archs == null) return new int[0];
+        int[] out = new int[archs.length()];
+        for (int i = 0; i < out.length; i++) out[i] = archs.optInt(i);
+        return out;
+    }
+
+    /** True when [id] can drive a Mali of architecture [arch]; a silent driver never refuses. */
+    public boolean canDrive(String id, int arch) {
+        int[] archs = getGpuArch(id);
+        if (archs.length == 0 || arch == 0) return true;
+        for (int a : archs) if (a == arch) return true;
+        return false;
+    }
+
+    private static int[] declaredArchs(int[] given, JSONObject zipMeta) {
+        if (given != null && given.length > 0) return given;
+        if (zipMeta == null) return new int[0];
+        JSONArray archs = zipMeta.optJSONArray("gpuArch");
+        if (archs == null || archs.length() == 0) return new int[0];
+        int[] out = new int[archs.length()];
+        for (int i = 0; i < out.length; i++) out[i] = archs.optInt(i);
+        return out;
     }
 
     static String sanitizeId(String name) {

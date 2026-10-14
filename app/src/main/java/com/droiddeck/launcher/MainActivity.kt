@@ -1171,10 +1171,10 @@ class MainActivity : ComponentActivity() {
                 onRemoveLinux = { id -> drivers.deleteDriver(id, linux = true) },
                 onRemoveAndroid = { id -> drivers.deleteDriver(id, linux = false) },
                 onDownloadDriver = { name -> drivers.downloadReleaseDriver(name) },
-                onImportLinux = { pickLinuxDriver.launch(InAppFilePicker.buildIntent(this, ZIP_EXT, getString(R.string.drivers_pick_linux))) },
+                onImportLinux = { pickLinuxDriver.launch(InAppFilePicker.buildIntent(this, DRIVER_EXT, getString(R.string.drivers_pick_linux))) },
                 onImportAndroid = { pickAndroidDriver.launch(InAppFilePicker.buildIntent(this, ZIP_EXT, getString(R.string.drivers_pick_android))) },
-                onImportZip = { pickAnyDriver.launch(InAppFilePicker.buildIntent(this, ZIP_EXT, getString(R.string.drivers_pick_any))) },
-                onRestoreBundled = { TurnipDriver(this).restoreBundled(); drivers.refreshDrivers() },
+                onImportZip = { pickAnyDriver.launch(InAppFilePicker.buildIntent(this, DRIVER_EXT, getString(R.string.drivers_pick_any))) },
+                onRestoreBundled = { drivers.restoreBundled() },
             ),
         )
     }
@@ -1718,6 +1718,8 @@ class MainActivity : ComponentActivity() {
         private const val MEDIA_SETTLE_MS = 1500L
         /** What the picker offers for a driver zip; some file apps label a zip as a plain stream. */
         private val ZIP_EXT = listOf("zip")
+        /** Driver archives: an Android PanVK build is published as a .tzst, not a zip. */
+        private val DRIVER_EXT = listOf("zip", "tzst")
         private val WCP_EXT = listOf("wcp")
     }
 }

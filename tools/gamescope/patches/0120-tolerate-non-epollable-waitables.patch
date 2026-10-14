@@ -1,0 +1,59 @@
+From: Antigravity <antigravity@deepmind.com>
+Subject: [PATCH] steamcompmgr, waitable: tolerate non-epollable DMA-BUFs and waitables
+
+udmabufshim provides memfd-backed DMA-BUFs on kernels lacking CONFIG_UDMABUF.
+Memfds are regular files (S_ISREG) and are rejected by epoll_ctl(EPOLL_CTL_ADD)
+with EPERM. Because these buffers have no asynchronous GPU fence, they are already
+ready. Mark them as bKnownReady so they signal immediately and nudge the compositor.
+Additionally, in CWaiter::AddWaitable, if epoll_ctl fails with EPERM, immediately
+dispatch OnPollIn() so non-epollable waitables do not stall the commit queue.
+---
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -62,6 +62,7 @@
+ #include <sys/time.h>
+ #include <sys/wait.h>
+ #include <sys/types.h>
++#include <sys/stat.h>
+ #if defined(__linux__)
+ #include <sys/prctl.h>
+ #elif defined(__DragonFly__) || defined(__FreeBSD__)
+@@ -8600,6 +8601,11 @@ void update_wayland_res(CommitDoneList_t
+ 		if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
+ 		{
+ 			fence = dup( dmabuf.fd[0] );
++			struct stat st;
++			if ( fence >= 0 && fstat( fence, &st ) == 0 && S_ISREG( st.st_mode ) )
++			{
++				bKnownReady = true;
++			}
+ 		}
+ 		else
+ 		{
+@@ -8611,7 +8617,10 @@ void update_wayland_res(CommitDoneList_t
+ 	{
+ 		newCommit->SetFence( fence, mango_nudge, uMangoMsgType, doneCommits );
+ 		if ( bKnownReady )
++		{
+ 			newCommit->Signal();
++			nudge_steamcompmgr();
++		}
+ 		else
+ 			g_ImageWaiter.AddWaitable( newCommit.get() );
+ 	}
+--- a/src/waitable.h
++++ b/src/waitable.h
+@@ -252,6 +252,12 @@ namespace gamescope
+ 
+             if ( epoll_ctl( m_nEpollFD, EPOLL_CTL_ADD, pWaitable->GetFD(), &event ) != 0 )
+             {
++                if ( errno == EPERM )
++                {
++                    g_WaitableLog.warnf( "Skipping non-epollable waitable fd %d", pWaitable->GetFD() );
++                    pWaitable->OnPollIn();
++                    return true;
++                }
+                 g_WaitableLog.errorf_errno( "Failed to add waitable" );
+                 return false;
+             }

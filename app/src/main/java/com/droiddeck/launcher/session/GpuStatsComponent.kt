@@ -144,7 +144,11 @@ class GpuStatsComponent(val dir: File) : SessionPart() {
             )
             DEVFREQ_NODES.forEach { sources.add("/sys/class/devfreq/$it/cur_freq") }
             File("/sys/class/devfreq").list()?.sorted()?.forEach { node ->
-                if (node.contains("kgsl") || node.contains("gpu")) sources.add("/sys/class/devfreq/$node/cur_freq")
+                // "13000000.mali" on a Mali: the node is named after the GPU's register address, so
+                // the family's name is what it is matched on, as GpuInfo already does.
+                if (node.contains("kgsl") || node.contains("gpu") || node.contains("mali")) {
+                    sources.add("/sys/class/devfreq/$node/cur_freq")
+                }
             }
             return sources.distinct()
         }

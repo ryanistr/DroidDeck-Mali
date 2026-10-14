@@ -34,6 +34,8 @@ public final class LinuxRuntime {
     /** Shortcut extra naming which of the modes above a Linux entry launches. */
     public static final String EXTRA_LINUX_MODE = "linux_mode";
     private static final String KGSL_DEVICE = "/dev/kgsl-3d0";
+    /** The node a Mali's kbase driver registers, where KGSL is absent. */
+    private static final String MALI_DEVICE = "/dev/mali0";
     /**
      * Where the guest sees a command's XDG_RUNTIME_DIR. A Unix socket's path must fit in 108 bytes,
      * and libwayland checks the guest's path before proot ever sees it: with the app on an SD card
@@ -375,17 +377,28 @@ public final class LinuxRuntime {
      * An app process may not open {@code /dev/dri} - the nodes exist but are labelled
      * {@code graphics_device}, which stock policy grants surfaceflinger and not us - yet libdrm and
      * everything built on it identify a GPU by its render node, and gamescope refuses to offer
-     * linux-dmabuf without one. The KGSL device Turnip actually drives ({@code gpu_device}, which we
-     * may open) stands in: it appears as a render node with the sysfs entries libdrm reads, and our
-     * Turnip build reports the same device numbers for it.
+     * linux-dmabuf without one. The GPU node we may open stands in: it appears as a render node with
+     * the sysfs entries libdrm reads, and the driver reports the same device numbers for it.
+     *
+     * <p>That node is KGSL's on an Adreno. On a Mali (MediaTek) it is kbase's {@code /dev/mali0},
+     * which a PanVK built for kbase opens itself - and without it libdrm has no render node at all
+     * here, so every WSI that matches a GPU to one by device number (the guest's X11/DRI3 present
+     * path among them) is refused and falls back to a copying path.
      */
     private static void bindGpuNode(Context context, List<String> cmd) {
+        String gpuDevice = KGSL_DEVICE;
         StructStat st;
         try {
             st = Os.stat(KGSL_DEVICE);
         } catch (ErrnoException e) {
-            return;
+            try {
+                st = Os.stat(MALI_DEVICE);
+                gpuDevice = MALI_DEVICE;
+            } catch (ErrnoException e2) {
+                return;
+            }
         }
+        boolean mali = MALI_DEVICE.equals(gpuDevice);
         long dev = st.st_rdev;
         long major = ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffL);
         long minor = (dev & 0xff) | ((dev >> 12) & ~0xffL);
@@ -402,23 +415,30 @@ public final class LinuxRuntime {
             Files.write(new File(drm, "dev").toPath(),
                     (major + ":" + minor + "\n").getBytes(StandardCharsets.UTF_8));
             Files.write(new File(device, "uevent").toPath(),
-                    "DRIVER=kgsl-3d0\nMODALIAS=platform:kgsl-3d0\n".getBytes(StandardCharsets.UTF_8));
+                    (mali ? "DRIVER=panfrost\nMODALIAS=platform:mali\n" : "DRIVER=kgsl-3d0\nMODALIAS=platform:kgsl-3d0\n")
+                            .getBytes(StandardCharsets.UTF_8));
             File subsystem = new File(device, "subsystem");
             if (!Files.isSymbolicLink(subsystem.toPath())) {
                 Os.symlink("/sys/bus/platform", subsystem.getPath());
             }
-            // What MangoHud names a GPU's driver by; msm_drm is how an Adreno's render node reads
-            // on a mainline kernel, and the driver it reads the load of (bindAdrenoStats).
+            // What MangoHud names a GPU's driver by; msm_drm is how an Adreno's render node reads on
+            // a mainline kernel, panfrost a Mali's. A stale link from another family is replaced: a
+            // symlink is followed, so its target, not its name, is what answers.
             File driver = new File(device, "driver");
+            String driverTarget = "/sys/bus/platform/drivers/" + (mali ? "panfrost" : "msm_drm");
+            if (Files.isSymbolicLink(driver.toPath())
+                    && !driverTarget.equals(Files.readSymbolicLink(driver.toPath()).toString())) {
+                Files.delete(driver.toPath());
+            }
             if (!Files.isSymbolicLink(driver.toPath())) {
-                Os.symlink("/sys/bus/platform/drivers/msm_drm", driver.getPath());
+                Os.symlink(driverTarget, driver.getPath());
             }
         } catch (IOException | ErrnoException e) {
             return;
         }
         bind(cmd, new File(base, "sys").getPath() + ":/sys/dev/char");
         bind(cmd, dri.getPath() + ":/dev/dri");
-        bind(cmd, KGSL_DEVICE + ":/dev/dri/" + node);
+        bind(cmd, gpuDevice + ":/dev/dri/" + node);
         bindDrmClass(base, cmd, node, major + ":" + minor);
     }
 

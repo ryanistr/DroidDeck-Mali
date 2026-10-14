@@ -1,0 +1,52 @@
+From: DroidDeck-Mali, after emir34-34/DroidDeck 8f260546 + 3d6ede4b
+Date: 2026-10-14
+Subject: kbase on glibc: report the node's own device numbers as the DRM render and primary device
+
+kbase exposes no DRM nodes, so the physical device was left with
+drm.render_rdev and drm.primary_rdev at zero and VkPhysicalDeviceDrmPropertiesEXT
+reported no device at all. Everything that matches a Vulkan device to a DRM node
+by device number then simply never matches - gamescope's WSI among them, which is
+what decides whether the session presents zero-copy or falls back to a copy.
+
+In the Linux runtime that number is knowable: proot presents the kbase node itself
+as the session's render node (tools/linuxfs/preload/drm.c picks /dev/mali0 and
+synthesizes a DRM device for it), so this node's st_rdev *is* the render node's. It
+is reported as the primary node too, because gamescope's nested Wayland backend
+refuses a device with no primary node and the runtime has no KMS node to offer in
+its place.
+
+Guarded to non-Android builds: the bionic half puts frames on a real Android
+surface and must keep whatever the platform reports.
+
+Reference: emirvapur11, emir34-34/DroidDeck, commits 8f260546 ("Add experimental
+MediaTek (Arm Mali) GPU support") and 3d6ede4b ("panvk: report the kbase node as
+the DRM primary device too"), where it is patch 0001 of that fork's PanVK build.
+Not upstream in wonderkast02/panvk-g720-kbase-csf g720-development ca16389.
+
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1285,7 +1285,23 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+    }
+ 
+    /* kbase does not expose DRM nodes, so drm.{render,primary}_rdev are left
+-    * zeroed; WSI paths that compare rdev values will simply not match. */
++    * zeroed; WSI paths that compare rdev values will simply not match.
++    *
++    * The glibc build is the exception: the Linux runtime presents the kbase
++    * node itself as the session's DRM render node, so this node's device
++    * number is the render node's, and reporting it is what lets gamescope
++    * match this device to the compositor's main device. It stands for the
++    * primary node too: gamescope's nested backend refuses a device without
++    * one and the runtime has no KMS node to offer in its place. */
++#ifndef __ANDROID__
++   {
++      struct stat st;
++      if (stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
++         device->drm.render_rdev = st.st_rdev;
++         device->drm.primary_rdev = st.st_rdev;
++      }
++   }
++#endif
+ 
+    device->formats.all = pan_format_table(arch);
+    device->formats.blendable = pan_blendable_format_table(arch);

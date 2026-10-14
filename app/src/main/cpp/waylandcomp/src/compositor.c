@@ -66,6 +66,8 @@
 #define SESSION_LOG_DIR "/storage/emulated/0/Download/Wayland-logs"
 
 static FILE *g_log;
+/* Where that file is, so a bring-up probe can put its marker next to it (frame_probe_on). */
+static char g_log_path[256];
 
 /* Lines logged before the session file exists are kept here and written into it, in order, the
  * moment it opens - the compositor runs on its own thread, so anything the app reports as that
@@ -115,6 +117,7 @@ static void open_session_log(void) {
             WLOGE("can't create %s: %s", SESSION_LOG_DIR, strerror(errno));
         snprintf(path, sizeof(path), "%s/wayland-%s.log", SESSION_LOG_DIR, stamp);
     }
+    snprintf(g_log_path, sizeof(g_log_path), "%s", path);
     if (!(f = fopen(path, "w"))) {
         WLOGE("can't open session log %s: %s", path, strerror(errno));
         return;
@@ -249,6 +252,7 @@ struct surface {
     struct wl_resource *last_shm_res;     /* last wl_shm buffer resource uploaded (ring reuse: same res again) */
     struct wl_resource *last_mmap_res;    /* last dma-buf buffer resource uploaded via mmap fallback (ring reuse) */
     uint32_t last_hash;                   /* FNV of the content current on the layer (same-pixels skip) */
+    int64_t content_ns;                   /* when a commit last carried real content (blank-frame hold) */
     int opaque[4], pending_opaque[4], pending_opaque_set; /* x, y, w, h; w = 0: none */
     int src_set, dst_set;
     float src[4];
@@ -806,6 +810,105 @@ extern void droiddeck_on_game_program(int pid, const char *program);
 
 static int g_dmabuf_import_unsupported = 0;
 
+/* ---- reading a committed frame on the CPU ----
+ * The compositor advertises linear modifiers only, so the client's frames arrive as plain,
+ * CPU-readable memory and no GPU readback is needed. out = {mean luma, max, count > 32, samples},
+ * sampled on a 64x36 grid. -1 when the buffer cannot be read. */
+static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4]) {
+    if (b->fd[0] < 0 || b->stride[0] == 0 || b->width <= 0 || b->height <= 0) return -1;
+    uint32_t page_mask = (uint32_t)sysconf(_SC_PAGESIZE) - 1;
+    uint32_t align_offset = b->offset[0] & ~page_mask;
+    uint32_t off_in_page = b->offset[0] & page_mask;
+    size_t map_size = (size_t)b->stride[0] * (size_t)b->height + off_in_page;
+    void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, b->fd[0], (off_t)align_offset);
+    if (ptr == MAP_FAILED) return -1;
+    const uint8_t *base = (const uint8_t *)ptr + off_in_page;
+    const int sx = b->width / 64 + 1, sy = b->height / 36 + 1;
+    unsigned long sum = 0, hi = 0, max = 0, n = 0;
+    for (int y = 0; y < b->height; y += sy) {
+        const uint8_t *row = base + (size_t)y * b->stride[0];
+        for (int x = 0; x < b->width; x += sx) {
+            const uint8_t *px = row + (size_t)x * 4;             /* XR24/AR24: B,G,R,A in memory */
+            unsigned l = (unsigned)(px[2] * 77 + px[1] * 151 + px[0] * 28) >> 8;
+            sum += l;
+            if (l > max) max = l;
+            if (l > 32) hi++;
+            n++;
+        }
+    }
+    munmap(ptr, map_size);
+    out[0] = n ? sum / n : 0; out[1] = max; out[2] = hi; out[3] = n;
+    return 0;
+}
+
+/* ---- idle-alternation bring-up probe (grep the session log for "probe") ----
+ * Says whether the buffer the compositor is about to draw holds content or is empty, which
+ * separates "the client's ring really alternates" from "the client is fine and the compositor
+ * invents the empty frame". Enabled by a marker file next to this session's log,
+ * `<log>.frame-probe`: the app owns that directory, so the marker is creatable while the session
+ * runs and checked on every commit (never cached). */
+static int frame_probe_on(void) {
+    static char marker[sizeof(g_log_path) + 16];
+    if (!marker[0]) {
+        if (!g_log_path[0]) return 0;
+        snprintf(marker, sizeof(marker), "%s.frame-probe", g_log_path);
+    }
+    return access(marker, F_OK) == 0;
+}
+
+static void frame_probe(const struct dmabuf_buffer *b, struct wl_resource *buffer) {
+    static unsigned seq;
+    unsigned long v[4];
+    if (dmabuf_sample(b, v) != 0) {
+        droiddeck_log("probe", "#%u res=%p fd=%d unreadable", ++seq, (void *)buffer, b->fd[0]);
+        return;
+    }
+    droiddeck_log("probe", "#%u res=%p fd=%d b=%p %dx%d stride=%u mean=%lu max=%lu hi=%lu/%lu",
+                  ++seq, (void *)buffer, b->fd[0], (void *)b, b->width, b->height, b->stride[0],
+                  v[0], v[1], v[2], v[3]);
+}
+
+/* ---- blank-frame hold ----
+ * gamescope's three output images do not all receive the composited scene: it hands this compositor
+ * one image with the UI and two that are blank, on a strict period of three, so the screen flickers
+ * at the client's present cadence (measured; see the ping-pong handoff doc). Those frames are the
+ * client's, so the compositor cannot fix them - but it can decline to draw the empty ones and keep
+ * the last frame that had content up instead.
+ *
+ * Bounded by time on purpose: past BLANK_HOLD_NS with no frame carrying content, blank frames are
+ * drawn again, so a scene that really is black (a fade, a loading screen, a dark game) reaches the
+ * screen instead of a stale picture sitting there forever. That bound is the whole safety of this.
+ * Disabled by a `<session log>.no-blank-hold` marker, so the two behaviours can be compared on one
+ * build. */
+#define BLANK_MEAN 40                      /* mean luma below this is an empty frame (10/25 blank, 78 UI measured) */
+#define BLANK_HOLD_NS 1200000000LL         /* how long a real frame keeps blank commits off the screen */
+
+static int blank_hold_off(void) {
+    static char marker[sizeof(g_log_path) + 20];
+    if (!marker[0]) {
+        if (!g_log_path[0]) return 0;
+        snprintf(marker, sizeof(marker), "%s.no-blank-hold", g_log_path);
+    }
+    return access(marker, F_OK) == 0;
+}
+
+/* 1 = keep the frame already on the screen: this commit is blank and a frame with content is recent. */
+static int blank_frame_hold(struct surface *s, const struct dmabuf_buffer *b, struct wl_resource *buffer) {
+    if (blank_hold_off()) return 0;
+    unsigned long v[4];
+    if (dmabuf_sample(b, v) != 0) return 0;
+    const int64_t now = now_ns();
+    if (v[0] >= BLANK_MEAN) { s->content_ns = now; return 0; }
+    if (!s->content_ns || now - s->content_ns > BLANK_HOLD_NS) return 0;
+    /* The client is waiting for this buffer back to reuse it: return it on the limiter's cadence,
+     * exactly as a replaced buffer is returned, and leave the surface showing what it shows. */
+    release_buffer(s, buffer, now);
+    { static unsigned g_dbg_hold;
+      droiddeck_log("framedbg", "#%u HOLD-BLANK res=%p mean=%lu (content %lld ms ago)",
+                    ++g_dbg_hold, (void *)buffer, v[0], (long long)((now - s->content_ns) / 1000000)); }
+    return 1;
+}
+
 static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_resource *buffer) {
     if (!b->img && !b->import_failed && !g_dmabuf_import_unsupported && b->n_planes >= 1) {
         b->img = vkp_image_from_dmabuf(b->fd[0], b->format, b->modifier, b->width, b->height,
@@ -826,7 +929,9 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                         ++g_dbg_dmabuf, (void *)buffer, (void *)b, (void *)b->img,
                         b->width, b->height, b->format, s->commit_gen);
         }
-        if (s->dmabuf != buffer || s->dmabuf_buf != b) {
+        if (frame_probe_on()) frame_probe(b, buffer);
+        const int hold = blank_frame_hold(s, b, buffer);
+        if (!hold && (s->dmabuf != buffer || s->dmabuf_buf != b)) {
             drop_dmabuf(s, 1);
             s->dmabuf = buffer;
             s->dmabuf_buf = b;

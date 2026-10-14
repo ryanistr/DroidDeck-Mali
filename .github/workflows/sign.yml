@@ -65,12 +65,15 @@ jobs:
           LABEL: ${{ inputs.label }}
         run: |
           set -euo pipefail
-          if [ -z "$RELEASE_KEYSTORE_B64" ]; then
-            echo "::error::environment '$ENVIRONMENT' has no signing key: run tools/release/make-release-key.sh once"
-            exit 1
+          if [ -n "$RELEASE_KEYSTORE_B64" ]; then
+            export RELEASE_KEYSTORE="$RUNNER_TEMP/release.p12"
+            ( umask 077; base64 -d <<<"$RELEASE_KEYSTORE_B64" > "$RELEASE_KEYSTORE" )
+          else
+            # No release key for this environment: sign with the debug key the build already carries
+            # (keystore/testkey.p12), so the pipeline is not blocked on a key this fork does not have.
+            # sign-apk.sh falls back on its own when RELEASE_KEYSTORE is unset.
+            echo "::warning::environment '$ENVIRONMENT' has no release key; signing with the debug key (keystore/testkey.p12)"
           fi
-          export RELEASE_KEYSTORE="$RUNNER_TEMP/release.p12"
-          ( umask 077; base64 -d <<<"$RELEASE_KEYSTORE_B64" > "$RELEASE_KEYSTORE" )
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
           export BUILD_TOOLS
           [ -n "$LABEL" ] || LABEL="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"

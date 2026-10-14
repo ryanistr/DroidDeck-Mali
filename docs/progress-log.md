@@ -7,6 +7,102 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-14 - Mali: the CSF fault we ship, and a driver-side render node for the guest
+
+- **Why:** a Mali-G615 (Valhall v11, the GT 30 Pro) submits through kbase's Command Stream Frontend,
+  and a report from another Mali fork showed the Steam client's UI freezing on it for a reason that
+  turned out to be one line of the CSF command stream.
+- **The finding:** `get_fb_descs()` in `csf/panvk_vX_cmd_draw.c` held `fns_bo->addr.dev` - a
+  `uint64_t` (`panvk_priv_bo.h:23`) - in a `uint32_t`. kbase's SAME_VA addresses sit above 4 GB, so
+  the CS frontend prefetched from a truncated address and every group stopped (`CSF group N fatal
+  error ... exception 0xc1`), which surfaces as queue timeouts, `DEVICE LOST` and a client whose
+  memory grows without bound. Only a render pass that starts before the provoking-vertex mode is
+  known takes that path, which Chromium on Zink does on every pass - so the Steam client is what
+  provokes it and `vkcube` never shows it. Reported with the fault and the fix measured on a G720 by
+  `emir34-34/DroidDeck` (`8f18a5ad`), and the same line is still unfixed in
+  `wonderkast02/panvk-g720-kbase-csf` @ `ca16389`.
+- **It is in the source our pinned driver was built from, and on the arch 11 path:** tag `v1.2.0`
+  has `uint32_t fn_addr` at `csf/panvk_vX_cmd_draw.c:1852`, and the fork's `meson.build` maps arch 11
+  to `csf_archs` (`:115`) with `jm_archs` staying `[6, 7, 9]` - so a G615's backend is CSF, not the
+  Job Manager. That corrects the earlier reading that the GT 30 Pro was "given a JM driver".
+- **Also applied:** kbase reported no DRM device to a glibc build at all (`drm.render_rdev` /
+  `drm.primary_rdev` left zeroed), so `VkPhysicalDeviceDrmPropertiesEXT` named no device and
+  gamescope could not match it - the driver side of "give the guest a real render node". The node's
+  own `st_rdev` is reported now that the runtime presents `/dev/mali0` as the render node. Both are
+  new patches in `tools/panvk-g57/patches/` (0004, 0005).
+- **The guest had no render node on a Mali at all** - and this is the device half of the X6739's own
+  ping-pong. `LinuxRuntime.bindGpuNode()` fabricates the guest's `/dev/dri/renderD<minor>` and the
+  sysfs entries libdrm reads, but returned early when `/dev/kgsl-3d0` was absent, which on a Mali it
+  always is. Without a node the guest's `drm.c` preload falls to its synthesized device with
+  `bustype = -1`, and `panvk_can_present_on_device()` only accepts `DRM_BUS_PLATFORM` - so the
+  guest's X11/DRI3 present path is refused and it copies through MIT-SHM, which is the mechanism the
+  ping-pong notes already describe. It now falls back to `/dev/mali0` (uevent `DRIVER=panfrost`, the
+  `driver` link pointed at panfrost, stale links replaced). `GpuStatsComponent.clockSources()` could
+  not see a Mali's devfreq node either (`13000000.mali` matches neither `kgsl` nor `gpu`); it matches
+  `mali` now, as `GpuInfo` already did.
+- **Compositor:** `vk_present.c` enabled five device extensions unconditionally, so a display driver
+  without one failed `vkCreateDevice` and there was no session at all, where leaving it out costs
+  only the zero-copy path. It now enables what the driver advertises and gates its dma-buf modifier
+  and import entry points on that. Turnip is unaffected.
+- **Read and not taken:** BkaNeko's CSF doorbell/timeout fixes (the fork already re-checks
+  `CS_ACTIVE` and kicks, and re-kicks while waiting) and its MTK gralloc/AFBC work (it targets a
+  bionic system Vulkan feeding SurfaceFlinger, not our path).
+- **Verified:** the five patches apply in order against PanVK fork tag `v1.2.0` (`patch -p1`), the
+  compositor file passes `aarch64-linux-android35-clang -fsyntax-only -Wall -Wextra`, and
+  `:app:assembleRelease` and `:app:testDebugUnitTest` are green. **Not verified on a device**, and
+  the driver patches only reach one once the panvk-g57 workflow publishes a new tag -
+  `tools/panvk/release.env` still pins `p4`.
+- Docs: `docs/development/panvk-mali-g77-bringup.md` §19, §17 corrected;
+  `docs/development/ping-pong-frame-handoff.md` §7.2a.
+
+## 2026-10-14 - Mali: driver options say which submission path a build runs
+
+- **Why:** the menus offered every published PanVK build with only its generations named, and the
+  release table claimed the G57 p4+ line carried v9 and v11 - which under-claims it: the fork's
+  `csf_archs` is `[10, 11, 12, 13, 14]` while `jm_archs` stays `[6, 7, 9]`, so arch 11 comes from the
+  CSF backend and arch 10 rides the same one. The GT 20 Pro's G610 is arch 10, meaning it was
+  refused every published line, including the one that drives it.
+- **`archsOf` now says `{9, 10, 11}` for the G57 p4+ line** (p1-p3 stay v9, the 24.3.0 line stays v9,
+  the bionic asset stays v9), so a G610 is offered p4 and refused the lines that have no v10
+  backend, and a G615 keeps the options it had. Nothing is hardcoded to the v9 JM build anywhere -
+  `chooseByDevice()`, `canDrive()` and the release rows all read the same table.
+- **Every row names the submission path:** `PanvkReleases.backendOf()` maps v9 to JM and v10/v11 to
+  CSF, the build list shows "Valhall v9 (JM) + v10 (CSF) + v11 (CSF)", and a row that cannot drive
+  this GPU names the missing one ("no Valhall v10 (CSF) backend"). A row that can drive it says
+  which path this GPU runs ("uses the CSF path"), so a JM fix is not chased for a CSF GPU.
+- Removed the stale comment in `SessionService` that said v10+ had no submission path here.
+- Tests: `PanvkReleasesTest` (G610 refused the v9-only lines and offered p4, `backendOf`).
+- Not verified on a device.
+
+## 2026-10-14 - Mali PanVK: every published build is an option, and the device picks by generation
+
+- **Why:** a Mali GPU can only run a PanVK build that was built with its own generation's backend,
+  and the driver menus offered exactly one build per half plus whatever the user imported by hand.
+  The GT 30 Pro (Mali-G615, Valhall v11) was therefore stuck with `panvk-android-24.3.0` for the
+  display half and the runtime's pinned build for the guest half, with no way to try another.
+- **Measured, not assumed:** the bundled bionic asset carries **no `panvk_v11` symbol at all**
+  (`strings` finds v6/v7/v9/v10/v12/v13/v14; it was committed 2026-10-13 10:17 +0700, before the
+  arch-11 patch landed at 21:06), while the pinned guest build (`panvk-linux-g57-1.2.0-p4`) is the
+  first of its line that carries v11 - its build script fails unless `panvk_v9_` and `panvk_v11_`
+  local symbols are both there. On a G615 that means: the guest half has a v11 backend, the
+  compositor half has none.
+- **`PanvkReleases`** (new): the fork's own releases as a download source for the Mali driver menus -
+  the shape `TurnipReleases` already has for Adreno (GitHub asset digest, sha256 verified after
+  download, cached check, installed through the same importers a picked file uses). `panvk-linux-*`
+  builds go to the runtime list, `panvk-android-*` to the display list, and every row says which
+  Mali generations it carries, with the ones carrying this GPU's marked.
+- **Picked by generation:** `PanvkDriver.chooseByDevice()` now considers `GpuInfo.arch` - an imported
+  build that declares the generation, then a build that stays silent, then the bundled one - and logs
+  when nothing carries it. Both importers record `gpuArch` per imported driver, and `SessionService`
+  logs when the chosen guest driver was built for other generations than the device's.
+- **Fixed on the way:** deleting or restoring a driver on Mali went to the Turnip managers and did
+  nothing; `PanvkDriver` had no `hideBundled`/`restoreBundled`; the Android import picker did not
+  accept a `.tzst`.
+- Docs: `docs/development/panvk-mali-g77-bringup.md` §18, with §17 corrected - `kbase_stub=1` and
+  `sw_device=1` are printed on the X6739's sessions too, so they are not evidence of a stub device.
+- Tests: `PanvkReleasesTest` (the arch table: p4 is the first build with v11, a G615 is refused the
+  earlier lines; a build that names nothing is never refused). Not yet on a device.
+
 ## 2026-10-09 - `feat/games-add-edit`: add games from the Games tab, edit them like Steam's Properties
 
 - **Steam ⚙ settings:** the Games section is gone (it was a feature, not a setting). Games

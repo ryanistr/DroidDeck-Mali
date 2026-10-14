@@ -19,6 +19,7 @@ import com.droiddeck.launcher.gpu.LinuxPanvkDriverManager
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
 import com.droiddeck.launcher.gpu.PanvkDriver
+import com.droiddeck.launcher.gpu.PanvkReleases
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.gpu.TurnipReleases
 import com.droiddeck.launcher.session.SessionService
@@ -60,6 +61,13 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
     var activeBundle by mutableStateOf<String?>(null)
     private var autoCheckedThisProcess = false
 
+    /** True when this device's two driver lists are the PanVK ones (Mali), not the Turnip ones. */
+    private val mali: Boolean
+        get() = gpu.family == GpuInfo.Family.MALI_VALHALL ||
+                gpu.family == GpuInfo.Family.MALI_BIFROST ||
+                gpu.family == GpuInfo.Family.MALI_MIDGARD ||
+                gpu.family == GpuInfo.Family.MALI_UNKNOWN
+
     fun state() = GpuDriversState(
         gpuName = gpu.displayName(activity), gpuFamily = gpu.family.label(activity), soc = gpu.soc, supportText = gpu.supportText(activity),
         supported = gpu.support == GpuInfo.Support.TESTED, unsupported = gpu.support == GpuInfo.Support.UNSUPPORTED,
@@ -91,10 +99,7 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
                     val mgr = LinuxPanvkDriverManager(activity)
                     bundleRow(id, linux = true) ?: DriverRow(
                         id, mgr.getDriverName(id),
-                        listOfNotNull(
-                            mgr.getDriverVersion(id).takeIf { it.isNotEmpty() },
-                            mgr.getMinGlibc(id).takeIf { it.isNotEmpty() }?.let { "glibc $it+" },
-                        ).joinToString(" · "),
+                        driverDetail(mgr.getDriverVersion(id), mgr.getMinGlibc(id), mgr.getGpuArch(id)),
                         true, origin(id),
                     )
                 }
@@ -127,8 +132,8 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
                     if (auto == "system") activity.getString(R.string.drivers_system_vulkan) else activity.getString(R.string.drivers_bundled, pd.displayName(auto)),
                     false,
                 ))
-                for (id in pd.visibleBundled()) add(DriverRow(id, pd.displayName(id), pd.driverVersion(id), true, DriverRow.BUNDLED))
-                for (id in pd.enumerateImported()) add(bundleRow(id, linux = false) ?: DriverRow(id, pd.displayName(id), pd.driverVersion(id), true, origin(id)))
+                for (id in pd.visibleBundled()) add(DriverRow(id, pd.displayName(id), driverDetail(pd.driverVersion(id), archs = pd.gpuArch(id)), true, DriverRow.BUNDLED))
+                for (id in pd.enumerateImported()) add(bundleRow(id, linux = false) ?: DriverRow(id, pd.displayName(id), driverDetail(pd.driverVersion(id), archs = pd.gpuArch(id)), true, origin(id)))
             }
             canRestoreBundled = pd.hiddenBundled().isNotEmpty()
             androidSelected = SessionPrefs.androidDriver(activity)
@@ -152,11 +157,68 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         refreshPairs()
     }
 
-    /** One line for the settings row that opens this: "Auto · WinNative · Balanced". */
-    fun summary(): String {
+    /** Put a bundled driver the user deleted back in the list (the display list's own restore). */
+    fun restoreBundled() {
+        if (mali) PanvkDriver(activity).restoreBundled() else TurnipDriver(activity).restoreBundled()
+        refreshDrivers()
+    }
+
+    /** One line for the settings row that opens this: "Auto · WinNative · Balanced". */    fun summary(): String {
         val active = pairRows.firstOrNull { it.active }?.name ?: activeBundle
         val label = activity.getString(if (mode == SessionPrefs.GPU_DRIVERS_AUTO) R.string.common_auto else R.string.drivers_manual)
         return active?.let { activity.getString(R.string.drivers_summary, label, it) } ?: label
+    }
+
+    /**
+     * A driver's detail line: its version, the glibc it asks for, the Mali generations it was built
+     * with, and - when it names generations other than this GPU's - that it cannot drive this one,
+     * which on Mali is the difference between a driver and a black screen.
+     */
+    private fun driverDetail(version: String, minGlibc: String = "", archs: IntArray = IntArray(0)): String {
+        val refused = archs.isNotEmpty() && gpu.arch > 0 && !archs.contains(gpu.arch)
+        return listOfNotNull(
+            version.takeIf { it.isNotEmpty() },
+            minGlibc.takeIf { it.isNotEmpty() }?.let { "glibc $it+" },
+            PanvkReleases.archLabel(activity, archs).takeIf { it.isNotEmpty() },
+            // Name the submission path the GPU needs to settle on, so a JM fix is not chased for a
+            // CSF GPU or a CSF tag picked for a JM one.
+            PanvkReleases.backendOf(gpu.arch).takeIf { it.isNotEmpty() && archs.isNotEmpty() && !refused }
+                ?.let { activity.getString(R.string.drivers_uses_backend, it) },
+            PanvkReleases.backendOf(gpu.arch)
+                .takeIf { it.isNotEmpty() && refused }
+                ?.let { activity.getString(R.string.drivers_other_arch_backend, gpu.arch, it) },
+        ).joinToString(" · ")
+    }
+
+    /**
+     * On Mali the offered downloads are this fork's own PanVK releases (PanvkReleases): a build
+     * carries the Mali generations it was built with, so every row says which and the ones that
+     * carry this GPU's are marked. The two halves are picked on their own - nothing here is a pair.
+     */
+    private fun panvkRows(check: PanvkReleases.Check?, linux: Boolean): List<com.droiddeck.launcher.ui.DownloadRow> {
+        val mgr = LinuxPanvkDriverManager(activity)
+        val pd = PanvkDriver(activity)
+        fun installed(id: String) = if (linux) mgr.isInstalled(id) else pd.isInstalled(id)
+        return check?.assets.orEmpty()
+            .filter { it.linux == linux }
+            .filter { PanvkReleases.installedId(activity, it) { id -> installed(id) } == null }
+            .map { a ->
+                val mb = activity.getString(R.string.common_size_mb, a.size / 1_048_576.0)
+                val arch = PanvkReleases.archLabel(activity, a.archs)
+                val detail = listOfNotNull(
+                    a.tag, arch.takeIf { it.isNotEmpty() }, mb,
+                    activity.getString(R.string.drivers_for_this_gpu).takeIf { gpu.arch > 0 && a.archs.contains(gpu.arch) },
+                ).joinToString(" · ")
+                com.droiddeck.launcher.ui.DownloadRow(a.name, a.name, detail, releaseProgress[a.name])
+            }
+    }
+
+    private fun panvkStatus(check: PanvkReleases.Check?): String = when (check) {
+        null -> activity.getString(R.string.drivers_not_checked)
+        else -> activity.getString(
+            R.string.drivers_release_status,
+            check.assets.map { it.tag }.distinct().joinToString(" · "), ago(check.checkedAt),
+        )
     }
 
     /** The pairs the last check found, with what is installed and in use; this GPU's first. */
@@ -337,11 +399,37 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
      */
     fun importDriver(uri: Uri, linux: Boolean?) {
         val name = activity.displayNameOf(uri)
+        // A released PanVK build is a .tzst (zstd + tar), not a zip: same import, other unpacker.
+        val tzst = name?.endsWith(".tzst", ignoreCase = true) == true
         Thread({
             var bundle: DriverBundle.Bundle? = null
             val problem = try {
                 when {
                     DriverBundle.isBundle(activity, uri) -> bundle = DriverBundle.install(activity, uri)
+                    mali && tzst && linux == false -> PanvkDriver(activity).installFromTzst(uri, name, null)
+                    mali && tzst && linux == true -> LinuxPanvkDriverManager(activity).installFromTzst(uri, name)
+                    // The tab's own import does not say which half a build is; only the libc check
+                    // tells them apart, so the runtime's half is asked first and the display's next.
+                    mali && tzst -> try {
+                        LinuxPanvkDriverManager(activity).installFromTzst(uri, name)
+                    } catch (runtime: IllegalArgumentException) {
+                        try {
+                            PanvkDriver(activity).installFromTzst(uri, name, null)
+                        } catch (display: IllegalArgumentException) {
+                            throw IllegalArgumentException(activity.getString(R.string.drivers_not_a_driver))
+                        }
+                    }
+                    mali && linux == true -> LinuxPanvkDriverManager(activity).installDriver(uri, name)
+                    mali && linux == false -> PanvkDriver(activity).installFromZip(uri, name)
+                    mali -> try {
+                        PanvkDriver(activity).installFromZip(uri, name)
+                    } catch (display: IllegalArgumentException) {
+                        try {
+                            LinuxPanvkDriverManager(activity).installDriver(uri, name)
+                        } catch (runtime: IllegalArgumentException) {
+                            throw IllegalArgumentException(activity.getString(R.string.drivers_not_a_driver))
+                        }
+                    }
                     linux == true -> LinuxVulkanDriverManager(activity).installDriver(uri, name)
                     linux == false -> TurnipDriver(activity).installFromZip(uri, name)
                     else -> try {
@@ -414,14 +502,21 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
             return
         }
         if (linux) {
-            LinuxVulkanDriverManager(activity).removeDriver(id)
+            if (mali) LinuxPanvkDriverManager(activity).removeDriver(id) else LinuxVulkanDriverManager(activity).removeDriver(id)
             if (SessionPrefs.linuxDriver(activity) == id) SessionPrefs.setLinuxDriver(activity, "")
         } else {
-            val td = TurnipDriver(activity)
-            if (id in TurnipDriver.BUNDLED) td.hideBundled(id) else td.remove(id)
-            if (SessionPrefs.androidDriver(activity) == id) SessionPrefs.setAndroidDriver(activity, TurnipDriver.AUTO)
+            if (mali) {
+                val pd = PanvkDriver(activity)
+                if (id in PanvkDriver.BUNDLED) pd.hideBundled(id) else pd.remove(id)
+                if (SessionPrefs.androidDriver(activity) == id) SessionPrefs.setAndroidDriver(activity, PanvkDriver.AUTO)
+            } else {
+                val td = TurnipDriver(activity)
+                if (id in TurnipDriver.BUNDLED) td.hideBundled(id) else td.remove(id)
+                if (SessionPrefs.androidDriver(activity) == id) SessionPrefs.setAndroidDriver(activity, TurnipDriver.AUTO)
+            }
         }
         TurnipReleases.forget(activity, id)
+        PanvkReleases.forget(activity, id)
         android.widget.Toast.makeText(activity, activity.getString(R.string.drivers_deleted, id), android.widget.Toast.LENGTH_SHORT).show()
         refreshDrivers()
     }
@@ -429,7 +524,8 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
     /** The download entries and the refresh line, from what the last check found. */
     fun refreshReleaseRows() {
         val check = TurnipReleases.cached(activity)
-        fun rows(linux: Boolean) = check?.assets.orEmpty()
+        val panvk = PanvkReleases.cached(activity)
+        fun rows(linux: Boolean) = if (mali) panvkRows(panvk, linux) else check?.assets.orEmpty()
             .filter { it.bundle || it.linux == linux }
             .filter { a -> installedIdOf(a) == null }
             .map { a ->
@@ -438,7 +534,8 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
             }
         linuxDownloads = rows(linux = true)
         androidDownloads = rows(linux = false)
-        if (!releaseChecking) releaseStatus = when (check) {
+        if (releaseChecking) return
+        releaseStatus = if (mali) panvkStatus(panvk) else when (check) {
             null -> activity.getString(R.string.drivers_not_checked)
             else -> {
                 val latest = check.latest.joinToString(" · ") { "${it.first} ${it.second}" }
@@ -462,10 +559,14 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
     fun checkLatestTurnip() {
         if (releaseChecking) return
         releaseChecking = true
-        releaseStatus = activity.getString(R.string.drivers_checking_sources)
+        releaseStatus = activity.getString(if (mali) R.string.drivers_checking_panvk else R.string.drivers_checking_sources)
         Thread({
-            val problem = try { TurnipReleases.refresh(activity); null } catch (e: Exception) {
-                Log.w(TAG, "latest Turnip check", e); e.message ?: activity.getString(R.string.drivers_check_failed)
+            // A Mali device has nothing to gain from the Adreno repos, and vice versa.
+            val problem = try {
+                if (mali) PanvkReleases.refresh(activity) else TurnipReleases.refresh(activity)
+                null
+            } catch (e: Exception) {
+                Log.w(TAG, "latest driver check", e); e.message ?: activity.getString(R.string.drivers_check_failed)
             }
             ui.post {
                 releaseChecking = false
@@ -478,6 +579,10 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
 
     /** Download one release driver and import it through the same importer a picked zip uses. */
     fun downloadReleaseDriver(assetName: String) {
+        if (mali) {
+            downloadPanvkDriver(assetName)
+            return
+        }
         val asset = TurnipReleases.cached(activity)?.assets?.firstOrNull { it.name == assetName } ?: return
         if (releaseProgress.containsKey(assetName)) return
         releaseProgress[assetName] = 0
@@ -505,6 +610,43 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
                 refreshDrivers()
             }
         }, "download-turnip").start()
+    }
+
+    /**
+     * Download one published PanVK build and install it as an ordinary imported driver of the half
+     * it belongs to - the runtime's glibc half, or the compositor's bionic one - remembering which
+     * Mali generations it was built with, so the device picks by them from then on.
+     */
+    private fun downloadPanvkDriver(assetName: String) {
+        val asset = PanvkReleases.cached(activity)?.assets?.firstOrNull { it.name == assetName } ?: return
+        if (releaseProgress.containsKey(assetName)) return
+        releaseProgress[assetName] = 0
+        refreshReleaseRows()
+        Thread({
+            var file: File? = null
+            val problem = try {
+                file = PanvkReleases.download(activity, asset) { pct -> ui.post { releaseProgress[assetName] = pct; refreshReleaseRows() } }
+                val uri = Uri.fromFile(file)
+                val id = if (asset.linux) LinuxPanvkDriverManager(activity).installFromTzst(uri, asset.name, asset.archs)
+                else PanvkDriver(activity).installFromTzst(uri, asset.name, asset.archs)
+                PanvkReleases.recordDownload(activity, asset, id)
+                null
+            } catch (e: IllegalArgumentException) {
+                e.message
+            } catch (e: Exception) {
+                Log.w(TAG, "release driver download", e)
+                activity.getString(R.string.comp_download_failed, e.message)
+            }
+            ui.post {
+                file?.let { com.droiddeck.launcher.core.FileUtils.delete(it) }
+                releaseProgress.remove(assetName)
+                val installed = activity.getString(
+                    R.string.drivers_installed_pick, asset.name.removeSuffix(".tzst"),
+                )
+                android.widget.Toast.makeText(activity, problem ?: installed, android.widget.Toast.LENGTH_LONG).show()
+                refreshDrivers()
+            }
+        }, "download-panvk").start()
     }
 
     private companion object {

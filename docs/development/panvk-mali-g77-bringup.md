@@ -294,6 +294,86 @@ rebuild). This is the genuine "adapt GameHub's passthrough" work; everything che
   10, CSF kbase) — neither our arch 9 JM nor our need (Vulkan). Data point only:
   a Panfork-kbase ecosystem exists (anonymususer04 origin), but it does not
   supersede the apexspan v9 JM fork we use.
+- **FristOneRR/FristOneRR-Panvk-Driver** (surveyed 2026-10-13 on request) — README + LICENSE
+  only; the download is `v2.0-rc1` → `Panvk-Mali-G57-2.0-rc1.zip` (2,922,415 B, sha256
+  `2ad19e7b97f7cdb57cddee96d476400bee0aad77486cec6b2434ebc537089d53`). Inside: a single
+  `libvulkan_panfrost.so` (15,640,776 B, sha256
+  `eb7e56c3125e4a1dab3800d5fa27f5d8956d5861a23dbaa1fd76279422a1babb`), `meta.json`
+  (`Mesa 26.3.0-devel`, `Mali-G57-2.0-rc1`, `minApi 36`) and `LICENSE-Mesa.txt`. It is
+  **bionic**: NEEDED is
+  liblog/libhardware/libnativewindow/libsync/libdrm/libz/libzstd/libc++_shared, no GLIBC_
+  symbols, so it cannot replace the guest's glibc driver at all. Its own compatibility table
+  claims Valhall v9 JM (G57/G68/G77/G78) and Bifrost v6/v7 and **excludes the 5th-gen CSF
+  parts (G610/G710/G615/G715)** — i.e. our GT 20 Pro and GT 30 Pro testers' GPUs — so it
+  cannot help either of them. Its declared main target is our own part (G77 MC9; their
+  "Dimensity 8050" is MT6893), with a 56-byte atom-stride auto-detect and `PANVK_HEAP_MB` /
+  `PANVK_TILER_HEAP_MB` / `PANVK_POLY_HEAP_MB` / `PANVK_STENCIL_LATE` / `PANVK_TRACE` knobs;
+  it admits `kbase: bo_import not yet implemented (dma-buf import requires
+  KBASE_IOCTL_MEM_IMPORT)`. **Verdict: not adoptable** — bionic-only, no arch 11, no dma-buf
+  import. Their release hashes match their published table, so the artifact is authentic.
+  - **Re-assessment 2026-10-14 — the "not adoptable" verdict above is too broad.** It is true for
+    the *guest* half and for the CSF testers, but as the ***bionic/compositor* half** this driver is
+    a legitimate candidate on arch-9 JM Mali, which is the X6739.
+    - It is the **same Meson target we build**: `src/panfrost/vulkan/libvulkan_panfrost.so`, which
+      `tools/panvk/build-panvk-android.sh:99` also produces and only renames to
+      `libvulkan_panvk.so` (line 106). Theirs keeps the upstream name.
+    - It satisfies **every** gate in `PanvkDriver.rejectionReason()`
+      (`app/src/main/java/com/droiddeck/launcher/gpu/PanvkDriver.java:219-243`): a `meta.json`, a
+      non-empty `libraryName` (`libvulkan_panfrost.so`), an aarch64 ELF, and no `libc.so.6`. Note
+      their `meta.json` has **no `kind`** key, so the `linux-vulkan-icd` rejection does not fire.
+    - The compositor loads its driver through **adrenotools** as `<driverPath>/<libraryName>`
+      (`WaylandCompositor.nativeStartWithSurface`, `wayland/WaylandCompositor.java:201`), and both
+      parts come from `PanvkDriver.driverPath()`/`libraryName()`, i.e. from the `meta.json`. Any
+      declared name works. Their zip is therefore importable **as-is** via the app's PanVK import
+      (`installFromZip` → `adopt`, `PanvkDriver.java:154`), which flattens the zip to base names, so
+      the three top-level files land correctly.
+    - **Why it is more than an equivalent.** Its kbase support is **in-tree C** — `strings` shows
+      `/dev/mali%d`, `failed to open kbase device %s`, `Found kbase device '%s'.` — with **no
+      `libpanvk_kbase_jm.so`** dependency. This fork instead patches Mesa to
+      `dlopen("libpanvk_kbase_jm.so")` and must keep that Rust cdylib beside the driver, which
+      AGENTS.md records as a hard failure mode (`VK_ERROR_INCOMPATIBLE_DRIVER` when it is absent).
+      It gates itself on `kbase: legacy JM driver version %d.%d not supported (need >= 11.0)`; this
+      device's own kbase reports **`kbase uAPI: JM 11.38`** (`dd06-session.log`), so it clears that
+      with margin.
+    - **Risks to test, not assume.** (a) It states `kbase: bo_import not yet implemented (dma-buf
+      import requires KBASE_IOCTL_MEM_IMPORT)`, while the compositor's zero-copy path is
+      `vkp_image_from_dmabuf()`; our current bionic driver imports fine (`framedbg DMABUF … img=0x…`
+      with no "dmabuf import failed"), so this could force the mmap-upload fallback. (b) It is Mesa
+      **26.3.0-devel** against our 1.2.0/24.3-era tree and carries no `PANVK_FD_INTEROP` string (the
+      gate our fork added for gamescope), though the external-memory extensions are present under
+      other names. (c) It cannot help GT 20 Pro (arch 10) or GT 30 Pro (arch 11) testers.
+    - **Verdict (corrected): worth testing as the compositor driver on arch-9 JM Mali (X6739); not
+      adoptable for the guest half, and not for CSF devices.**
+- **FristOneRR-Admin/FristOneRR-Wrapperv1** — a fork of `leegao/bionic-vulkan-wrapper` at tag
+  `v0.0.5r5` (branch `fristonerr-wrapper-v1`): a Vulkan-on-Vulkan **ICD wrapper**
+  (`libvulkan_wrapper.so`) that bridges a glibc Wine/Winlator process to a bionic driver,
+  installed by copying it into `Z:\usr\lib\`. DroidDeck does not need a wrapper because it
+  builds PanVK twice from one tree (glibc for the guest, bionic for the compositor) instead of
+  shipping a bionic-only driver plus a translation layer. **Verdict: not needed** (section 3).
+- **FristOneRR-Admin/FristOneRR-Panvk-Source** — the one worth remembering: a Mesa 26.3.0-devel
+  tree whose `src/panfrost/lib/kmod/kbase_kmod.c` is 93,829 B with 12 job-submit markers
+  (`kbase_kmod_job_submit`, `..._dep`, `..._retry`, a JOB_SUBMIT stride probe), i.e. it completes
+  Job Manager submission **inside Mesa**, where DroidDeck instead patches Mesa to
+  `dlopen("libpanvk_kbase_jm.so")` (`tools/panvk/mesa-patches/0002-kbase-support.patch:245`) and
+  drives kbase from that Rust cdylib. Our inherited header still says submission "is not wired up
+  yet" and dma-buf/WSI is "left for future work". Replacing the Rust shim with in-tree submission
+  is a large refactor, not a drop-in; revisit only if the Rust layer becomes the blocker.
+  **Added 2026-10-14 — it does carry a rebuild recipe, and it can produce both halves.** The exact
+  configure line is checked in as `tools/fristonerr/build-options.txt` (`-Dpanfrost-kmds=kbase`,
+  `-Dplatforms=android`, `-Dandroid-stub=true`, `-Dandroid-strict=true`, `-Dvulkan-drivers=panfrost`,
+  `-Dpanfrost-rust=false`, `-Dplatform-sdk-version=35`, tests off), with the cross file
+  `android-cross.txt` (`clang --target=aarch64-linux-android35`). CI is
+  `.github/workflows/kbase-release.yml` (439 lines, `runs-on: ubuntu-24.04-arm`, tag `kbase-v*`,
+  `meson setup … -Db_ndebug=true -Dpanfrost-kmds=kbase,panthor`) and it stages
+  `libvulkan_panfrost_kbase.so` + `panfrost_kbase_icd.aarch64.json` into **arm64 Linux** packages
+  (debian13 / ubuntu2604 / archlinux / generic `tar.gz`) — i.e. a **glibc** kbase PanVK, which is the
+  shape the *guest* half needs. So this tree could supply both halves from one source, unlike our
+  current split (glibc from `mesa-panvk-mali-g57`, bionic from `tools/panvk/`).
+  **Updated 2026-10-14 — its released bionic driver was actually run in our compositor.** With the
+  dependency libraries staged (§16) it loads and renders real Mesa PanVK 26.3.0-devel on this
+  device, and then fails to present: `vkCreateSwapchainKHR` -> `VK_ERROR_INVALID_EXTERNAL_HANDLE`,
+  i.e. its unimplemented kbase dma-buf import. So it is not adoptable as the compositor driver for
+  the reason predicted here, and the bionic half is still the vendor blob in every shipped build.
 
 ## 9. Useful on-device commands (all via `./tools/droiddeckctl` unless noted)
 
@@ -453,3 +533,442 @@ Shipped `panvk-linux-g57-1.2.0-p4` (sha256 `dc6503e3e9aa649387e01022c6337276c6e1
 `Mali-G615`/`Mali-G715` are in the model table, and its NEEDED list is unchanged
 (libdrm/libz/libzstd/libwayland-client/libxcb*/libexpat/libstdc++/libm/libc, no LLVM family).
 Build workflow runs: `38411817925` (compile) and `38412415983` (publish p4).
+
+## 14. 0.3.3 verified on X6739; the bionic half has no arch 11 yet
+
+Verified on the rooted X6739 (MT6893, G77 MC9) 2026-10-13, app **0.3.3 (13)**, build
+`remote clean · main at f3f57c2` (CI artifact of run `38427278217`), runtime r9. Session
+`2026-10-13-38-steam` reached `phase READY`, `firstFrame true`, `guestPid 4732`, output
+1600x720, `focusedApp 769`, `refreshHz 120`. The guest ran the GPU, not software:
+
+```
+== uid=10311 size=1600x720 fps=60 icd=/usr/share/vulkan/icd.d/panvk_icd.aarch64.json
+PANVKDBG kbase uAPI: JM 11.38
+MESA: warning: panvk: unknown gpu_id (0x90800011) or variant (0); continuing with conservative "Mali (unknown Valhall)" defaults
+selecting physical device 'Mali unknown 0x90800011 MC9'
+CREATE_DEVICE EXT: VK_EXT_image_drm_format_modifier, VK_EXT_queue_family_foreign,
+  VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf, VK_KHR_external_semaphore_fd,
+  VK_EXT_robustness2
+```
+
+`wayland.log`: `compositor renders on Mali-G77 MC9 with libvulkan_panvk.so`, driver folder
+`graphics_driver_panvk/panvk-android-24.3.0/`; `"Steam Big Picture Mode" (gamescope) is presenting
+GPU frames through Wayland: 1600x720, format XR24`. `device.txt` prints
+`Mali-G77 MC9 · Mali Valhall · Experimental: Mali/PanVK support is early`. On-screen rate is
+~5-7 fps, which is the known Steam-BPM cost (sections 1 and 5), not a bring-up failure.
+
+**Arch coverage of the two halves, measured from the shipped artifacts** (the only honest source
+without the tester's device):
+
+| Half | Artifact | Model strings in the library | Arches |
+|---|---|---|---|
+| glibc (guest) | `panvk-linux-g57-1.2.0-p4` | `Mali-G57`, `Mali-G610`, `Mali-G615`, `Mali-G715`, `Mali-G310v1..v5` | 9, 10, 11 |
+| bionic (compositor) | `graphics_driver/panvk-android-24.3.0.tzst` (repacked from the fork's `panvk-mali-g57-v1.2.0-ahb`) | `Mali-G57`, `Mali-G610`, `Mali-G310v1..v5` — **no `Mali-G615`/`G715`** | 9, 10 |
+
+So a GT 20 Pro (G610/v10) is covered by both halves, and a GT 30 Pro (G615/v11) is covered by the
+guest half only. `PanvkDriver.chooseByDevice()` returns `BUNDLED_PANVK` for **every** Mali family,
+so the compositor on a GT 30 Pro loads an arch-9/10 driver. panvk's unknown-gpu_id path keeps
+conservative defaults and does initialise on this hardware (X6739 above proves it for an unknown
+`gpu_id`), so the compositor may still come up; this is the one half the X6739 cannot answer for.
+If a GT 30 Pro's compositor fails, the fix is to build the fork's panvk for **bionic** with patch
+`0003` — the glibc script is `tools/panvk-g57/build-panvk-g57.sh`, and the fork's own bionic build
+(section 3) used NDK r29; `tools/panvk/build-panvk-android.sh` pins NDK r27c and upstream Mesa
+24.3.0, which has no v11 schema at all, so it cannot be patched into shape.
+
+CI state the same day: `Build APK` is green (runs `38424543841`, `38427278217`; the job had never
+passed in this fork before), but the four `sign / sign <variant>` jobs failed with
+`environment 'signing-main' has no signing key` — the fork has the `signing-main` environment but no
+`RELEASE_KEYSTORE_B64`, so `build.yml`'s overall conclusion was red and `release.yml` (which greps
+`gh run list --status success`) could not find a successful run to sign. That is now unblocked:
+`tools/release/sign-apk.sh` and `.github/workflows/sign.yml` fall back to the debug key
+(`keystore/testkey.p12`) when no release keystore is configured, signing each variant with the
+testkey alone exactly as every local `tools/build_local.sh` build already does. Verified locally for
+`standard` and `pubg` (both `v3 signer a40da80a…`, `META-INF/TESTKEY.SF`/`TESTKEY.RSA` present, v1
+under `--min-sdk-version 21`); the fix still needs a CI run to be seen green. The release-key path is
+untouched, so adding a key later via a secret restores the lineage sign. `keystore/release-signer.sha256`
+still names upstream's key (`b241ea7d…`) and the app's update catalog is upstream's
+(`AppUpdates.kt` hardcodes `Droid-Deck/DroidDeck` / `Droid-Deck/DroidDeck-CI`), so in-app/OTA updates
+remain upstream-bound; nothing in the tree changed for that. The rest of the chain is
+fixed: the stray `mesa` gitlink that broke every `actions/checkout`, `check_session_assets'`
+missing `usr/share/vulkan/icd.d/**` glob, `verifyRuntimeInputs` racing `stageSessionScripts`, the
+unquoted `PANVK_SOURCE` in `tools/panvk/release.env`, the absent PanVK staging step, samba.org
+mirrors for talloc, ECR throttle fallback, and the session log's byte cap.
+
+## 15. Frame ping-pong — compositor content gate (measured fix, 2026-10-14)
+
+The user-visible ping-pong (§11) is a **guest** defect and was confirmed by measurement, not
+inference: gamescope's three output images are linear and therefore CPU-readable, so the compositor
+was instrumented to `mmap` each committed buffer and sample a 64x36 grid. With the Steam QAM open
+(session `2026-10-14-02-steam`, guide button) the guest alternates on a strict period of 3 — one
+bright image (`mean=91`, `hi=1118/2170`) and two partial blanks (`mean=12`, and in the earlier
+threshold-16 run a second partial frame at `mean=25`, `hi=282/2170`). The screen tracks whichever
+buffer it is handed, so the compositor is faithful and the guest is handing over blanks.
+
+The fix shipped in `app/src/main/cpp/waylandcomp/src/compositor.c` is a compositor-side **content
+gate**: `dmabuf_sample()` (the same mmap sampler) plus `blank_frame_hold()`, wired into
+`take_dmabuf`'s `if (b->img)` branch so it gates only the buffer *swap* (the `g_stat_dmabuf` count,
+the size-change log and the HUD tick at the tail all still run). It holds a commit whose mean is
+below `BLANK_MEAN` while a content frame arrived within `BLANK_HOLD_NS`, and releases the held
+buffer to the client like any replaced one. Values: `BLANK_MEAN 40`, `BLANK_HOLD_NS 1200000000`.
+`BLANK_MEAN 16` was insufficient — the `mean=25` partial frame passed as content and still flickered.
+
+Measured on device, hot-swapping the rebuilt `libdroiddeckwayland.so` into the installed 0.3.3
+(session `2026-10-14-03-steam`, 20 frames each):
+
+| Build | Screen R | Spread |
+|---|---|---|
+| gate on | 82.88 only | 0.00 |
+| gate off (`<session log>.no-blank-hold`) | 14.29 <=> 82.88 | 68.59 |
+| gate on again | 82.88 only | 0.00 |
+
+The guest keeps alternating throughout (same `mean=12/91/12` period 3), 122 `HOLD-BLANK` lines fired
+and every hold reports a content age <= 946 ms, under the 1.2 s bound. This **hides** the guest bug
+rather than fixing it: the bound must exceed the client's content-frame interval, and a genuinely
+dark scene can be held for up to the bound before it reaches the screen. The guest-side root cause
+(why only one of three swapchain images receives the scene — the PanVK WSI's `WSI_BLIT_SHM` slot
+handling) remains open; see `docs/development/ping-pong-frame-handoff.md` §7.5 and §9.1a. The fix
+only reaches users through a rebuilt `libdroiddeckwayland.so`, i.e. a new APK.
+
+### 15a. Ring regime and gate hole measured on the released build (2026-10-14)
+
+Re-measured on the **released** test APK (`test-0.3.3-mali-frame-gate-20261014`, sha256
+`10f842416f842acdba9069dbfcee893dd063f347a26dcea5c85bc5c6171f0702`) rather than by hot-swapping the
+`.so`: the installed `base.apk` was verified by `sha256sum` in place. Session
+`2026-10-14-04-steam`, 2,413 commits, `frame-probe` on.
+
+- The ring does **not** stay on "1 bright + 2 blank". Three regimes are measured: all-equal
+  (invisible), 1 bright + 2 dark (hard flicker), 1 bright + 2 mid (soft flicker). The odd image is
+  not a fixed slot — it moved `327` -> `326` -> `325` within one session.
+- **All three images are updated over time** (`fd327` took `6,11,13,37,67,90`), so there is no
+  permanently-unwritten swapchain image. Updates arrive in **bursts of 1-2**, so the ring rarely
+  converges (one 3-way convergence in 2,413 commits).
+- The guest commits at ~4 fps **continuously while rendering nothing**: a frozen `85/67/67` ring was
+  presented for 292 s / 1,046 commits. That is the ping-pong in its purest form, and it is
+  guest-side — our compositor only draws what it is handed.
+- The content gate is **inert when every image is `>= BLANK_MEAN`** (in the `85/67/67` regime, marker
+  on and off both give screen spread 17.93) and **can freeze the display on a stale bright frame**
+  when the stale image is the bright one. So the gate damps the loud regime only; it is not a fix.
+- Guest-side evidence from the same session: `sw=1` present path, `minImageCount: 3`, three
+  `WSI_BLIT_SHM` allocations at `size=4608000` (1600x720x4) with three distinct `sw_host_ptr`s and no
+  NULL. The earlier "12 of 27 allocations returned NULL" note was **not reproducible** and is
+  withdrawn.
+
+Full detail: `docs/development/ping-pong-frame-handoff.md` §3.8a and §7.5a.
+
+## 16. The bionic half was never loading — the compositor ran the vendor blob (measured 2026-10-14)
+
+This supersedes any earlier reading of `compositor renders on Mali-G77 MC9 with libvulkan_panvk.so`.
+That line prints `g_library_name`, the name we *asked* for, not the driver that answered
+(`app/src/main/cpp/waylandcomp/src/vk_present.c:489`), so it never was evidence of PanVK. The device
+name it also prints is the same string the vendor blob reports (`Mali-G77 MC9`), so it cannot
+discriminate either.
+
+**What actually happens, from logcat (`hook_impl`):**
+
+```
+I hook_impl: hook_android_dlopen_ext: filename: vulkan.mali.so
+I hook_impl: hook_android_dlopen_ext: loading custom driver: <driver>/libvulkan_panvk.so
+I hook_impl: hook_android_dlopen_ext: hook failed: failed to load custom driver:
+    dlopen failed: library "libandroid-shmem.so" not found: needed by <driver>/libvulkan_panvk.so
+I hook_impl: hook_android_dlopen_ext: falling back!
+```
+
+`falling back!` loads the vendor ICD. `/proc/<app>/maps` then holds
+`/system/lib64/libvulkan.so` + `/vendor/lib64/hw/mt6893/vulkan.mali.so`, and nothing from
+`files/graphics_driver_panvk/<id>/` except `temp/0_patched.so` (a 251 KB copy of `libvulkan.so`).
+The compositor's Vulkan on this device is ARM's blob. The same holds for FristOneRR's driver, which
+fails one library later on `library "libz.so.1" not found`.
+
+**Two separate mechanisms, both proven:**
+
+1. **Missing dependency libraries.** `adrenotools` loads the driver through
+   `hook_impl.cpp`'s `android_create_namespace(filename, customDriverDir, hookLibDir, …)`, so the
+   driver folder is the namespace's `ld_library_path` and files placed *in that folder* do satisfy
+   NEEDED — that is how `libz.so.1`/`libzstd.so.1` resolved once copied in.
+2. **Soname shadowing beats the search path.** An already-loaded library with a matching SONAME wins
+   over the driver folder. `/vendor/lib64/libdrm.so` is already loaded (gralloc), it declares
+   `SONAME libdrm.so`, and it **lacks `drmCloseBufferHandle`**, which the driver needs
+   (`/system/lib64/libdrm.so` has it; the vendor one does not). Proof: putting a full
+   `/system/lib64/libdrm.so` copy in the driver folder changed nothing, and replacing it with a
+   deliberate 1-byte bogus file produced the *identical* symbol error — the copy is never consulted.
+
+**Fix that works (verified on device):** ship the two zlibs, and give the driver its own
+uniquely-named full libdrm so it cannot collide:
+
+```sh
+patchelf --set-soname libdrm_full.so  <staged>/libdrm_full.so     # a full libdrm
+patchelf --replace-needed libdrm.so libdrm_full.so <driver>/libvulkan_panfrost.so
+```
+With `libz.so.1`, `libzstd.so.1` and `libdrm_full.so` beside the driver, the hook no longer logs a
+failure and `maps` shows `<driver>/libvulkan_panfrost.so` + `libdrm_full.so` with
+`/vendor/lib64/hw/mt6893/vulkan.mali.so` **absent** — real Mesa PanVK in the compositor for the
+first time.
+
+**Then it hits a wall that is not ours to patch.** PanVK renders offscreen but cannot take the
+screen surface:
+
+```
+error  present: vkCreateSwapchainKHR failed (-1000072003)
+error  present: no swapchain on the screen surface; retrying every 0.5 s
+```
+
+`-1000072003` is `VK_ERROR_INVALID_EXTERNAL_HANDLE`. The session renders (`433 scenes / 10 s`) and
+presents **0 on screen** — a black screen and a `STARTING_STEAM` that never finishes. This is the
+predicted consequence of FristOneRR's own admission in §8a, `kbase: bo_import not yet implemented
+(dma-buf import requires KBASE_IOCTL_MEM_IMPORT)`: its in-tree kbase backend cannot import the
+gralloc buffers the Android swapchain hands it. FristOneRR's bionic driver therefore **cannot** be
+DroidDeck's compositor driver on MT6893 — not because it is a bad build, but because its
+memory-import path is unimplemented where the vendor blob's is not.
+
+**Consequences to carry forward:**
+
+- Any *compositor-side* measurement in this doc or in `ping-pong-frame-handoff.md` taken before
+  2026-10-14 was taken on the vendor blob, not on PanVK.
+- Our own bionic driver has the same latent bug and additionally needs `libandroid-shmem.so` (not
+  present anywhere on the device) plus `libxcb*.so`/`libexpat.so.1` — `tools/panvk/build-panvk-android.sh`
+  installs `libxcb1-dev`/`libxshmfence-dev` in its container, which is what pulls the xcb WSI and its
+  expat dependency into the driver's NEEDED. A bionic rebuild must drop those and stage Mesa's
+  `android_stub` libraries, with the same `patchelf` rename for `libdrm.so`.
+- The misleading log line should be replaced by the real driver identity
+  (`VkPhysicalDeviceDriverProperties.driverName`), so a silent fallback can never masquerade as
+  PanVK again.
+
+Reproduce: select a driver via `session.xml` `androidDriver` (the app must be stopped first — the
+compositor loads its driver once per process), then
+`adb logcat | rg 'hook_impl|graphics driver'` and
+`cat /proc/$(pidof com.droiddeck.launcher)/maps`.
+
+## 17. GT 30 Pro (G615, arch 11) is given a Job Manager driver on a CSF-only GPU (2026-10-14)
+
+From the GT 30 Pro's own session bundle (`DroidDeck-2026-10-14-03-steam.zip`, X6873 / MT6897 /
+`Mali-G615 MC6`, Android 16, app 0.3.3, runtime r9), the guest's PanVK prints its kbase
+capabilities. Side by side with the X6739's:
+
+| | X6739 (G77, arch 9) | GT 30 Pro (G615, arch 11) |
+|---|---|---|
+| `PANVKDBG kbase uAPI` | `JM 11.38` | **`CSF 1.21`** |
+| `PANVKDBG kbase props` | `js_present=0x7 jsf=20e,1c9e,1e … shader_present=0x660067` | **`js_present=0x0 jsf=0,0,0 num_cg=1 cg0=0x130013 shader_present=0x130013`** |
+| WSI line | `uses_kbase=1 … sw_device=1` | same |
+| driver in use | our JM build | our **JM** build |
+
+`js_present=0x0` means the G615 exposes **no Job Manager slots at all**, and its kbase is CSF. Our
+pinned guest driver (`panvk-linux-g57-1.2.0-p4`) is the Mali-G57 fork's **Job Manager** backend -
+`app/src/main/rust/panvk-kbase-jm` is the JM one, and `release.env` says p4 "ports Valhall gen3
+(arch 11) back into the fork" - so the arch is *enumerated* (gamescope selects
+`Mali-G615 MC6`, `device.txt` shows the session running) while submission goes down the JM path the
+GPU does not offer. That is a strong candidate for the GT 30 Pro's ping-pong, and it is *not* the
+same bug as the X6739's (whose GPU does offer JM slots).
+
+**Corrected 2026-10-14 (§18):** `kbase_stub=1` and `sw_device=1` are *not* evidence of a stub or
+software device - the X6739's sessions print exactly the same two values (`art/dd01-session.log`,
+`art/dd06-session.log`) while its GPU does offer JM slots, so they distinguish nothing.
+
+**So the GT 30 Pro does not need a different pick from the set we publish - it needs a build we do
+not publish.** Every released guest build is JM-family (`panvk-linux-24.3.0-p1..p13`,
+`panvk-linux-g57-1.2.0-p1..p4`); there is no CSF guest build. `GpuInfo.PANVK_ARCHS =
+{9, 10, 11}` therefore over-claims: it makes a G610/G615 session run PanVK with a JM backend, where
+`SessionService`'s own fallback comment (`arch v10+ submits through CSF, which the kbase layer here
+does not implement`) says it should not. Adding more driver options to the menus only helps once a
+CSF build exists to select.
+
+Open questions, not yet decided (they change behaviour, so they are not being guessed):
+
+1. Until a CSF guest build exists, should arch 10/11 fall back to `llvmpipe` (honest, slow, and
+   what `SessionService` already does when `panvkBackend` is false) instead of running PanVK on a
+   submission path the GPU lacks?
+2. Build the CSF guest driver from `FristOneRR-Panvk-Source` (§8a: `-Dpanfrost-kmds=kbase`, CI
+   already stages kbase-CSF packages), then auto-pick it for arch 10/11 and keep the JM build for
+   arch 9? That is what "use the driver this GPU should use" actually requires.
+
+**Decided 2026-10-14:** keep arch 10/11 on PanVK as they are today (no move to `llvmpipe`), and
+build the CSF guest driver later. What was done instead is §18 below.
+
+## 18. Every published PanVK build is an option now, and the pick is by Mali generation (2026-10-14)
+
+The GT 30 Pro's bundle (`DroidDeck-2026-10-14-03-steam.zip`) showed which build each half was given:
+the display half `panvk-android-24.3.0` ("Mesa PanVK 1.2.0 (Mali-G57 fork, v9 JM kbase, AHB)",
+`device.txt`), the guest half the runtime's pinned build. What each of those can actually drive is
+now measured, not assumed:
+
+| Build | Mali generations in it | Evidence |
+|---|---|---|
+| `panvk-android-24.3.0` (bundled, bionic) | **v9 only - no v11** | `strings -a libvulkan_panvk.so \| grep -c panvk_v11` = **0**, `panvk_v10` = 729 (v6/v7/v9/v10/v12/v13/v14 present). Committed 2026-10-13 10:17 +0700, before 0003 landed (21:06 +0700). |
+| `panvk-linux-24.3.0-p1..p13` (glibc) | v9 | `tools/panvk/mesa-patches/` = `0002-kbase-support` + `0003-panvk-v9-jm`. |
+| `panvk-linux-g57-1.2.0-p1..p3` (glibc) | v9 | the fork line before 0003. |
+| `panvk-linux-g57-1.2.0-p4` and later (glibc, **pinned**) | v9 + **v11** | `tools/panvk-g57/build-panvk-g57.sh` fails the build unless `readelf -sW` finds both `panvk_v9_` and `panvk_v11_`; p4 was tagged 14:23:54Z, after 0003. |
+
+So on a G615 the guest half has a v11 backend and the compositor half has none - and no build
+covering v11 is published for the bionic half at all. The GT 30 Pro's ~3 fps is real and measured
+(its `wayland.log` 10 s line: "30 frames on screen (3.0 fps) | 30 GPU frames from games", "30
+scenes, 30 on screen" - the compositor presented every scene it was handed), but which layer loses
+the time is still open; §17's JM-submission reading is a hypothesis, not a measurement.
+
+What changed in the app (the "add all drivers as an option, and use the one this GPU should use"
+work):
+
+- `gpu/PanvkReleases.kt` (new): the fork's own releases (`ryanistr/DroidDeck-Mali`, `panvk-*.tzst`)
+  as a download source for the Mali driver menus, the shape `TurnipReleases` has for Adreno - asset
+  digest from GitHub, sha256 checked after download, cached check, installed through the same
+  importers a picked file uses. Both halves are offered: `panvk-linux-*` to the runtime list,
+  `panvk-android-*` to the display list.
+- The arch table (`archsOf`, pinned by `app/src/test/java/com/droiddeck/launcher/gpu/PanvkReleasesTest.kt`):
+  every row says which generations its build carries, and the ones carrying this GPU's are marked.
+- `PanvkDriver.chooseByDevice()` picks by `GpuInfo.arch`: an imported build that declares the
+  generation, then a build that stays silent, then the bundled one - and logs
+  `no installed PanVK display driver carries a Mali vN backend` when nothing does. Hiding the
+  bundled driver now means "system Vulkan" on Mali, as it already did on Adreno.
+- Both importers record `gpuArch` per imported driver (`LinuxPanvkDriverManager`, `PanvkDriver`), so
+  a downloaded or hand-picked build keeps its declaration; `SessionService` logs when the chosen
+  guest driver was built for other generations than the device's.
+- Mali fixes found on the way: deleting or restoring a driver went to the *Turnip* managers and did
+  nothing; `PanvkDriver` had no `hideBundled`/`restoreBundled`; the Android import picker did not
+  accept a `.tzst`.
+
+Still open: a CSF submission path (`app/src/main/rust/panvk-kbase-jm` is the Job Manager one) and a
+bionic build from the same tree as p4. Until then a G615's compositor has no PanVK build, and its
+guest runs the only published build that carries v11.
+
+## 19. A CSF fault in the build we ship, and the guest's missing render node (2026-10-14)
+
+Sources read for this section, all on 2026-10-14:
+
+| Tree | Revision | Why it was read |
+|---|---|---|
+| `emir34-34/DroidDeck` (`mediatek-mali-support`) | fork of `Droid-Deck/DroidDeck`, tip `229fe074`, device POCO X8 Pro / MT6899 / Mali-G720 MC8 / Android 16 | the Mali work with on-device Steam measurements |
+| `wonderkast02/panvk-g720-kbase-csf` | `g720-development` @ `ca163891` | the kbase/CSF tree emir's driver is built from, and the one our fork is a cousin of |
+| `BkaNeko/panvk-mtk-driver` | `594efbf` | bionic system-Vulkan replacement for a Mali-G610 under HyperOS; read for CSF queue/gralloc fixes |
+
+### 19.1 The CSF provoking-vertex address truncation is compiled into our pinned driver, for arch 11
+
+emir's `8f18a5ad` ("panvk: fix the real cause of Steam's UI freezing on Mali"), patch 0002, is one
+line: `get_fb_descs()` in `csf/panvk_vX_cmd_draw.c` held `fns_bo->addr.dev` in a `uint32_t`. That
+field is `uint64_t` (`panvk_priv_bo.h:23`), and on Android's kbase the addresses are SAME_VA and sit
+above 4 GB, so the command stream frontend prefetched from a truncated address and every group
+stopped: `CSF group N fatal error ... exception 0xc1` in the client log, dmesg `Unhandled Page fault
+... source Command Stream Frontend, pref0`. Queue timeouts, `DEVICE LOST` and a client whose memory
+grows without bound (Zink unable to recycle) all follow from that one fault. emir measured the fix on
+a G720: 120 scroll/tap/back gestures in Big Picture over ~5 minutes, no fault, CEF's GPU process
+steady at 0.45-0.7 GB.
+
+**It is in the source our pinned release was built from.** At tag `v1.2.0` (the tag
+`panvk-linux-g57-1.2.0-p4` was built from) the line is
+`src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c:1852: uint32_t fn_addr =`. It is still unfixed in
+wonderkast02's own tree (`g720-development` @ `ca16389`, line 2449), so there was nothing to pull
+from there: their issue #9 is emir's report.
+
+**And that line is arch 11's, not a dormant one.** The fork's `meson.build` puts arch 11 in
+`csf_archs` (`:115` — `[10, 11, 12, 13, 14]`) while `jm_archs` stays `[6, 7, 9]` (`:95`), so the
+`panvk_v11_` backend that 0003 ports in is the **CSF** backend. `panvk_cmd_draw.h:299` guards the
+whole provoking-vertex machinery on `PAN_ARCH >= 10`, so arch 9 never has this code in any build and
+a G77 session cannot be affected by it either way.
+
+**This corrects §17.** The GT 30 Pro is not being handed a Job Manager driver: on a G615 the pinned
+build has no JM backend for that arch at all, so `js_present=0x0` costs nothing by itself. The
+concrete CSF defect is this truncation, and the trigger is exactly what a G615 runs: a render pass
+that starts before the provoking-vertex mode is known, which Chromium on Zink does on every pass
+(Steam's CEF) and `vkcube` does not.
+
+Fixed as `tools/panvk-g57/patches/0004-csf-fix-provoking-vertex-fn-address-truncation.patch`.
+
+### 19.2 kbase reported no DRM device at all to a glibc build
+
+emir's `8f260546` + `3d6ede4b` (their patch 0001): `panvk_physical_device_init_kbase()` left
+`drm.render_rdev` and `drm.primary_rdev` zeroed, so `VkPhysicalDeviceDrmPropertiesEXT` named no
+device and everything that matches a Vulkan device to a DRM node by device number silently failed to
+match — gamescope's WSI among them, which is what decides zero-copy present against a copy.
+
+In the runtime that number is knowable: proot presents the kbase node as the session's render node
+(`tools/linuxfs/preload/drm.c:383` picks `/dev/mali0`, `:332` synthesizes a DRM device for it), so the
+node's own `st_rdev` is the render node's number. This is §7.2 of `ping-pong-frame-handoff.md` —
+"give the guest a real render node" — reached from the driver side instead of the device side.
+
+Fixed as `tools/panvk-g57/patches/0005-kbase-report-node-rdev-as-drm-device.patch`, guarded
+`#ifndef __ANDROID__` because the bionic half presents to a real Android surface and must keep
+whatever the platform reports. That guard is the same one 0001 already uses in this patch set.
+
+### 19.3 The compositor no longer asks for extensions the driver may not have
+
+Our `dev_init()` (`app/src/main/cpp/waylandcomp/src/vk_present.c`) enabled five device extensions
+unconditionally. A driver without any one of them fails `vkCreateDevice` outright — no session at all
+— where leaving it out costs only the zero-copy path (clients fall back to `wl_shm`). emir hit this
+with a system Mali driver that lacks `VK_EXT_image_drm_format_modifier`; the same shape of failure is
+available to us the moment the display half is not a PanVK/Turnip build.
+
+Applied: only `VK_KHR_SWAPCHAIN_EXTENSION_NAME` is required, each dma-buf extension is enabled if the
+driver advertises it and logged if not, and a new `g_has_drm_modifiers` gates
+`vkp_dmabuf_modifiers()` and `vkp_image_import_dmabuf()` so nothing offers a modifier list the device
+was never created for. On Turnip all four are present and the behaviour is unchanged.
+`aarch64-linux-android35-clang -fsyntax-only -Wall -Wextra` over the file: clean.
+
+### 19.4 Read and deliberately not taken
+
+- **BkaNeko's CSF queue fixes** — drop the userspace doorbell so every publish kicks the scheduler,
+  and widen `KBASE_WAIT_TIMEOUT_NS` from 10 s to 120 s. The fork already does the first: after
+  ringing the doorbell it re-reads `CS_ACTIVE` and falls through to `kbase_kmod_csf_queue_kick()` if a
+  suspend raced the write (`csf/panvk_vX_gpu_queue.c:694-709`), which is the same mitigation, and it
+  re-kicks every 500 ms while waiting (`:770-777`). Not taken; worth revisiting only if a CSF device
+  still reports `timeout on subqueue` after 0004.
+- **BkaNeko's MTK gralloc/AFBC work** (report the MTK AFBC modifier where gralloc says
+  `DRM_FORMAT_MOD_INVALID`, AFBC body 4096 alignment, take the largest of MTK's three dma-buf fds):
+  it targets a bionic system Vulkan driver feeding SurfaceFlinger on a G610, which is not the path
+  this app takes — our bionic half is a PanVK build the compositor loads itself.
+- **emir's app-side Mali work** (detection, the "explain instead of offering Adreno pairs" panel, the
+  `build-panvk-kbase.sh` cross-build): our fork already covers this ground and differently — our
+  display half is PanVK rather than the system Mali driver, and our own `tools/panvk-g57/` +
+  `tools/panvk/` build scripts are what publish our builds.
+
+### 19.5 The guest had no render node at all on a Mali — the device half of the ping-pong
+
+Found while reading emir's `LinuxRuntime.java` hunk, and it is the strongest lead yet for the X6739's
+own ping-pong rather than for a CSF device.
+
+`LinuxRuntime.bindGpuNode()` fabricates a render node in the guest: it makes
+`<cache>/drm/dri/renderD<minor>` plus the sysfs entries libdrm reads
+(`/sys/dev/char/<maj>:<min>/device/{uevent,subsystem,driver}`, and `/sys/class/drm/<node>` where the
+app may not list the real one), then binds them over the guest's `/sys/dev/char`, `/dev/dri` and the
+node itself. It did this **only for KGSL** — `Os.stat("/dev/kgsl-3d0")` throwing returned early, and
+a Mali has no KGSL, so on this device **the guest got no `/dev/dri/renderD*` and no sysfs entry to
+describe it.**
+
+That has a direct consequence in the driver. With no node, `tools/linuxfs/preload/drm.c` falls to its
+synthesized device (`alloc_fallback_drm_device()`, `:332`), which sets `dev->bustype = -1` (`:346`).
+Every WSI that asks whether the device can present directly then answers no:
+`panvk_can_present_on_device()` (`panvk_wsi.c:38-49` in the fork) returns true only for
+`DRM_BUS_PLATFORM`, and the guest's X11/DRI3 path calls it (`wsi_common_x11.c:172`). So the guest is
+refused the DRI3 present path and falls back to MIT-SHM — which is exactly the state
+`steam-ui-logo-pingpong-bug.md:32` describes as the ping-pong's mechanism (a two-frame X11 SHM
+alternation), and it also explains the other gate in the same note, `kbase_dmabuf=0 → sw_device=1`.
+
+Fixed here:
+
+- `LinuxRuntime.bindGpuNode()` now falls back to `/dev/mali0` (constant `MALI_DEVICE`) when KGSL is
+  absent, writes `DRIVER=panfrost` into `uevent`, points the `driver` symlink at
+  `/sys/bus/platform/drivers/panfrost`, replaces a stale link from the other family, and binds the
+  GPU node it actually chose. With the node present, libdrm builds the device itself from sysfs and
+  reports `DRM_BUS_PLATFORM`, which is what the check above wants.
+- `GpuStatsComponent.clockSources()` could not see a Mali's devfreq node either: it matches
+  `kgsl`/`gpu`, and MT6893's node is `13000000.mali`. It now matches `mali` too, the way `GpuInfo`
+  already does, so the session can feed the overlay's clock on a Mali at all.
+
+This is emir's `bindGpuNode` change (their `8f260546`), which extended the same function to Mali; the
+`GpuInfo`-style devfreq match is the same fork's `gpuClockSource()`. Both are app-side and need only
+an APK.
+
+### 19.6 Effect, and what is still required to ship it
+
+0004 reaches every CSF arch in the pinned build (10, 11, 12, 13, 14); 0005 is glibc-only and affects
+how the guest's WSI matches the presented render node; 19.5 gives the guest that node to begin with;
+19.3 is in the compositor. Only the app-side changes (19.3, 19.5) are in this build.
+
+**None of the four has been run on a device, and the two driver patches are not in a published
+driver yet.** `tools/panvk-g57/patches/` is consumed by `.github/workflows/build-panvk-g57.yml`, so
+the patches only change the *next* build of that line; `tools/panvk/release.env` still pins
+`panvk-linux-g57-1.2.0-p4`, which carries neither 0004 nor 0005. To ship them: dispatch that workflow
+(`version=1.2.0`, `tag=panvk-linux-g57-1.2.0-p5`), then set `PANVK_TAG` and `PANVK_SHA256` in
+`tools/panvk/release.env` to the new asset.
+
+What to measure, in order: (1) whether the guest session log now shows a `/dev/dri/renderD*` and
+`PANVKDBG WSI: uses_kbase=1 … kbase_dmabuf=1` rather than `sw_device=1` (19.5, the ping-pong), on the
+X6739; (2) whether `PANVKDBG` now prints non-zero DRM device numbers for the physical device (0005);
+(3) the G615 on the GT 30 Pro for 0004, since the X6739's G77 submits through JM and is untouched by
+it.

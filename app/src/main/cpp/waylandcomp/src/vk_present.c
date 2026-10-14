@@ -65,6 +65,10 @@ static int g_swap_extra;
  * the frame-generation ring): a blit converts every client format into it, the chains read RGBA. */
 #define SCENE_FMT VK_FORMAT_R8G8B8A8_UNORM
 static VkPhysicalDeviceMemoryProperties g_memprops;
+/* Set at device creation: this driver has dma-buf import with explicit modifiers. Always true of
+ * Turnip, but a driver handed to us from elsewhere may lack it, and then the import path below
+ * must stay off rather than hand the device a format list it never agreed to. */
+static int g_has_drm_modifiers;
 
 static VkSurfaceKHR g_surface;
 static VkSwapchainKHR g_swapchain;
@@ -116,6 +120,31 @@ static void perf_add(int64_t *sum, int64_t *max, unsigned *count, int64_t d) {
     if (d > *max) *max = d;
     (*count)++;
 }
+/* ---- bring-up instrumentation (grep the session log for "rdbg") ----
+ * One compact line per acquire / frame / present so the log shows which swapchain image every
+ * frame lands on and what the driver said. Added while chasing the idle whole-screen alternation;
+ * delete once that is settled. */
+static unsigned g_rdbg_seq, g_rdbg_hist_n;
+static uint32_t g_rdbg_hist[32];
+static int64_t g_rdbg_last_ns;
+
+static const char *rdbg_hist(void) {
+    static char buf[192];
+    size_t o = 0;
+    for (unsigned i = 0; i < g_rdbg_hist_n && o + 6 < sizeof(buf); i++)
+        o += (size_t)snprintf(buf + o, sizeof(buf) - o, i ? ",%u" : "%u", g_rdbg_hist[i]);
+    buf[o] = 0;
+    return buf;
+}
+
+static void rdbg_push(uint32_t img) {
+    if (g_rdbg_hist_n == 32) {
+        memmove(g_rdbg_hist, g_rdbg_hist + 1, sizeof(g_rdbg_hist) - sizeof(g_rdbg_hist[0]));
+        g_rdbg_hist_n--;
+    }
+    g_rdbg_hist[g_rdbg_hist_n++] = img;
+}
+
 /* vkWaitForFences on the compositor's own work, timed for the perf line. */
 static VkResult timed_wait(VkFence fence, uint64_t timeout) {
     int64_t t0 = perf_now();
@@ -467,18 +496,28 @@ static int dev_init(void) {
     }
     g_vk.GetPhysicalDeviceMemoryProperties(g_pd, &g_memprops);
 
-    /* Verify the dmabuf-import extensions are present, and log any that are missing. */
-    const char *dev_exts[7] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_external_memory_fd",
-                               "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier",
-                               "VK_KHR_image_format_list", NULL, NULL};
-    uint32_t n_dev_exts = 5;
+    /* Enable the dmabuf-import extensions the driver actually has, and log any that are missing.
+     * Only the swapchain is required: asking for an extension a driver does not have fails
+     * vkCreateDevice outright, which costs the whole session, where leaving it out costs only the
+     * zero-copy path (clients fall back to wl_shm). */
+    static const char *const dmabuf_exts[] = {"VK_KHR_external_memory_fd",
+                                              "VK_EXT_external_memory_dma_buf",
+                                              "VK_EXT_image_drm_format_modifier",
+                                              "VK_KHR_image_format_list"};
+    const char *dev_exts[7] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    uint32_t n_dev_exts = 1;
     uint32_t ne = 0;
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *exts = calloc(ne ? ne : 1, sizeof(*exts));
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, exts);
-    for (unsigned i = 0; i < 5; i++)
-        if (!has_ext(exts, ne, dev_exts[i]))
-            LOGE("present: driver MISSING %s (dmabuf import will fail)", dev_exts[i]);
+    if (!has_ext(exts, ne, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+        LOGE("present: driver MISSING %s", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    for (unsigned i = 0; i < sizeof(dmabuf_exts) / sizeof(*dmabuf_exts); i++) {
+        if (has_ext(exts, ne, dmabuf_exts[i])) dev_exts[n_dev_exts++] = dmabuf_exts[i];
+        else LOGE("present: driver MISSING %s (dmabuf import will fail)", dmabuf_exts[i]);
+    }
+    g_has_drm_modifiers = has_ext(exts, ne, "VK_EXT_image_drm_format_modifier") &&
+                          has_ext(exts, ne, "VK_EXT_external_memory_dma_buf");
     /* HDR sessions only: the HDR10 swapchain (frame generation) can carry the game's metadata. */
     int want_hdr_md = 0;
     if (droiddeck_color_requested()) {
@@ -917,6 +956,7 @@ static int modifier_importable(VkFormat fmt, uint64_t modifier, VkImageUsageFlag
 
 int vkp_dmabuf_modifiers(uint32_t drm_format, uint64_t *out, int max) {
     if (max <= 0 || dev_init() != 0 || !g_vk.GetPhysicalDeviceFormatProperties2) return 0;
+    if (!g_has_drm_modifiers) return 0; /* the device was made without the import extensions */
     VkFormat fmt = drm_to_vk(drm_format);
     VkDrmFormatModifierPropertiesListEXT list = {
         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
@@ -958,7 +998,7 @@ int vkp_image_is_dmabuf(const struct vkp_image *img) { return img && img->dmabuf
 struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t modifier, int w, int h,
                                           uint32_t stride, uint32_t offset, int as_blit_dst) {
     if (modifier == MOD_INVALID || w <= 0 || h <= 0) return NULL;
-    if (dev_init() != 0) return NULL;
+    if (dev_init() != 0 || !g_has_drm_modifiers) return NULL;
 
     struct vkp_image *img = calloc(1, sizeof(*img));
     if (!img) return NULL;
@@ -1429,7 +1469,13 @@ static int acquire_image(int k, int first, uint32_t *img, VkResult *ar_out) {
         const int64_t t_acq = perf_now();
         VkResult ar = g_vk.AcquireNextImageKHR(g_dev, g_swapchain, 1000000000ULL, g_acqs[k], VK_NULL_HANDLE, img);
         perf_add(&g_perf.acquire_ns, &g_perf.acquire_max_ns, &g_perf.acquires, perf_now() - t_acq);
-        if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) { *ar_out = ar; return 0; }
+        if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) {
+            *ar_out = ar;
+            rdbg_push(*img);
+            droiddeck_log("rdbg", "ACQUIRE seq=%u slot=%d first=%d img=%u/%u res=%s hist=%s",
+                          g_rdbg_seq, k, first, *img, g_nimg, vk_result_name(ar), rdbg_hist());
+            return 0;
+        }
         if (ar == VK_ERROR_DEVICE_LOST) { device_lost("acquire"); return -1; }
         if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_ERROR_SURFACE_LOST_KHR) {
             droiddeck_log("gpu", "screen surface %s on acquire: rebuilding the swapchain", vk_result_name(ar));
@@ -1630,6 +1676,17 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     VkImage scene_img = deep ? g_fgscene.img : g_scene.img;
     const VkFormat scene_fmt = deep ? FG_HDR_FMT : SCENE_FMT;
     const VkFilter blit_filter = vkp_effects_blit_filter();
+
+    g_rdbg_seq++;
+    g_rdbg_hist_n = 0; /* the history is this frame's acquires */
+    {
+        const int64_t now = perf_now();
+        droiddeck_log("rdbg", "FRAME seq=%u scene=%dx%d draws=%d pass=%d fx=%d fg=%d hdr=%d swap=%ux%u nimg=%u dt=%.1fms",
+                      g_rdbg_seq, scene_w, scene_h, n, pass, fx, fg, hf != NULL,
+                      g_extent.width, g_extent.height, g_nimg,
+                      g_rdbg_last_ns ? (double)(now - g_rdbg_last_ns) / 1e6 : 0.0);
+        g_rdbg_last_ns = now;
+    }
 
     VkCommandBuffer cmd = g_cmds[0];
     g_vk.ResetCommandBuffer(cmd, 0);
@@ -1866,6 +1923,8 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         const int64_t t_pres = perf_now();
         pr = g_vk.QueuePresentKHR(g_queue, &pi);
         perf_add(&g_perf.present_ns, &g_perf.present_max_ns, &g_perf.presents, perf_now() - t_pres);
+        droiddeck_log("rdbg", "PRESENT seq=%u slot=%d/%d img=%u res=%s",
+                      g_rdbg_seq, k, presents, img, vk_result_name(pr));
         if (k < ngen) presented_gen++;
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR || pr == VK_ERROR_DEVICE_LOST) break;
     }
@@ -1876,6 +1935,8 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
     }
     VkResult fr = timed_wait(g_fence, UINT64_MAX);
+    droiddeck_log("rdbg", "DONE seq=%u fence=%s presents=%d pr=%s drawn=%d imgs=%s",
+                  g_rdbg_seq, vk_result_name(fr), presents, vk_result_name(pr), drawn, rdbg_hist());
     if (fg) vkp_framegen_presented(presented_gen);
     if (fr == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {

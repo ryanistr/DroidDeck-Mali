@@ -609,8 +609,8 @@ class SessionService : Service() {
             guest.add("LIBGL_KOPPER_DRI2=true")
             Log.i(TAG, "GPU: Mali ${gpuInfo.name} (arch v${gpuInfo.arch}), using PanVK/Panfrost")
         } else if (isMali) {
-            // A generation this build cannot drive (v10 and newer submit through CSF, which the
-            // kbase layer here does not implement): software rendering, so the session still runs.
+            // A generation this build cannot drive has no backend to point at: software rendering,
+            // so the session still runs.
             guest.add("MESA_LOADER_DRIVER_OVERRIDE=llvmpipe")
             guest.add("GALLIUM_DRIVER=llvmpipe")
             guest.add("LIBGL_KOPPER_DRI2=true")
@@ -639,6 +639,13 @@ class SessionService : Service() {
         // its build, and with one per mode every emulator compiled its shaders twice.
         val linuxDriverId = SessionPrefs.linuxDriver(this)
         if (isMali) {
+            // A build that names other generations than this GPU's cannot drive it at all: say so
+            // here, where the log of a session that renders nothing gets read, not in a toast.
+            if (linuxDriverId.isNotEmpty() &&
+                !com.droiddeck.launcher.gpu.LinuxPanvkDriverManager(this).canDrive(linuxDriverId, gpuInfo.arch)) {
+                Log.w(TAG, "GPU: Mali ${gpuInfo.name} is Valhall v${gpuInfo.arch}, and the chosen PanVK " +
+                        "driver ($linuxDriverId) was built for other generations")
+            }
             com.droiddeck.launcher.gpu.LinuxPanvkDriver.resolveIcdPath(this, linuxDriverId)
                 ?.let { guest.add(com.droiddeck.launcher.gpu.LinuxPanvkDriver.ENV + "=" + it) }
         } else {
