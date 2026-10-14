@@ -1,6 +1,6 @@
 # Handoff: Steam Big Picture on DroidDeck (Mali G77 / X6739) — boot stall + frame ping-pong
 
-**Updated:** 2026-10-14 (§7.2c: the p6 driver + `PANVK_KBASE_DRI3=1` leaves the SHM path)
+**Updated:** 2026-10-14 (§7.2c/§7.2d: the p6 driver + `PANVK_KBASE_DRI3=1` leaves the SHM path; the ping-pong on that path is a frozen two-content ring)
 **Device:** Infinix GT 10 Pro `102562537K104189` — MT6893, Mali-G77 MC9, Android 16
 **Tool:** `python3 tools/droiddeckctl …` (run from `/mnt/project/DroidDeck`)
 **Report:** `docs/development/panvk-mali-g77-bringup.md` (driver bring-up). This file is the
@@ -23,6 +23,7 @@ Evidence tags used throughout: **[E]** = observed (command output, file:line, me
 | Root cause pinned to a layer? | **Yes: the guest.** All three gamescope output images are CPU-readable and were sampled directly; the compositor's output tracks its input. The compositor only draws what the guest hands it [E] |
 | Any verified fix? | **Partly — a mitigation, measured, with a measured hole.** The compositor content gate (§7.5) holds blank commits while a content frame is recent: gate on ⇒ spread **0.00**, gate off ⇒ **68.59** — but only while the stale frames are *dark*. When every ring image is `>= BLANK_MEAN` (the `85/67/67` regime) the gate is inert and the flicker survives (§7.5a) [E] |
 | Guest on the GPU present path? | **Yes, since p6 + `PANVK_KBASE_DRI3=1`** (`kbase_dmabuf=1 sw_device=0`, §7.2c): the WSI left MIT-SHM and the compositor draws ~57 frames/10 s where p5 drew 0. The ping-pong is unchanged by it, and Defect A still stalls until the §7.3 nudge [E] |
+| Ping-pong, measured on the GPU path | **A frozen two-content ring.** Exactly two screen states, differing only by a ~180 px vertical shift of one bright element; the present mode (mailbox vs fifo) does not change it; the three ring fds are frozen (stable statistics over 40 commits, period 3). The compositor draws what it is given — it ignores Wayland damage entirely (§7.2d) [E] |
 | Guest-side root cause | **Narrowed (§9.1a)**: *not* "one image never updates" — all three do. The guest presents its 3-image ring **continuously** while the images hold content from different moments, and it updates them only in **bursts of 1-2**, so the ring rarely converges [E] |
 | Current session | `2026-10-14-04-steam` on the released test build `test-0.3.3-mali-frame-gate-20261014` (installed `base.apk` sha256 `10f842416f842acdba9069dbfcee893dd063f347a26dcea5c85bc5c6171f0702`); gate left at its shipped default (on), `frame-probe` marker still in place [E] |
 | Device claim | `/mnt/project/X6739/Status.md` — claimed by Antigravity; handoff details recorded below. |
@@ -580,6 +581,47 @@ non-selecting D-pad nudges — the §7.3 nudge — and the same crop then read 1
 across 20 captures with `mean` spanning `71…151` (including a `mean=151 std=0 colors=146` frame and a
 `mean=150 std=68 colors=93061` frame). That is the §1 step-5 ping-pong window, now reachable with the
 GPU present path live. [E]
+
+### 7.2d Measured on the GPU path: the ping-pong is a frozen two-content ring
+
+Sessions `2026-10-14-40-steam` (installed build `e25c2cef`, whose `droiddeck-session` exports
+`PANVK_KBASE_DRI3=${PANVK_KBASE_DRI3:-1}`, so no override was involved) and `-41-steam` (same build,
+with `MESA_VK_WSI_PRESENT_MODE=fifo` in the session env) were measured while Steam sat on the
+startup movie's last frames — the state the user reported as *"the boot animation played up to the
+end, then it gets stuck with the DroidSpace icon going up and down"*.
+
+- Both sessions are off the SHM path: `kbase_dmabuf=1 sw_device=0`, `WSI_BLIT_SHM` and `XSHM_GATE`
+  at count 0, driver `…/linux_panvk_drivers/PanVK-rynx-1.2.0-p6/libvulkan_panvk.so`
+  (`2aa4f174…`), and no env override present. `PRESENT CREATE_ENTER … mode=1` (mailbox) on `-40`
+  becomes `mode=2` (fifo) on `-41`, so the env knob reached the guest. [E]
+- The compositor draws ~5.6 scenes/s (`1202 ticks, 56 scenes, 56 on screen` over 10 s): one draw per
+  guest commit. Zero `HOLD-BLANK` lines — the mean of every guest frame is 6-7, far below
+  `BLANK_MEAN` 40, so the §7.5 gate is **inert** in this regime. [E]
+- The screen alternates between **exactly two** states, and the present mode makes no difference:
+  8 s of screen recording gives mailbox `32 : 14` and fifo `18 : 10` (plus two near-duplicates
+  differing by one unit in a single grid band, i.e. the same two states). Frames were compared as a
+  12x12 luma grid, not by file hash: a lossy mp4 makes every frame's hash unique. [E]
+- The two states differ in **one** thing. Against a background of 0-18, a bright element (grid
+  values 45-191) sits two grid rows higher in one state than the other — **~180 px** — and every
+  other cell of the 12x12 grid is unchanged. That is the icon the user sees going up and down. [E]
+- The three ring images are **frozen**. Over 40 consecutive commits the same three fds recur on a
+  strict period of 3 with stable statistics each time — `fd=322 mean=7 hi=71/2170`,
+  `fd=323 mean=6 hi=68/2170`, `fd=324 mean=7 hi=71/2170`. So this is not a scene animating slowly:
+  the client is not rendering at all and keeps committing a ring whose slots hold two different
+  contents, two of the three carrying the same one (the 2:1 draw ratio above). [E]
+- The compositor is faithful: it draws whatever it is handed. `surface_damage` and
+  `surface_damage_buffer` are **empty stubs** (`compositor.c:1114`, `:1372`), so it cannot tell a
+  re-attached stale buffer from freshly rendered content even in principle today. [E: source]
+
+**What this means for a fix.** §7.5's mean-based gate cannot help here (both contents are mean 71 on
+screen, 6-7 in the guest's own frame), and a fingerprint-only dedupe is not sound either: "A,B,A,B"
+is exactly what a legitimate two-frame animation looks like, so freezing on a repeat would break real
+animations. Every signal that distinguishes them lives on the **client** side — whether the commit
+re-rendered anything — and the one channel that carries that, the Wayland damage region, is the one
+this compositor throws away. Capturing it (and logging it in the `framedbg` line) is the next
+measurement: if gamescope reports empty damage for the stale commits, "commit with no damage and a
+fingerprint already on screen" becomes a rule that is correct rather than a heuristic, and the
+10 s window with 56 commits and 0 new contents is a test case for it.
 
 ### 7.3 Defect A: don't rely on the movie being dismissed
 

@@ -9,6 +9,36 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-14 - Mali: the ping-pong on the GPU path is a frozen two-content ring
+
+- **Why:** the user still sees the defect ("the boot animation plays to the end, then the DroidSpace
+  icon goes up and down"), so the shipped knob was verified on device and the ping-pong re-measured
+  on the path the knob selects.
+- **The knob works with no override.** The rebuilt APK's own `droiddeck-session` gives
+  `kbase_dmabuf=1 sw_device=0` on a session started with an empty `env list`, and the session's log
+  names the imported `PanVK-rynx-1.2.0-p6` driver. No per-session override is needed any more.
+- **The ping-pong is exactly two screen states.** Comparing 8 s of screen recording as a 12x12 luma
+  grid (file hashes are useless: the mp4 is lossy, so every frame hashes differently) gives two
+  states that differ in one thing - a bright element ~180 px higher in one - and nothing else. The
+  present mode does not matter: mailbox `32:14`, fifo `18:10`.
+- **The ring is frozen, so the compositor is faithful.** Over 40 commits the same three fds recur on
+  a strict period of 3 with unchanged statistics each time: the client has stopped rendering and
+  keeps committing a ring whose slots hold two different contents. The §7.5 mean-based gate cannot
+  act here (every guest frame is mean 6-7 and the gate's floor is 40), and the compositor cannot
+  even see whether a commit re-rendered anything, because `surface_damage`/`surface_damage_buffer`
+  are empty stubs.
+- **What is left to measure:** whether the client reports Wayland damage on the stale commits. That
+  is the one signal that separates "re-attached stale buffer" from "freshly rendered content" and
+  therefore the only basis for a dedupe that is not a guess; it needs a build that records the
+  damage it is handed, then the same 10 s / 56-commit window is the test case.
+- **Lessons.** Verify the layer that is actually being blamed: "the compositor invents the blank
+  frame" was a hypothesis, and it is now falsified for this regime - the compositor draws what it is
+  handed. And do not hash screen recordings: measure a downsampled grid.
+
+---
+
+---
+
 ## 2026-10-14 - Mali: the kbase WSI leaves the SHM path at last, and the ping-pong is unchanged by it
 
 - **Why:** continue the frame ping-pong on the p6 driver, which carries both halves of the DRM
