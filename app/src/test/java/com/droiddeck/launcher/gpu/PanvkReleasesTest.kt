@@ -25,6 +25,33 @@ class PanvkReleasesTest {
     }
 
     @Test
+    fun theRetaggedLineIsReadTheSameWay() {
+        // p1-p6 were retagged from panvk-linux-g57-1.2.0-pN to PanVK-rynx-1.2.0-pN, with the asset
+        // renamed to carry the patch too. The old tags stay understood so a list cached before the
+        // retag still reads.
+        assertArrayEquals(intArrayOf(9), PanvkReleases.archsOf("PanVK-rynx-1.2.0-p3"))
+        assertArrayEquals(intArrayOf(9, 10, 11), PanvkReleases.archsOf("PanVK-rynx-1.2.0-p6"))
+        assertEquals(
+            PanvkReleases.lineOf("panvk-linux-g57-1.2.0-p4"),
+            PanvkReleases.lineOf("PanVK-rynx-1.2.0-p6"),
+        )
+    }
+
+    @Test
+    fun anAssetIsARuntimeHalfOnlyUnderItsOwnNames() {
+        // The bug this guards: every patch of the line shipped the same asset name, so
+        // PanvkReleases - which records a download by asset name - could not tell p6 from p4 and
+        // never offered the newer patch. The name carries the patch now.
+        assertTrue(PanvkReleases.isAsset("PanVK-rynx-1.2.0-p6.tzst"))
+        assertTrue(PanvkReleases.isAsset("panvk-linux-g57-1.2.0.tzst"))
+        assertFalse(PanvkReleases.isAsset("PanVK-rynx-1.2.0-p6.tzst.sha256"))
+        assertFalse(PanvkReleases.isAsset("panvk-p13-test.zip"))
+        assertTrue(PanvkReleases.isLinuxHalf("PanVK-rynx-1.2.0-p6.tzst"))
+        assertTrue(PanvkReleases.isLinuxHalf("panvk-linux-24.3.0.tzst"))
+        assertFalse(PanvkReleases.isLinuxHalf("panvk-android-24.3.0.tzst"))
+    }
+
+    @Test
     fun theOlderLinesAndTheBionicBuildCarryValhallV9() {
         assertArrayEquals(intArrayOf(9), PanvkReleases.archsOf("panvk-linux-24.3.0-p13"))
         assertArrayEquals(intArrayOf(9), PanvkReleases.archsOf("panvk-android-24.3.0"))

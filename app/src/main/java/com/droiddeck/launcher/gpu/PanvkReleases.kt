@@ -22,9 +22,16 @@ import java.net.URL
  * carries is not in its file name - it is in how it was built, so [archsOf] keeps what each
  * published line carries and every row says it.
  *
- * Every asset is a `.tzst` (zstd + tar). The runtime's half (`panvk-linux-*`, glibc) is what the
- * Steam client, its games and the desktop draw with; the display half (`panvk-android-*`, bionic)
- * is what the app's compositor puts the screen frame together with.
+ * Every asset is a `.tzst` (zstd + tar). The runtime's half is the glibc driver the Steam client,
+ * its games and the desktop draw with; it is named after the build's own code name,
+ * `PanVK-rynx-<version>-<patch>`, since the p1-p6 retag (older releases of that line are still
+ * `panvk-linux-g57-*`). The display half (`panvk-android-*`, bionic) is what the app's compositor
+ * puts the screen frame together with.
+ *
+ * The asset name, not the tag, is a download's identity: [installedId] records the build a download
+ * installed under that name, so a line that shipped the same file name for every patch could never
+ * offer a newer patch - which is exactly what `panvk-linux-g57-1.2.0.tzst` did until the releases
+ * were retagged with the patch in the name.
  */
 object PanvkReleases {
     /** The fork's own releases: tools/panvk/release.env pins what the apk ships from here. */
@@ -62,7 +69,7 @@ object PanvkReleases {
     internal fun archsOf(tag: String): IntArray {
         val t = tag.lowercase()
         return when {
-            t.startsWith("panvk-linux-g57-1.2.0-p") -> {
+            t.startsWith("panvk-rynx-1.2.0-p") || t.startsWith("panvk-linux-g57-1.2.0-p") -> {
                 val patch = t.substringAfterLast("-p").toIntOrNull() ?: 0
                 if (patch >= 4) intArrayOf(9, 10, 11) else intArrayOf(9)
             }
@@ -70,6 +77,24 @@ object PanvkReleases {
             t.startsWith("panvk-android-") -> intArrayOf(9)
             else -> IntArray(0)
         }
+    }
+
+    /**
+     * True for an asset this list offers at all: a PanVK `.tzst`. The `.sha256` beside it and the
+     * `.zip` test builds are not drivers.
+     */
+    internal fun isAsset(name: String): Boolean {
+        val n = name.lowercase()
+        return n.startsWith("panvk-") && n.endsWith(".tzst")
+    }
+
+    /**
+     * True for the glibc half the runtime draws with. It is `PanVK-rynx-*` since the p1-p6 retag and
+     * `panvk-linux-*` in releases published before it; the bionic half is `panvk-android-*`.
+     */
+    internal fun isLinuxHalf(name: String): Boolean {
+        val n = name.lowercase()
+        return n.startsWith("panvk-rynx") || n.startsWith("panvk-linux")
     }
 
     /**
@@ -109,13 +134,14 @@ object PanvkReleases {
     /**
      * The line a build belongs to. Patches of one line supersede each other (each is the previous
      * plus a fix), so only the newest of a line is offered - the way [TurnipReleases] offers the
-     * newest release of each variant: the G57 fork's 1.2.0 line, our own 24.3.0 line, and whatever
-     * bionic builds are published.
+     * newest release of each variant: the G57 fork's 1.2.0 line (retagged `PanVK-rynx-1.2.0-p<n>`,
+     * still `panvk-linux-g57-1.2.0-p<n>` in releases published before that), our own 24.3.0 line,
+     * and whatever bionic builds are published.
      */
     internal fun lineOf(tag: String): String {
         val t = tag.lowercase()
         return when {
-            t.startsWith("panvk-linux-g57-1.2.0") -> "panvk-linux-g57-1.2.0"
+            t.startsWith("panvk-rynx-1.2.0") || t.startsWith("panvk-linux-g57-1.2.0") -> "panvk-rynx-1.2.0"
             t.startsWith("panvk-linux-24.3.0") -> "panvk-linux-24.3.0"
             t.startsWith("panvk-android-") -> "panvk-android"
             else -> t
@@ -135,10 +161,10 @@ object PanvkReleases {
             for (j in 0 until list.length()) {
                 val a = list.getJSONObject(j)
                 val name = a.getString("name")
-                if (!name.startsWith("panvk-") || !name.endsWith(".tzst")) continue
+                if (!isAsset(name)) continue
                 // Only assets GitHub has a sha256 for are offered: the download is checked against it.
                 val sha = Hashes.githubSha256(a.optString("digest")) ?: continue
-                val linux = name.startsWith("panvk-linux-")
+                val linux = isLinuxHalf(name)
                 // Newest first, so the first release carrying a line is the one offered.
                 if (!seen.add("${lineOf(tag)}|$linux")) continue
                 val archs = archsOf(tag)

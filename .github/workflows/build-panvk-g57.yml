@@ -9,7 +9,7 @@ name: Build PanVK (Mali-G57 fork)
 # requires through VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf /
 # VK_KHR_external_semaphore_fd.
 #
-# Published as an asset the apk build fetches (tools/panvk-g57/release.env names the tag and sha).
+# Published as an asset the apk build fetches (tools/panvk/release.env names the tag and sha).
 on:
   push:
     paths:
@@ -22,7 +22,7 @@ on:
         required: false
         default: '1.2.0'
       tag:
-        description: 'Release tag to publish as (e.g. panvk-linux-g57-1.2.0-p1); empty = artifact only'
+        description: 'Release tag to publish as (e.g. PanVK-rynx-1.2.0-p7); empty = artifact only'
         required: false
         default: ''
 
@@ -66,7 +66,7 @@ jobs:
       - name: Name the build after its tag
         # The driver names itself "PanVK-rynx-<version>-<patch>", the code name that tells this
         # fork's build apart from any other PanVK package, and the patch is the tag's own suffix
-        # (panvk-linux-g57-1.2.0-p5 -> p5). Nothing is exported for a push build, which publishes
+        # (a tag ending -p5 -> p5). Nothing is exported for a push build, which publishes
         # no release and so has no tag.
         env:
           TAG: ${{ inputs.tag }}
@@ -87,17 +87,17 @@ jobs:
           bash tools/panvk-g57/build-panvk-g57.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: panvk-linux-g57
+          name: panvk-rynx
           path: |
-            panvk-linux-g57-*.tzst
-            panvk-linux-g57-*.tzst.sha256
+            PanVK-rynx-*.tzst
+            PanVK-rynx-*.tzst.sha256
       - name: Publish
         if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "PanVK-rynx-${PANVK_G57_VERSION:-1.2.0}${PANVK_G57_PATCH:+-$PANVK_G57_PATCH} - the Mali-G57 fork's glibc PanVK (Valhall v9 JM + v10/v11 CSF on its own kbase driver), staged by the apk into linuxfs/usr/lib. sha256 $(cut -d' ' -f1 panvk-linux-g57-*.tzst.sha256)" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" panvk-linux-g57-*.tzst panvk-linux-g57-*.tzst.sha256 --clobber
+          gh release create "${{ inputs.tag }}" --latest=false --prerelease=false --title "${{ inputs.tag }}" --notes "PanVK-rynx-${PANVK_G57_VERSION:-1.2.0}${PANVK_G57_PATCH:+-$PANVK_G57_PATCH} - the Mali-G57 fork's glibc PanVK (Valhall v9 JM + v10/v11 CSF on its own kbase driver), staged by the apk into linuxfs/usr/lib. sha256 $(cut -d' ' -f1 PanVK-rynx-*.tzst.sha256)" PanVK-rynx-*.tzst PanVK-rynx-*.tzst.sha256 || gh release upload "${{ inputs.tag }}" PanVK-rynx-*.tzst PanVK-rynx-*.tzst.sha256 --clobber
           # A component the apk fetches by tag, never something users install: it must not become
           # the repo's Latest release or appear as a pre-release, also when re-uploaded.
           gh release edit "${{ inputs.tag }}" --latest=false --prerelease=false

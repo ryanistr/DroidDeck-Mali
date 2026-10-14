@@ -221,11 +221,11 @@ jobs:
           fi
           if [ -f tools/panvk/release.env ]; then
             . tools/panvk/release.env
-            gh release download "${PANVK_TAG}" -R "${PANVK_REPO:-${GITHUB_REPOSITORY}}" -p 'panvk-linux-*.tzst' -O panvk-linux.tzst
-            echo "${PANVK_SHA256}  panvk-linux.tzst" | sha256sum -c -
-            tar --use-compress-program=unzstd -xf panvk-linux.tzst -C "$D"
+            gh release download "${PANVK_TAG}" -R "${PANVK_REPO:-${GITHUB_REPOSITORY}}" -p 'PanVK-rynx-*.tzst' -O panvk-rynx.tzst
+            echo "${PANVK_SHA256}  panvk-rynx.tzst" | sha256sum -c -
+            tar --use-compress-program=unzstd -xf panvk-rynx.tzst -C "$D"
             test -f "$D/usr/lib/libvulkan_panvk.so"
-            rm panvk-linux.tzst
+            rm panvk-rynx.tzst
           fi
           . tools/linuxfs/uruntime.env
           curl -fsSL --retry 3 -o uruntime "https://github.com/VHSgunzo/uruntime/releases/download/${URUNTIME_VERSION}/${URUNTIME_ASSET}"

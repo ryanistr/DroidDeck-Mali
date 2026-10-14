@@ -177,8 +177,8 @@ fi
 # PanVK driver for Mali GPUs (glibc)
 if [[ -f "${repo_root}/tools/panvk/release.env" ]]; then
     . "${repo_root}/tools/panvk/release.env"
-    panvk_archive=$(cached "${PANVK_SHA256}" panvk-linux.tzst \
-        bash -c 'gh release download "$0" -R "$1" -p panvk-linux-*.tzst -O "$out"' "${PANVK_TAG}" "${PANVK_REPO:-${github_repo}}")
+    panvk_archive=$(cached "${PANVK_SHA256}" panvk-rynx.tzst \
+        bash -c 'gh release download "$0" -R "$1" -p "PanVK-rynx-*.tzst" -O "$out"' "${PANVK_TAG}" "${PANVK_REPO:-${github_repo}}")
     zstd -dc "${panvk_archive}" | tar -xf - -C "${linuxfs_dir}"
     test -f "${linuxfs_dir}/usr/lib/libvulkan_panvk.so"
 fi

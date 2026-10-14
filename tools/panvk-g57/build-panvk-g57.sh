@@ -10,12 +10,12 @@
 # needs no libpanvk_kbase_jm.so beside it. Its CSF backends (v10 for a G610, v11 for a G615/G715)
 # come from the same build and the patches in tools/panvk-g57/patches/.
 #
-# Built natively on an arm64 runner. Outputs: panvk-linux-g57-<VERSION>.tzst + .sha256
+# Built natively on an arm64 runner. Outputs: PanVK-rynx-<VERSION>[-<patch>].tzst + .sha256
 set -euxo pipefail
 
 VERSION=${PANVK_G57_VERSION:-1.2.0}
 # The published patch level, so the driver names itself the way its tag does
-# (panvk-linux-g57-1.2.0-p5 -> PanVK-rynx-1.2.0-p5). Empty for an unreleased build.
+# (a tag ending in -p5 -> PanVK-rynx-1.2.0-p5). Empty for an unreleased build.
 PATCH=${PANVK_G57_PATCH:-}
 CODENAME="PanVK-rynx-$VERSION${PATCH:+-$PATCH}"
 G57_REPO=${PANVK_G57_REPO:-https://github.com/apexspan-svg/mesa-panvk-mali-g57.git}
@@ -128,6 +128,9 @@ cat > "$WORK/out/meta.json" <<META
 META
 
 cd "$WORK/out"
-tar --use-compress-program="zstd -19" -cf "$WORK/panvk-linux-g57-$VERSION.tzst" usr meta.json
-sha256sum "$WORK/panvk-linux-g57-$VERSION.tzst" > "$WORK/panvk-linux-g57-$VERSION.tzst.sha256"
-ls -l "$WORK/panvk-linux-g57-$VERSION.tzst"*
+# The asset carries the patch, not just the version: the app records which build a download
+# installed by asset name, so a line whose every patch shipped the same file name could never
+# offer the next patch. PanVK-rynx-1.2.0-p5.tzst and ...-p6.tzst are two different downloads.
+tar --use-compress-program="zstd -19" -cf "$WORK/$CODENAME.tzst" usr meta.json
+sha256sum "$WORK/$CODENAME.tzst" > "$WORK/$CODENAME.tzst.sha256"
+ls -l "$WORK/$CODENAME.tzst"*

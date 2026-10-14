@@ -1070,7 +1070,9 @@ A driver that only says "Built-in" cannot be compared against anything.
 in the driver list and the device report's `Linux driver (PanVK)` line show it.
 
 The workflow derives the patch in its own step and exports `PANVK_G57_PATCH` through `$GITHUB_ENV`;
-the release note uses the same code name.
+the release note uses the same code name. The release *tag*, its title and the *asset* name did not
+carry it until §23 - they stayed `panvk-linux-g57-1.2.0-pN` / `panvk-linux-g57-1.2.0.tzst`, which
+is what broke the app's update check.
 
 ### 20.5 What this does not yet do
 
@@ -1321,3 +1323,41 @@ xid: 0xc00002`.
 The proper fix is to let the guest's `pacman` finish the upgrade, or to reinstall the runtime; the
 symlink is a stopgap that a runtime reinstall replaces. Do not read the ping-pong findings from
 sessions 26-33: none of them ever got a Steam UI.
+
+## 23. The release name was not the driver's name - retagged 2026-10-14
+
+### 23.1 What was wrong
+
+`tools/panvk-g57/build-panvk-g57.sh` has named its output `PanVK-rynx-<version>-<patch>` inside
+`meta.json` since §20.4, but the *release* and the *asset* never carried that name: every patch went
+up as tag `panvk-linux-g57-1.2.0-pN` with the file `panvk-linux-g57-1.2.0.tzst`. p1 through p6 are
+six releases with six different drivers and one asset name.
+
+### 23.2 Why that broke the app's update check
+
+`PanvkReleases.recordDownload` records which build a download installed, keyed by the **asset name**,
+and `installedId` looks the same key up again. Two releases sharing a name share the key: a download
+of p4's asset is remembered as `panvk-linux-g57-1.2.0.tzst -> <installed p4 id>`, so when p5 and p6
+are published under the same name the list reads them as already installed and offers nothing. The
+check therefore reported no update - which is what "the app can no longer detect the driver updates"
+was. The name has to carry the patch, not just the tag.
+
+### 23.3 The rename
+
+- Asset: `PanVK-rynx-1.2.0-pN.tzst` (+ `.tzst.sha256`), written by the build script from the same
+  `CODENAME` its `meta.json` uses.
+- Release tag and title: `PanVK-rynx-1.2.0-pN`.
+- p1-p6 were retagged and their assets re-uploaded under the new names, so the line is consistent
+  from p1 onward. `release.env` re-pins `PANVK_TAG=PanVK-rynx-1.2.0-p6`, its sha256 unchanged: the
+  bytes were never touched, only the name they are published under.
+- The fetch points follow: `tools/build_local.sh` and `.github/workflows/build.yml` download
+  `PanVK-rynx-*.tzst`.
+- `PanvkReleases` reads both families - `panvk-rynx-*` and the older `panvk-linux-*` - so a list
+  cached before the retag still reads, and `lineOf` puts them in one line so the newest patch still
+  supersedes.
+
+### 23.4 Not measured
+
+The app's update check has not been run against the retagged releases on device; what is verified is
+the parse (`PanvkReleasesTest`) and the release page itself.
+

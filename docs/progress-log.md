@@ -9,6 +9,27 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-14 - Mali: the release name was not the driver's name, and the app couldn't see a new patch
+
+- **Why:** every patch of the G57 line was published as the same asset, `panvk-linux-g57-1.2.0.tzst`,
+  under a tag that carried the patch. The driver named itself `PanVK-rynx-1.2.0-pN` in its
+  `meta.json`, but nothing else did, and the app's driver check stopped offering new patches.
+- **The check had a real cause, not a UI glitch.** `PanvkReleases` records a download and looks it up
+  by **asset name**; two releases sharing a name share the key, so a download of p4's asset made p5
+  and p6 read as already installed. The name has to carry the patch, not only the tag. (Bringup §23.)
+- **Renamed end to end.** The build script writes `PanVK-rynx-<version>-<patch>.tzst` from the same
+  CODENAME its `meta.json` uses; the release tag and title match it, and p1-p6 were retagged and
+  their assets re-uploaded. `release.env` re-pins `PanVK-rynx-1.2.0-p6` with the p6 sha256 unchanged
+  (renaming a file does not change its bytes), and both fetch points - `tools/build_local.sh` and
+  `.github/workflows/build.yml` - download `PanVK-rynx-*.tzst`.
+- **The app reads both families.** `PanvkReleases` accepts `PanVK-rynx-*` and the older
+  `panvk-linux-*` and keeps them on one line so the newest patch supersedes; `PanvkReleasesTest`
+  pins both the parse and the half-detection.
+- **Still unmeasured:** the ping-pong frame handoff, and the update check against the retagged
+  releases on device (the parse and the release page are what is verified).
+
+---
+
 ## 2026-10-14 - Mali: 0005 was inert without 0008, and the guest rootfs was half-upgraded underneath
 
 - **Why:** pin the published PanVK build, rebuild, test on the X6739, and continue on the frame
