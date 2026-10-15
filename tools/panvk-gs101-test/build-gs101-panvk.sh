@@ -61,7 +61,15 @@ ours)
     for p in "$WORK/tools/panvk-g57/patches"/*.patch; do
         patch -p1 --no-backup-if-mismatch < "$p" || true
     done
-    apply_set
+    # Only 0003 goes on top, and that is the whole point of this arm: 0004/0005 are a v9 JM backend
+    # and its draws, which this fork already has (applied blindly they do NOT merge - they hit
+    # sibling code that moved, giving `heap_templ has no member`, `too many arguments to
+    # panvk_cmd_draw` and `#endif without #if`). 0001/0002 are model-table rows this fork already
+    # carries for G77. The claim under test is only about transaction elimination, which is 0003.
+    echo "== applying 0003 only (the transaction-elimination change) on top of the fork"
+    patch -p1 --no-backup-if-mismatch < "$PATCHDIR/0003-panfrost-disable-transaction-elimination-on-G78.patch" || true
+    python3 "$WORK/tools/panvk-gs101-test/set-no-crc-quirk.py" src/panfrost/model/pan_model.c
+    grep -n "no_crc" src/panfrost/model/pan_model.c || true
     ;;
 *)
     echo "unknown GS101_ARM=$ARM" >&2; exit 2;;
@@ -74,13 +82,15 @@ esac
 if [ "$ARM" = "gsl" ] || [ "$ARM" = "gsl+fix" ]; then
     # gs101's own patches are written against gallium panfrost being built (0003 patches
     # gallium/drivers/panfrost/pan_resource.c), so build both drivers here, unlike our fork's script.
+    # llvm must stay ENABLED: gallium panfrost needs CLC, and meson refuses -Dllvm=disabled with
+    # "Feature llvm cannot be enabled: CLC requires LLVM" (first run of this arm failed on exactly
+    # that, not on the patches).
     meson setup builddir \
         -Dbuildtype=release \
         -Dvulkan-drivers=panfrost \
         -Dgallium-drivers=panfrost \
         -Dplatforms=wayland,x11 \
         -Ddebug=false -Dbuild-tests=false \
-        -Dllvm=disabled \
         -Dprefix=/usr -Dlibdir=lib
 else
     meson setup builddir \
