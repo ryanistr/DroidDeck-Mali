@@ -43,7 +43,7 @@ jobs:
             libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev \
             libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-keysyms1-dev \
             libxfixes-dev libxrandr-dev libxshmfence-dev libxxf86vm-dev \
-            libglvnd-dev libegl-dev libgles-dev \
+            libglvnd-dev libegl-dev libgles-dev libxcb-glx0-dev libxcb-util-dev \
             python3-mako python3-ply python3-yaml python3-packaging \
             libelf-dev zlib1g-dev libzstd-dev libexpat1-dev \
             bison flex zstd libdisplay-info-dev libudev-dev wayland-protocols >/dev/null
