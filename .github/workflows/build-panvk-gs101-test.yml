@@ -1,0 +1,83 @@
+name: Build PanVK gs101 experiment
+
+# EXPERIMENT ONLY. Builds PanVK from m8l8th814n-eng/mesa-gs101's driver-side patches (no kernel
+# patches) to settle by measurement whether that tree fixes this fork's frame ping-pong. Its stated
+# symptom is stale tiles from CRC-based write-back skip ("transaction elimination"), which is a
+# gallium panfrost (GL) mechanism; the guest here renders through PanVK, where no such code exists,
+# and this fork's build has -Dgallium-drivers= empty. Two arms:
+#   gsl     - pure upstream Mesa at the gs101 tree's own base + their patches (nothing of ours)
+#   gsl+fix - same, but sets the no_crc quirk their own patch reads and never sets (it is inert)
+#   ours    - our Mali-G57 fork v1.2.0 + our patches, then theirs on top
+# Nothing here publishes a release or touches tools/panvk/release.env; results are artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      arm:
+        description: 'Which tree to build'
+        required: true
+        default: 'gsl'
+        type: choice
+        options: [gsl, gsl+fix, ours]
+      tag:
+        description: 'Optional release tag to publish as (omit for artifact only)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            git ninja-build pkg-config patch \
+            libwayland-dev libwayland-egl-backend-dev \
+            libdrm-dev libx11-dev libxext-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-keysyms1-dev \
+            libxfixes-dev libxrandr-dev libxshmfence-dev libxxf86vm-dev \
+            libglvnd-dev libegl-dev libgles-dev \
+            python3-mako python3-ply python3-yaml python3-packaging \
+            libelf-dev zlib1g-dev libzstd-dev libexpat1-dev \
+            bison flex zstd libdisplay-info-dev libudev-dev wayland-protocols >/dev/null
+          sudo apt-get install -y -qq --no-install-recommends \
+            llvm-18-dev libclang-18-dev libclc-18-dev libllvmspirvlib-18-dev spirv-tools >/dev/null
+      - name: Install meson
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages -U 'meson>=1.4'
+          meson --version
+      - name: Build (gs101 patches, no kernel patches)
+        env:
+          GS101_ARM: ${{ inputs.arm || 'gsl' }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          bash tools/panvk-gs101-test/build-gs101-panvk.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: panvk-gs101-experiment
+          path: |
+            panvk-gs101-*.tzst
+            panvk-gs101-*.tzst.sha256
+            out-gs101-*/meta.json
+          if-no-files-found: warn
+      - name: Publish (only when a tag was given)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ inputs.tag }}" --latest=false --prerelease=true \
+            --title "${{ inputs.tag }} (gs101 experiment)" \
+            --notes "EXPERIMENT: PanVK built from m8l8th814n-eng/mesa-gs101 driver patches (arm ${{ inputs.arm }}), no kernel patches. Not for shipping." \
+            panvk-gs101-*.tzst panvk-gs101-*.tzst.sha256 || \
+          gh release upload "${{ inputs.tag }}" panvk-gs101-*.tzst panvk-gs101-*.tzst.sha256 --clobber
