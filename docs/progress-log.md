@@ -7,7 +7,120 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
+## 2026-10-15 - Mali: the gs101 "ping pong fix" patch set was built and run — it cannot drive this GPU
+
+- **Outcome first: it does not work, and now that is measured rather than argued.** The
+  `m8l8th814n-eng/mesa-gs101` tree that "someone already fixed the ping pong" was built two ways as a
+  driver (pure upstream at its own base commit + its patches; and our fork + its TE patch) and one of
+  them was installed on the device. The guest dies before it draws:
+  `vkCreateInstance failed (VkResult: -9)` = `VK_ERROR_INCOMPATIBLE_DRIVER`, then gamescope
+  `Assertion 'instance' failed` → `Aborted (core dumped)`, session `FAILED`/`GUEST_EXIT`/`134`.
+- **Why**: their driver has **no kbase backend** (artifact is a single `libvulkan_panvk.so`,
+  19,249,456 bytes, no `libpanvk_kbase_jm.so`; `kbase`/`mali0` occur 0 times in the binary). It only
+  speaks the panfrost DRM driver — which is exactly the half of their work that patches
+  `drivers/gpu/drm/panfrost` and **cannot apply** to a device running ARM's `mali_kbase` at
+  `/dev/mali0`. Drop the kernel patches, as asked, and nothing can reach the GPU.
+- **Our own tree gains nothing either**: applying their `0003` to the fork leaves the binary
+  **byte-identical to the shipped p6 driver** (`dafd269e…`) — its `pan_model.h` hunk fails, so the
+  quirk is never declared, and its other hunk lands in gallium, which this build does not compile.
+- **Two build traps cost a CI run each** (both in §27): gallium panfrost links GLX
+  (`Dependency "xcb-glx" not found` → needs `libxcb-glx0-dev`), and `-Dllvm=disabled` is refused with
+  `CLC requires LLVM`.
+- Net: the ping-pong/stale-content defect is still ours to fix on the present path (§26), not
+  something a better panfrost patch set can hand us. Scaffolding kept in `tools/panvk-gs101-test/`
+  (experiment only, never in `release.env`); device driver restored to p6 and md5-verified.
+
 ---
+
+## 2026-10-15 - Mali: a compositor hold by buffer content identity was tried and REVERTED
+
+- **Outcome first: it is not in the tree.** The hold was implemented, measured, and taken back out
+  after a live test showed it turns the ping-pong into a *freeze* - the screen stops updating at all,
+  which is a worse bug than the one it was meant to fix. Session `-16-steam` on that build measured
+  `commits 41 held-same 14 held-blank 27` and `commits 46 held-same 15 held-blank 31`: **every** guest
+  commit held while the compositor kept rendering 41-46 scenes/s from the buffer it already had - a
+  live render loop over a frozen picture, which is exactly the user's "stops at a blackscreen and never
+  updates until I press a button". The drawn-commit generation `gen` stopped advancing: `184 -> 184`
+  across 20 s of real input.
+- **The "fix that works" in the previous revision of this entry was a misread.** The counters were
+  right (90-97% held with the rule on, 0% with the marker, one build, one session); holding 90-97% of
+  the guest's presents is not progress, it is the failure. A high `held` share is now the *bug*
+  signature, and these attempts are judged by whether `gen` advances under input.
+- **Why the rule cannot work.** `drawn_fp` asks "has this buffer's content changed since I last drew
+  it" - but the guest re-presents its ring with unchanged contents as a matter of course, so during the
+  rotation the answer is *no* for every slot. The compositor has no channel that says which slot the
+  client means as current: damage is a constant (`1 / 0x3FFFFFFF00000001`, 724 commits of `-08`, so
+  gamescope marks the whole surface damaged every time) and content identity is identical by
+  construction. A fix has to come from the guest, or from not treating the ring as three
+  interchangeable frames.
+- **Reverted and re-verified.** With the compositor byte-identical to HEAD, hot-swapped and md5-checked,
+  session `-17-steam` shows `held` gone and `gen` advancing again (`171 -> 314 -> 627` under input),
+  with the ring's two contents alternating on screen (`8c43d86c` / `0bf7c651`). That alternation is the
+  ping-pong, still unfixed - but a freeze is not an improvement on it.
+- **Also run down and rejected in this session: the panfrost transaction-elimination route**
+  (`m8l8th814n-eng/mesa-gs101`, "someone already fixed the ping pong"). Its symptom is *stale tiles*
+  from CRC-based write-back skip, on the upstream **panfrost DRM** driver + gallium GL
+  (`pan_resource.c`). Not our mechanism: our device binds no panfrost DRM driver (we run `mali_kbase`
+  at `/dev/mali0`) and the guest renders through **PanVK**, which has no CRC/TE path - across all five
+  of its Mesa patches, `wsi`/`swapchain`/`dri3`/`damage`/`gbm`/`kbase`/`mali0` occur **0 times**. Its
+  patch `0003` is inert as written (reads `quirks.no_crc`, nothing ever sets it true), and its
+  `0004`/`0005` are compute-only/clear-only with draws stubbed, i.e. behind our p6 build.
+- **Two measurement traps that cost real rounds.** (1) `magick ... -delete 0` deletes the only image,
+  so every frame hashes to the empty-string md5 `d41d8cd9` and *every* A/B reads "1 state" - the crop
+  form is `-crop 2200x1080+0+0 +repage gray:-`, no `-delete`. (2) A dead session leaves focus on
+  `com.transsion.launcher3`, so one whole run measured the Android home screen; check `mCurrentFocus`
+  before hashing captures.
+
+---
+
+## 2026-10-15 - Mali: the knob that makes the screen draw is the knob that kills the GL clients
+
+- **Why:** the previous entry left "the knob works" and "the ping-pong is a frozen ring" standing, so
+  the next step was §7.2d's damage capture. Checking what the knob actually buys first showed it buys
+  a dilemma, so the capture is still pending.
+- **The A/B, one build (`58a827ad`), three sessions.** With `PANVK_KBASE_DRI3=1` (the shipped
+  default) the WSI reads `kbase_dmabuf=1 sw_device=0`, the screen draws - and every GL/X11 client
+  dies: `XSHM_GATE dri3=0 present=1 wants_shm=0`, then `MESA: info: vulkan: No DRI3 support detected
+  - required for presentation`, `MESA: error: zink: could not create swapchain` and
+  `X Error of failed request:  GLXBadCurrentWindow`. With the knob set to `0` for one session the
+  WSI reads `kbase_dmabuf=0 sw_device=1`, every one of those lines is gone - and the compositor
+  presents nothing (`0 on screen` against ~70 `GPU frames from games`). Neither arm emitted
+  `session.ready`.
+- **It is a dichotomy in the driver, not a tuning problem.** `wsi_common_x11.c:246` computes
+  `wants_shm` from the `sw` flag that `panvk_wsi.c:142` sets to `!kbase_dmabuf`. So the flag does not
+  merely pick a transport: `kbase_dmabuf=1` disables MIT-SHM presentation and makes DRI3 mandatory,
+  and the guest X has no DRI3 because it has no glamor (`Failed to initialize glamor, falling back
+  to sw`), even though `droiddeck-session:311` still exports `XWAYLAND_NO_GLAMOR=1`.
+- **The export is not uniform.** In `-03-steam`, `session.log` read `kbase_dmabuf=1 sw_device=0`
+  while `steam/steamwebhelper.log` read `kbase_dmabuf=0 sw_device=1`, followed by
+  `MESA-EGL: warning: DRI3 error: Could not get DRI3 device` and
+  `ANGLE Display::initialize error 12289: Could not create GL context`. CEF is launched
+  ANGLE-on-Vulkan precisely so it needs no Xwayland GL (`b8c26d7f`), so this is a new failure and the
+  newest blocker on the client UI. Why the helper misses the export is not yet determined.
+- **The client UI is on SwiftShader.** The guest's `logs/webhelper_gpu.txt` reports
+  `DRIVER_VENDOR=SwANGLE`, `[ GL implementation parts ]: (gl=egl-angle,angle=swiftshader)`,
+  `[ Display type ]: ANGLE_SWIFTSHADER`,
+  `Cannot create an OpenGL ES platform on GLX without the GLX_ARB_create_context extension`, and
+  `dri3 extension not supported`. So `-cef-force-gpu -cef-use-angle=vulkan` is not buying hardware
+  Big Picture: CEF rasterizes on the CPU. That is the likeliest cause of the user's lag and the
+  ~5 fps UI, and the named reason is the same missing glamor as everything else here.
+- **The reason is a switch this tree throws.** Xwayland logs `Disabling glamor and dri3 support,
+  XWAYLAND_NO_GLAMOR is set` (twice, one per instance), and that export is
+  `droiddeck-session:311`, unconditional. So every GL client here is asked to present to an X server
+  that has been told to turn DRI3 off, and the `kbase_dmabuf=1` present path the knob selects cannot
+  work against it. The bringup doc's header records removing that export once yielding `READY` +
+  `firstFrame: True` + a live `-cef-force-gpu`, so that is the next experiment. It needs an APK build:
+  the app re-stages session scripts at every session start, so an in-place edit reverts within
+  seconds.
+- **Two testing obstacles.** The app re-downloads the whole Steam client when it believes the client
+  started twice without showing anything, and it only records the repair when it finishes, so a
+  session killed mid-download repeats it. The download is real but slow (~170 KB/s measured; one
+  `bins_linuxarm64_linuxarm64.zip` reached 80 MB before the device died).
+- **The device rebooted** mid-session (`uptime` 1 min, load average 37.9) and the app wrote
+  `ended-without-teardown.txt` for it. Order sessions by `droiddeckctl state`, not by mtimes.
+
+---
+
 
 ## 2026-10-14 - Mali: the ping-pong on the GPU path is a frozen two-content ring
 
@@ -37,7 +150,6 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
----
 
 ## 2026-10-14 - Mali: the kbase WSI leaves the SHM path at last, and the ping-pong is unchanged by it
 
@@ -73,7 +185,6 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
----
 
 ## 2026-10-14 - Mali: the release name was not the driver's name, and the app couldn't see a new patch
 
@@ -135,7 +246,6 @@ the timeline, then lessons and backlog. Companion to the README (what the app *d
 
 ---
 
----
 
 ## 2026-10-14 - Mali: one rynx build already carries v9 JM and CSF, and the CSF fork's register file is merged in
 

@@ -1402,3 +1402,239 @@ device can be shown to have run the published p6 bytes. It can:
   `kbase_dmabuf=0 sw_device=1`. Read the session's own `== vulkan driver:` line before comparing
   any two sessions. [E]
 
+## 25. `kbase_dmabuf=1` requires DRI3, and the guest X has none (measured 2026-10-15)
+
+§7.2c of `ping-pong-frame-handoff.md` established that `PANVK_KBASE_DRI3=1` - now the shipped
+default in `droiddeck-session` - is what makes the compositor draw the guest's frames at all. This
+section records the other half of that trade, measured on sessions `-01`, `-02` and `-03` under one
+installed build (`58a827ad`):
+
+- **The present path is a dichotomy by construction.** `panvk_wsi.c:142` passes
+  `sw_device = !ahb_wsi && uses_kbase && !kbase_dmabuf` into `wsi_device_init`, and
+  `wsi_common_x11.c:246` derives
+  `wants_shm = wsi_dev->sw && !(WSI_DEBUG & WSI_DEBUG_NOSHM) && wsi_dev->has_import_memory_host`
+  (that last flag is set unconditionally for a kbase device). So `kbase_dmabuf=1` gives `sw=0`,
+  hence `wants_shm=0`: X11 presentation may no longer use MIT-SHM and goes down the DRI3 route.
+  `wsi_x11_check_for_dri3()` (`wsi_common_x11.c:423`) then logs
+  `MESA: info: vulkan: No DRI3 support detected - required for presentation` and returns false, so
+  every swapchain and present on that path fails. [E: source]
+- **The guest X has no DRI3, so the DRI3 route cannot work.** Session `-01-steam` (no override, so
+  the script's `${PANVK_KBASE_DRI3:-1}` applied) reads `kbase_dmabuf=1 sw_device=0` and then, twice
+  each and verbatim:
+
+  ```
+  PANVKDBG XSHM_GATE dri3=0 present=1 wants_shm=0
+  MESA: info: vulkan: No DRI3 support detected - required for presentation
+  MESA: error: zink: could not create swapchain
+  X Error of failed request:  GLXBadCurrentWindow
+  ```
+
+  with four `pEngineName: mesa zink` instances. The session never emitted `session.ready`: it sat in
+  `STARTING_STEAM` with `firstFrame: false` until it was stopped. [E]
+- **Turning the knob off removes those failures but presents nothing.** Session `-02-steam`, same
+  build, started with `droiddeckctl env set PANVK_KBASE_DRI3=0` (one session only), reads
+  `kbase_dmabuf=0 sw_device=1` and has **zero** occurrences of `zink`, `No DRI3 support` and
+  `XSHM_GATE`. It did get as far as opening `"Steam Big Picture Mode" (gamescope) 1600x720 at 0,0`
+  and logging `[vulkan] … is presenting GPU frames through Wayland: 1600x720, format XR24, linear`,
+  yet every `[perf]` line reads `0 on screen (copy 0, zero-copy 0, layer copy 0)` against ~70
+  `GPU frames from games`, and it also never emitted `session.ready`. That 0-on-screen reading is
+  exactly what p5 gave in session `-34` (§7.2c). [E]
+- **So `XSHM_GATE` is a per-process marker of which path was taken**, not a per-frame log: `-01` has
+  it twice, `-02` not at all. [E]
+- **gamescope and steamwebhelper do not agree on the knob.** Session `-03-steam` (no override) reads
+  `kbase_dmabuf=1 sw_device=0` in `session.log`, but its `steam/steamwebhelper.log` reads
+  `kbase_dmabuf=0 sw_device=1` and is followed by
+  `MESA-EGL: warning: DRI3 error: Could not get DRI3 device` and
+  `ANGLE Display::initialize error 12289: Could not create GL context`. The export does not reach
+  CEF's helper. Whether that is an environment filter in Steam's own launcher or
+  `kbase_kmod_supports_dmabuf()` returning false there is **not yet determined** [H]. CEF is
+  launched `-cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan`
+  (`droiddeck-session:1024`, from `b8c26d7f`, "allow CEF GPU acceleration without Xwayland glamor"),
+  so ANGLE-on-Vulkan is meant to need no Xwayland GL - yet it failed here, which makes this the
+  newest blocker on the client UI and a regression against the §7.2c pass. [E]
+- **The guest X is deliberately given neither glamor nor DRI3, and Xwayland says so itself.** Session
+  `-05-steam` logs, twice (gamescope starts two Xwayland instances):
+
+  ```
+  [gamescope] [Info] wlserver: [xwayland/server.c:108] Starting Xwayland on :0
+  Disabling glamor and dri3 support, XWAYLAND_NO_GLAMOR is set
+  Failed to initialize glamor, falling back to sw
+  ```
+
+  `XWAYLAND_NO_GLAMOR=1` is exported unconditionally by `droiddeck-session:311`, so this is a switch
+  the project throws, not a device limitation. It is the single cause behind everything above: no
+  glamor means no `GLX_ARB_create_context` (why ANGLE's GLX backend dies), no DRI3 (why zink's
+  swapchain dies, why CEF logs `dri3 extension not supported`, and why the `kbase_dmabuf=1` present
+  path cannot work), and therefore SwiftShader for the client UI. [E]
+- **Dropping the export is therefore the next experiment**, and it is worth doing on the Xwayland
+  line above rather than on the header of this file, which attributes the 2026-10-13 fix to
+  "`droiddeck-session` removing `XWAYLAND_NO_GLAMOR=1` fallback" - `git log -S` shows no commit ever
+  removed line 311, so treat that attribution as unverified [H]. What is verified is that the project,
+  not the device, is turning glamor and DRI3 off. The change needs an APK build: the app re-stages
+  session scripts at every session start (next bullet). [E]
+- **The client UI cannot get a hardware GL context at all, and falls back to SwiftShader.** Inside
+  the guest, `/root/.steam/steam/logs/webhelper_gpu.txt` (timestamps `04:55:53`, i.e. session `-02`'s
+  window) reports:
+
+  ```
+  [ GPU0 ]: VENDOR= 0xffff [Google Inc. (ARM)], DEVICE=0xffff [ANGLE (ARM, Vulkan 1.3.354
+  (Mali unknown 0x90800011 MC9 (0x90800011)), panvk-26.2.99)], DRIVER_VENDOR=SwANGLE ... *ACTIVE*
+  [ GL implementation parts ]: (gl=egl-angle,angle=swiftshader)
+  [ Display type ]: ANGLE_SWIFTSHADER
+  ANGLE Display::initialize error 12289: Could not create GL context.
+  ANGLE Display::initialize error 12289: Cannot create an OpenGL ES platform on GLX without the
+  GLX_ARB_create_context extension.
+  WARNING:gpu_memory_buffer_support_x11.cc(49)] : dri3 extension not supported.
+  ```
+
+  Two things follow. (a) `-cef-force-gpu -cef-use-angle=vulkan` is not buying hardware rendering:
+  ANGLE initialises a **SwiftShader** display and CEF reports `dri3 extension not supported`, so Big
+  Picture is rasterized on the CPU - which is the most likely cause of the user's "boot animation
+  lags, then the icon goes up and down", and of `-04`'s `render_scene 405/806 ms` and 0.2-0.3 fps
+  boot frames. (b) The named reason is the same missing-glamor root cause as §7.2: without glamor
+  the guest X offers neither `GLX_ARB_create_context` nor DRI3, so ANGLE's GLX backend dies and its
+  Vulkan backend cannot present. Fixing §7.2 properly is therefore still the load-bearing fix; do
+  not expect a CEF flag to route around it. [E]
+- **Device state during these sessions.** The device rebooted at ~05:09 (`uptime` 1 min, load
+  average 37.9), which ended `-03`; the app wrote `ended-without-teardown.txt` for it. The app also
+  re-downloaded the whole Steam client ("repairing the Steam client (the client was started 2 times
+  without showing anything)", `droiddeck-steam-install:23-25`) in `-03` and again in `-04`, because
+  the repair only writes `repaired` into `$steam_root/package/droiddeck-unconfirmed` when it
+  finishes, and `-03` was killed mid-download. The download is real but slow (~170 KB/s; `-03`'s
+  `bins_linuxarm64_linuxarm64.zip` had reached 80 MB when it died). [E]
+- **Session scripts are re-staged from the APK at every session start, so they cannot be patched on
+  the device.** Editing `files/linuxfs/usr/local/bin/droiddeck-session` in place and then starting a
+  session reverts the file within seconds - the md5 returns to the repo's `16ee9334…` and the edited
+  line comes back. Session-script experiments therefore need an APK build; at runtime the only knob
+  is `droiddeckctl env set`, which works only where the script reads `${VAR:-default}`. [E]
+
+## 26. A compositor hold by buffer content identity was tried and reverted (2026-10-15)
+
+**Status: reverted, not in this tree.** Kept because the failure mode is the useful finding, and
+because it is the second compositor-side attempt to fix the ring rotation that has failed.
+
+The ping-pong the user reports on the runtime display is gamescope re-presenting its output ring in
+rotation while nothing is being rendered (§7.2d of `ping-pong-frame-handoff.md`: 3 slots, 2 frozen
+contents, ~5.5 commits/s). The attempt was: each dma-buf buffer records the content fingerprint it
+held when last drawn, and a commit whose buffer still holds that fingerprint is not drawn.
+
+It was measured on one build by flipping a marker (`<session log>.no-content-hold`), the `perf` line
+carrying `commits N held-same N held-blank N` — 90-97% held with the rule on, 0% with the marker, same
+session, same guest ring. **That number was read as success and it is the bug.** On session
+`2026-10-15-16-steam` every guest commit was held (`41 held-same 14 held-blank 27`, `46 / 15 / 31`)
+while the compositor kept rendering 41-46 scenes/s from the buffer it already held: a live render loop
+over a frozen picture. The drawn-commit generation `gen` stopped advancing entirely — `184 -> 184`
+across 20 s of real input. The user's "it freezes and never updates until I press a button" is
+exactly this shape, and it was this change that produced it.
+
+With the compositor reverted to HEAD (byte-identical, hot-swapped, session `2026-10-15-17-steam`) the
+counters show `held` gone and `gen` advancing again (`171 -> 314 -> 627` under input) with the ring's
+two contents alternating on screen (`8c43d86c` / `0bf7c651`). That alternation is the ping-pong —
+still unfixed, but a freeze is not an improvement on it.
+
+What matters for the driver bring-up:
+
+- **It is a compositor (bionic, `libdroiddeckwayland.so`) change, not a driver one**, so the PanVK
+  driver pins, the Mesa patches and `droiddeck-session` are untouched by it. [E]
+- **The damage region cannot carry the rule.** `s->damage_n / s->damage_area` is a constant
+  `1 / 0x3FFFFFFF00000001` on every commit of `-08` (724 sampled), i.e. gamescope declares the whole
+  surface damaged each time, so damage cannot separate a re-attached stale image from a fresh one.
+  That closes the plan §7.2d ended with. [E]
+- **Content identity cannot carry it either, and that is the new finding.** The guest re-presents its
+  ring with unchanged contents as a matter of course; "this buffer's content has not changed" is true
+  for every slot during the rotation, so the rule suppresses all of them. The compositor has no
+  channel saying which slot the client means as current — damage is constant and content identity is
+  identical by construction. A fix has to come from the guest side, or from not treating the ring as
+  three interchangeable frames. [E]
+- **`held` is not a progress metric.** A high held-share is the failure signature here, not a
+  success one; judge these attempts by whether `gen` advances under input, and by whether the screen
+  actually changes (`magick … -crop 2200x1080+0+0 +repage gray:-` hashed; **never** `-delete 0`, which
+  deletes the only image and makes every frame hash to the empty-string md5 `d41d8cd9`, i.e. every
+  A/B reads "1 state" no matter what — that artifact invalidated a whole round of measurements). [E]
+- **Iterating on it needs no APK.** `./gradlew :app:externalNativeBuildRelease` produces
+  `app/build/intermediates/cmake/release/obj/arm64-v8a/libdroiddeckwayland.so`, and copying that over
+  `/data/app/*/com.droiddeck.launcher-*/lib/arm64/libdroiddeckwayland.so` after a force-stop takes
+  effect on the next session (md5-verified). Session *scripts* still need an APK (§25, last bullet),
+  but this compositor library does not. [E]
+- **The panfrost transaction-elimination route was built and run on the device, not just read: it
+  cannot work here** (§27). `m8l8th814n-eng/mesa-gs101` ("someone already fixed the ping pong") is
+  about **stale tiles** from CRC-based write-back skip on the *upstream panfrost DRM* driver +
+  gallium GL (`pan_resource.c`). Built from upstream at their own base commit with their patches
+  0001-0005 (no kernel patches, driver side only) it compiles fine, but on this device the guest
+  dies before it draws: `vkCreateInstance failed (VkResult: -9)` =
+  `VK_ERROR_INCOMPATIBLE_DRIVER`, then gamescope's `Assertion 'instance' failed` and
+  `Aborted (core dumped)`. Its cause is structural: the driver has **no kbase backend at all** (no
+  `libpanvk_kbase_jm.so` in its artifact, 0 occurrences of `kbase`/`mali0` in the .so), so it only
+  speaks panfrost DRM, which we do not bind (§2). Its patch `0003` is also inert as written — it
+  reads `dev->model->quirks.no_crc` but nothing in the repo ever sets it true (grep: 2 hits, the
+  declaration and the read); the `gsl+fix` arm that sets it on the G77/G78 rows still cannot create
+  an instance. Its `0004`/`0005` are compute-only/clear-only with draws stubbed, i.e. behind our p6
+  build, and applied blindly to our fork they do not even merge. [E]
+- **The device reboots mid-experiment often** (uptime 1-2 min after several reboots this session,
+  load average 15-25), which ends a session mid-run; and the compositor keeps its log file open at the
+  directory of the session it *started* in, so `<newest session>/wayland.log` can be the wrong path
+  and marker - find the growing one. A dead session leaves focus on
+  `com.transsion.launcher3`, so **check `mCurrentFocus` before hashing captures** (a whole run was
+  invalidated that way). [E]
+
+## 27. The gs101 patch set was built and run on the device: it cannot drive this GPU (2026-10-15, measured)
+
+`m8l8th814n-eng/mesa-gs101` is the tree behind "someone already fixed the ping pong". Its own README
+says the stale tiles were fixed by **disabling transaction elimination**, and §26's investigation had
+only ever *read* those patches — which settles nothing, because the argument was about code paths, not
+about what the device does. So it was built and run. The experiment scaffolding is
+`tools/panvk-gs101-test/` + `.github/workflows/build-panvk-gs101-test.yml` (**experiment only, never a
+release, never in `tools/panvk/release.env`**).
+
+**Arms.** `arm=gsl` is a *pure* tree: upstream Mesa at the patch set's own base commit
+`dc330577adb9e98363ef6061e09062f171d0d053` (26.3.0_git20260825, verified to exist) + their Mesa
+patches 0001-0005, **no kernel patches**, driver side only. `arm=gsl+fix` is the same plus the
+`MODEL_QUIRKS(.no_crc = true)` their `0003` reads but never sets (rows patched: 2). `arm=ours` is our
+G57 fork v1.2.0 with `0003` on top, kept because the user asked for both orders.
+
+**What was measured**
+
+- Both pure arms **build**: the earlier failures were never the patches. The first run died on
+  `meson.build:2328: ERROR: Dependency "xcb-glx" not found` (gallium panfrost links GLX, so the arm
+  needs `libxcb-glx0-dev`), and on `-Dllvm=disabled` being refused with `Feature llvm cannot be
+  enabled: CLC requires LLVM`. Both fixed; three arms then built clean. [E]
+- **The pure driver cannot create a Vulkan instance on this device.** Installed as the active
+  imported driver (p6's dir, its `.so` backed up beside itself first) and a session started, the
+  session log's own words are:
+
+      == vulkan driver: imported .../PanVK-rynx-1.2.0-p6/libvulkan_panvk.so (via .../icd.json)
+      [gamescope] [Error] vulkan: vkCreateInstance failed (VkResult: -9)
+      gamescope: ../gamescope/src/rendervulkan.cpp:299: bool CVulkanDevice::BInit(...):
+                 Assertion `instance' failed.
+      droiddeck-session: line 331: 13698 Aborted (core dumped) stdbuf -oL -eL gamescope ...
+
+  The session went to `FAILED` / `GUEST_EXIT` / `status 134`. `-9` is
+  `VK_ERROR_INCOMPATIBLE_DRIVER`. [E]
+- **The cause is structural, and visible in the artifact itself.** The pure driver ships one file
+  (`usr/lib/libvulkan_panvk.so`, 19,249,456 bytes) — **no `libpanvk_kbase_jm.so`** beside it — and the
+  .so contains **0** occurrences of `kbase`/`mali0`; its only device path is the panfrost DRM kms
+  path (`libvulkan_panfrost.so`, `panfrost_kmod`). Our fork's driver has the kbase strings and ships
+  the cdylib. Without the kernel half of the gs101 work (which patches `drivers/gpu/drm/panfrost` and
+  **cannot apply** to a device running ARM's `mali_kbase` at `/dev/mali0` — §2), the driver-side
+  patches have no way to reach the GPU. The `gsl+fix` arm, with the quirk actually set, fails
+  identically. [E]
+- **`0003` cannot be re-landed on our tree, and the "ours" arm proved it is a no-op.** Applying
+  `0003` to the fork, its `pan_model.h` hunk **fails** (so `no_crc` is never declared and the fix
+  helper patches **0 rows**) while its `pan_resource.c` hunk lands in **gallium** — which this fork's
+  build does not compile at all (`-Dgallium-drivers=` is empty on purpose). The resulting binary is
+  **byte-identical to the shipped p6 driver** (`md5 dafd269efc81e348aeaebb1eef686ff3`, 21,871,824
+  bytes, same on device), i.e. that arm measures p6 and nothing else. There is nothing here to gain.
+  [E]
+
+**Why it looked like our bug, and is not.** Their symptom — stale tiles under a compositor, worst on
+text — is a plausible match for ours, and the "fix" is a one-line quirk, which is why it was worth
+building rather than arguing about. But their failure lives in gallium's CRC/TE path on the panfrost
+DRM driver; ours lives in the guest's Vulkan swapchain on `mali_kbase`. Our guest never runs that
+code: the Vulkan driver we ship has no CRC/`crc_state` path at all (`grep -rn crc_state
+src/panfrost/vulkan/` → empty) and `PAN_DBG_NO_CRC` is only consulted by `gallium/panfrost`, never by
+panvk. [E]
+
+**Consequences.** The ping-pong/stale-content defect still needs a fix on our side of the stack (the
+present path, §26), not in better panfrost patches. The `tools/panvk-gs101-test/` scaffolding stays
+because the arms are reproducible and the two build traps above (xcb-glx, CLC/LLVM) cost two CI runs
+each to rediscover.

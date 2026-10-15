@@ -1,14 +1,17 @@
 # Handoff: Steam Big Picture on DroidDeck (Mali G77 / X6739) — boot stall + frame ping-pong
 
-**Updated:** 2026-10-14 (§7.2c/§7.2d: the p6 driver + `PANVK_KBASE_DRI3=1` leaves the SHM path; the ping-pong on that path is a frozen two-content ring)
+**Updated:** 2026-10-15 (§7.2f: a content-identity hold for the ring's rotation was implemented, measured and then **reverted** — it converts the ping-pong into a freeze; the section records why the rule is unsound. §7.2c/§7.2d: the p6 driver + `PANVK_KBASE_DRI3=1` leaves the SHM path; the ping-pong on that path is a frozen two-content ring. §7.2e: that same flag forces the DRI3 route, which the guest X cannot serve, so every GL client dies; with the flag off nothing presents)
 **Device:** Infinix GT 10 Pro `102562537K104189` — MT6893, Mali-G77 MC9, Android 16
 **Tool:** `python3 tools/droiddeckctl …` (run from `/mnt/project/DroidDeck`)
 **Report:** `docs/development/panvk-mali-g77-bringup.md` (driver bring-up). This file is the
 ping-pong/stall story and supersedes all earlier revisions of it.
 
 **Bottom line:** both defects are reproduced with hard numbers. The ping-pong is real and
-whole-screen (~99% of pixels per flip). It is **not fixed**. Three-buffer swapchain cycling
-(`887c49d5` ↔ `e953f712` ↔ `bc7310af`) is live on session 34 and sustained at idle.
+whole-screen (~99% of pixels per flip). A compositor-side content hold (§7.2f) was tried and
+**reverted** — it stops the alternation only by freezing the screen (0% -> 90-97% of commits held,
+but `gen` stops advancing, i.e. nothing new is ever drawn), and the guest still declares no damage and still re-presents
+stale slots, so the underlying guest behaviour is unchanged and Defect A is untouched. Its one
+unmeasurable case is a legitimate two-frame animation re-rendered byte-identically (§8.4).
 
 Evidence tags used throughout: **[E]** = observed (command output, file:line, measured pixels),
 **[I]** = inference. Keep the convention if you extend this file.
@@ -623,6 +626,130 @@ measurement: if gamescope reports empty damage for the stale commits, "commit wi
 fingerprint already on screen" becomes a rule that is correct rather than a heuristic, and the
 10 s window with 56 commits and 0 new contents is a test case for it.
 
+### 7.2e The knob's other half: `kbase_dmabuf=1` needs DRI3, and the guest X has none (2026-10-15)
+
+§7.2c showed `PANVK_KBASE_DRI3=1` is what puts the guest on the GPU present path. Measured on
+sessions `-01`, `-02` and `-03` under one installed build (`58a827ad`), that same flag is also what
+kills every GL/X11 client - so each arm of the knob is unusable in a different way:
+
+| Session | `PANVK_KBASE_DRI3` | WSI | zink lines | "No DRI3" | on screen | `session.ready` |
+|---|---|---|---|---|---|---|
+| `-40`, `-41` | 1 (default) | `kbase_dmabuf=1 sw_device=0` | 1 | 0 | ~56 per 10 s | yes |
+| `-01` | 1 (default) | `kbase_dmabuf=1 sw_device=0` | 8 | 4 | - | no |
+| `-02` | 0 (override) | `kbase_dmabuf=0 sw_device=1` | 0 | 0 | **0** | no |
+
+- The mechanism is a dichotomy inside the driver, not a heuristic. `wsi_common_x11.c:246` derives
+  `wants_shm = wsi_dev->sw && !(WSI_DEBUG & WSI_DEBUG_NOSHM) && has_import_memory_host`, and
+  `panvk_wsi.c:142` sets `sw = !ahb_wsi && uses_kbase && !kbase_dmabuf`. So `kbase_dmabuf=1`
+  disables MIT-SHM presentation and forces the DRI3 route, and `wsi_x11_check_for_dri3()`
+  (`wsi_common_x11.c:423`) then fails because the guest X has no DRI3 (it has no glamor). [E]
+- Verbatim from `-01-session.log`, twice each: `PANVKDBG XSHM_GATE dri3=0 present=1 wants_shm=0`,
+  `MESA: info: vulkan: No DRI3 support detected - required for presentation`,
+  `MESA: error: zink: could not create swapchain`, `X Error of failed request:  GLXBadCurrentWindow`,
+  with four `pEngineName: mesa zink` instances. The session never emitted `session.ready`. [E]
+- `-02` (knob off) has none of that and does open the Big Picture window, but the compositor then
+  reports `0 on screen (copy 0, zero-copy 0, layer copy 0)` against ~70 `GPU frames from games` -
+  the same 0-on-screen p5 gave in `-34` (§7.2c). It also never emitted `session.ready`. [E]
+- **`-03` proves the export is not uniform.** Its `session.log` reads `kbase_dmabuf=1 sw_device=0`
+  while its `steam/steamwebhelper.log` reads `kbase_dmabuf=0 sw_device=1`, followed by
+  `MESA-EGL: warning: DRI3 error: Could not get DRI3 device` and
+  `ANGLE Display::initialize error 12289: Could not create GL context`. CEF is launched
+  ANGLE-on-Vulkan precisely so it needs no Xwayland GL (`droiddeck-session:1024`, `b8c26d7f`,
+  "allow CEF GPU acceleration without Xwayland glamor"), so this is a new failure. [E]
+- **And the client UI is on SwiftShader, not the GPU.** The guest's
+  `/root/.steam/steam/logs/webhelper_gpu.txt` (timestamps `04:55:53`) reports
+  `DRIVER_VENDOR=SwANGLE`, `[ GL implementation parts ]: (gl=egl-angle,angle=swiftshader)`,
+  `[ Display type ]: ANGLE_SWIFTSHADER`,
+  `Cannot create an OpenGL ES platform on GLX without the GLX_ARB_create_context extension` and
+  `gpu_memory_buffer_support_x11.cc(49)] : dri3 extension not supported`. So `-cef-force-gpu
+  -cef-use-angle=vulkan` is not buying hardware Big Picture: ANGLE lands on SwiftShader and CEF
+  rasterizes on the CPU. That is the likeliest cause both of the lag the user reports and of the UI
+  sitting at ~5 fps, and it names the same root cause as §7.2 - the guest X has no glamor, so it
+  offers neither GLX nor DRI3. [E]
+- **And that is a switch this tree throws, not a device limitation.** Xwayland names it: session
+  `-05-steam` logs, twice (one per Xwayland instance), `Disabling glamor and dri3 support,
+  XWAYLAND_NO_GLAMOR is set`, then `Failed to initialize glamor, falling back to sw`.
+  `XWAYLAND_NO_GLAMOR=1` comes from `droiddeck-session:311`, unconditionally. So the "GPU present
+  path" the knob selects is being pointed at a guest X that has been told to disable DRI3 - §7.2c and
+  §7.2d should be read with that in mind. **Dropping the export is the highest-value next
+  experiment.** It needs an APK build. [E]
+- **The live client is also stuck before its webhelper exists.** In `-04` (repaired client, knob at
+  its default) the guest shows `steam` at 95.6% CPU with a `steam <defunct>` child and no
+  `steamwebhelper` at all, while the compositor logs `DMABUF res=` zero times and
+  `RENDER-COPY n=0`, i.e. no guest frame ever arrives to probe. [E]
+- `XSHM_GATE` is a per-process marker of the path a process took (twice in `-01`, absent in `-02`),
+  so its presence or absence says nothing about frames. [E]
+- Testing is also now gated by the app's self-repair: "repairing the Steam client (the client was
+  started 2 times without showing anything)" re-downloads every component
+  (`droiddeck-steam-install:23-25`) before Steam starts at all, and it only records `repaired` when
+  it finishes, so a session killed mid-download repeats it next time. Budget for a full download
+  (~170 KB/s measured) before expecting the ping-pong state to be reachable. [E]
+- **A session-script change cannot be tested from the device.** The app re-stages
+  `files/linuxfs/usr/local/bin/droiddeck-session` from the APK at every session start, so editing it
+  in place (md5 `99849e1f…`) reverts to the repo's `16ee9334…` within seconds of `start`, and the
+  edited line returns. Only `droiddeckctl env set` works without a rebuild, and only where the script
+  itself reads `${VAR:-default}`. Any experiment that changes `XWAYLAND_NO_GLAMOR` or the CEF
+  arguments therefore needs an APK build. [E]
+
+**This is why §7.2d's damage capture has not been taken yet.** The session must reach the ping-pong
+state first, and every route to it is blocked by one of the two arms above. The instrumented build
+(`58a827ad`; its `lib/arm64-v8a/libdroiddeckwayland.so` contains `fp=%08x dmg=%d`) is installed and
+the marker was placed, but no session since has drawn a frame with `frame_probe_on()` true.
+
+### 7.2f The ring's rotation is held by content identity — REVERTED 2026-10-15, it freezes the screen
+
+**Status: reverted, not shipped.** The hold below was implemented, measured, then taken back out
+after a live test showed it converts the ping-pong into a *freeze* — the screen stops updating at all.
+Keep this section as the record of why that rule fails; do not re-land it as written.
+
+§7.2d ended by asking for the damage region, on the theory that "commit with no damage and a
+fingerprint already on screen" would be the sound rule. §8.3 of the handoff then measured the damage
+region, and it **cannot carry that rule**: `s->damage_n / s->damage_area` is a *constant*
+`1 / 0x3FFFFFFF00000001` (4611686014132420609) on all 724 commits of session
+`2026-10-15-08-steam` — gamescope declares the whole surface damaged every time, so damage is
+identical for a re-attached stale image and a freshly rendered one. The rule had to come from the
+buffer contents instead.
+
+**What was implemented** (`compositor.c`, `content_hold()` + `content_hold_off()`;
+`compositor_internal.h`, `struct dmabuf_buffer.drawn_fp/drawn_fp_valid`): each dma-buf buffer
+remembered the FNV-1a fingerprint it held when the compositor last drew from it. A commit whose
+buffer still held exactly that fingerprint was held. Disabled by a `<session log>.no-content-hold`
+marker.
+
+**Why it failed.** `drawn_fp` answers "has this buffer's content changed since I last drew it",
+which is the wrong question — during the ring's rotation the answer is *no* for every slot, and the
+compositor drives its own render loop from one of them. Session `2026-10-15-16-steam` on that build
+measured it directly:
+
+```
+perf last 10 s: 601 ticks, 41 scenes, 41 on screen (copy) | commits 41 held-same 14 held-blank 27
+perf last 10 s: 601 ticks, 46 scenes, 46 on screen (copy) | commits 46 held-same 15 held-blank 31
+```
+
+Every guest commit held (14+27 of 41, 15+31 of 46) while the compositor kept rendering 41-46 scenes/s
+from the buffer it already had — a live render loop over a frozen picture. That is the freeze the
+user reports, and `gen` (the drawn-commit generation) stopped advancing entirely: `184 -> 184` across
+20 s of real input.
+
+**The measurement that had said "97% held" was measuring the wrong thing.** Holding 97% of commits is
+not success; it is the bug. The A/B tables in the earlier revision of this section (marker flips on
+`-15-steam`) are accurate as *counts* and were misread as *progress*. With the rule reverted
+(compositor byte-identical to HEAD, hot-swapped, session `2026-10-15-17-steam`) the same counters show
+`held` gone and `gen` advancing normally — `171 -> 314 -> 627` under input — with the ring's two
+contents alternating on screen again (`8c43d86c` / `0bf7c651`). That alternation is the ping-pong,
+and it is the thing that still has to be fixed; a freeze is not an improvement on it.
+
+**What the failure teaches.** Any rule built on *buffer content identity* is unsound here, because
+the guest re-presents its ring with unchanged contents as a matter of course, and the compositor must
+still draw one of them — the one the client means as current. The compositor has no channel that says
+which slot that is: damage is constant (§8.3), and content identity is identical by construction. The
+signal has to come from the guest, or from not treating the ring as three interchangeable frames.
+
+**Log volume** (kept as a lesson even though the rule is out): holding is the normal state in the
+regime this acted on, so the per-hold `framedbg` line was rate-limited to one in 200 with the real
+count in `perf`; the unbounded version wrote 3.8 MB of `HOLD-SAME` per session, and `wayland.log` is
+one file the app shares.
+
 ### 7.3 Defect A: don't rely on the movie being dismissed
 
 - Cheapest test of the hypothesis: blank/remove `StartupMovie` (`SessionFiles.kt:224-232`,
@@ -778,7 +905,9 @@ the cycle (e.g. remember the last three content fingerprints and hold the one th
    12 allocations across 4 sessions carry a valid `alloc_shm` and three distinct `sw_host_ptr`s, and
    no `alloc_shm=(nil)` line exists anywhere (§9.3).
    **This is the last real defect: the compositor-side gate (§7.5) hides its symptom but does not
-   answer it.**
+   answer it.** A content-identity hold (§7.2f) was tried as a second answer and **reverted** — it
+   stops the rotation only by freezing the screen (nothing new is ever drawn), so it does not answer
+   it either; the guest still presents stale slots.
 2. **What is the white state?** A never-drawn/cleared buffer, a format/alpha misinterpretation, or a
    gamescope clear colour? The white background with preserved UI content is the strongest clue.
 3. ~~**Why do 12 of 27 `WSI_BLIT_SHM` allocations return NULL?**~~ **WITHDRAWN (2026-10-14): not

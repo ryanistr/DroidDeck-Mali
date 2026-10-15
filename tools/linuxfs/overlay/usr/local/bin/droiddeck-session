@@ -308,7 +308,11 @@ if [ -z "${BL_INSIDE:-}" ]; then
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
 
-  export XWAYLAND_NO_GLAMOR=1
+  # Glamor/DRI3 stay on unless a session explicitly opts out: with the export forced
+  # to 1 the guest X offers neither GLX nor DRI3, which kills zink swapchains, CEF/ANGLE
+  # hardware rendering (SwiftShader fallback, ~5fps UI) and the kbase_dmabuf=1 present
+  # path. XWAYLAND_NO_GLAMOR=1 via session env restores the old arm for comparison.
+  export XWAYLAND_NO_GLAMOR=${XWAYLAND_NO_GLAMOR:-0}
   # Bring-up tracing: WAYLAND_DEBUG logs every protocol message of every client, line-buffered, and
   # costs a client most of its frame rate. BL_BRINGUP=1 (droiddeck-env, or an agent's switch) turns
   # all three back on; a session that is merely being played does not want them.

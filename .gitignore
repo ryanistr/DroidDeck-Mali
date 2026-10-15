@@ -52,3 +52,9 @@ app/src/main/assets/directaudio/
 !/AGENTS.md
 !/CLAUDE.md
 !/README.md
+
+# Working trees and experiment scratch: source clones and build dirs that must never be committed.
+# .scratch/ alone reached 3.4G here (a Mesa clone plus a build dir), so a `git add -A` would
+# otherwise try to stage a whole checkout.
+/.scratch/
+/.ppv/
