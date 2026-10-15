@@ -865,6 +865,12 @@ a cosmetic damper for the loudest regime, nothing more. A gate that *could* work
 the cycle (e.g. remember the last three content fingerprints and hold the one that repeats as
 "stale"), which is guesswork layered on a guest bug.
 
+**Superseded in part (2026-10-15):** the gate itself turned out to be a *symptom source* on the kbase
+path, not just a damper. Its `mean < 40` test held real UI frames there (UI measures `mean` 12-42 with
+`max=255`), freezing the display for up to `BLANK_HOLD_NS` per frame. The test is now `max == 0`, so
+it can only suppress a fully black commit — see `panvk-mali-g77-bringup.md` §28 for the before/after
+counts. The conclusion above is unchanged: the alternation is the guest's, and no threshold fixes it.
+
 ---
 
 ## 8. Dead ends (do not repeat)

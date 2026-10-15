@@ -1638,3 +1638,200 @@ panvk. [E]
 present path, §26), not in better panfrost patches. The `tools/panvk-gs101-test/` scaffolding stays
 because the arms are reproducible and the two build traps above (xcb-glx, CLC/LLVM) cost two CI runs
 each to rediscover.
+
+## 28. The blank-frame gate was the freeze: `mean < 40` held real UI on the kbase path (2026-10-15, measured)
+
+The user's report was two symptoms, and they have two different causes. This section covers the one
+the compositor owns.
+
+**The gate's threshold does not transfer to this path.** §15 calibrated `BLANK_MEAN 40` where the
+real UI measured `mean=78` on the blit path. The frame probe (`<log>.frame-probe`, format added in
+58a827ad: `fp=%08x` content fingerprint, `dmg=%d/%lld` declared damage) shows the same Steam UI
+measuring far lower here:
+
+| session | ring slots | real UI | empty slot |
+|---|---|---|---|
+| `-22-steam` idle | fd 216/229/262 | `mean=37 max=255 hi=849/2170`, `mean=37 hi=868/2170` | `fd=229 mean=0 max=0 hi=0/2170` |
+| `-23-steam` idle | fd 222/223/224 | `mean` 12-67, `max=255`, `hi` up to 843 | interleaved, `max=0` |
+
+So `mean < 40` classified **every** slot as blank. `blank_frame_hold()` returned 1, released the
+buffer straight back to the client and kept the previous picture; the display advanced only when
+`BLANK_HOLD_NS` (1.2 s) expired (`HOLD-BLANK … (content 1184 ms ago)`). Session `-23-steam`: 89 probe
+commits, **16 HOLD-BLANK events, every held commit carrying `max=255`** — real content suppressed.
+That is "freezes between frames and never shows the current frame".
+
+**`max`, not `mean`, separates the populations** — by two orders of magnitude. `hi` equally: the empty
+slot is `hi=0/2170`. Fixed in `blank_frame_hold()` (`compositor.c`): hold only when
+`max == 0` (the buffer is entirely black); any non-black pixel means the client drew. `BLANK_MEAN` is
+gone, the 1.2 s bound and the `<log>.no-blank-hold` marker are unchanged.
+
+**Verified on device, hot-swapped** (compositor `.so` only, per `ping-pong-frame-handoff.md` §6.3;
+device md5 `363a545e…` → `01bbfc9c…`, backup `.pre-swap` left beside it):
+
+| | commits | HOLD-BLANK | held with content |
+|---|---|---|---|
+| before (`-22`/`-23`) | 89-121 | on most commits | 16 of 89, `max=255` |
+| after (`-25-steam`) | **175** | **0** | **0** |
+
+Screen samples in the after-window: `mean` 11,11,37,37,45,37,37,37 → 4 distinct states of 8, i.e. the
+display is updating. **The gate no longer suppresses any frame carrying content.**
+
+**What this does not fix.** The *alternation* survives (4 distinct states, `cc8844bd` repeating).
+`ping-pong-frame-handoff.md` §7.5a already settled why: the compositor cannot tell a current dark
+frame from a stale dark one, and "a gate that *could* work would have to key on the cycle … guesswork
+layered on a guest bug". The freeze was ours; the ping-pong is gamescope's ring rotation.
+
+**The damage read falsifies the "stale re-attach" reading.** 58a827ad was built on the premise that
+the client's declared damage separates "re-attached a stale image" from "rendered fresh pixels".
+Measured over all three windows: `dmg=1` with the **full-surface** sentinel
+(`area = (2^31-1)^2`) on **100%** of commits, `dmg=0` never once (session `-22`, 121/158/125 commits;
+`-23`, 89). The client claims it redrew everything, every time. So rejection is not "the client
+silently re-attaches"; the client believes it rendered and the ring content is nonetheless frozen.
+That points at the guest's WSI/swapchain, and is the strongest lead for the remaining alternation.
+
+**Separate defect seen while measuring:** session `-24-steam` reached `READY` with
+`firstFrame=True` but **never created `wayland.log` at all** (4.9 MB in `-22`, 71 KB in `-25`), i.e.
+the compositor logged no frames for that whole session. Not investigated further. [E]
+
+## 29. The freeze reproduces as a guest-delivered black frame, and frame-callback starvation is disproven (2026-10-15, measured)
+
+§28 fixed the compositor half. The user's report persisted ("still ping pong then freezes/stop on a
+single frame"), so the freeze was reproduced deliberately on the §28 build and characterised.
+
+**A protocol obligation the compositor does not meet — but it is not this bug.** `wl_surface.frame`
+callbacks and presentation feedback are answered only from inside `render_scene()`, reached solely
+via `if (g_dirty && !scene_waits_for_game(now)) render_scene()`. A client blocked on a frame callback
+while nothing is dirty would therefore never be woken — the same obligation `pace_without_output()`
+meets for the no-window case. Implemented as an idle-tick firing path behind `<log>.idle-frames`
+(default off), hot-swapped, and **disproven during a real freeze**: with the marker on, a frozen window
+reporting `601 ticks, 21 scenes, 0 GPU frames from games` produced **`IDLE-FRAMES fired=0`** and
+`grep -c IDLE-FRAMES` = 0 over the whole run. No surface had a pending frame callback. The path stays
+in the tree behind the marker so it is inert by default; it is not the fix.
+
+**What the freeze actually is.** Session `-26-steam` (marker on), the last frames before the display
+stopped:
+
+```
+16:41:16.811  #4183 DMABUF res=0x755981f1d0 b=… img=… (1600x720 fmt=0x34325258) gen=4144
+16:41:16.811  #33 HOLD-BLANK res=0x755981f1d0 mean=0 (content 323 ms ago)
+16:41:17.199  #4184 DMABUF res=0x7559835d30 b=… img=… (1600x720 fmt=0x34325258) gen=4144
+16:41:17.200  #34 HOLD-BLANK res=0x7559835d30 mean=0 (content 712 ms ago)
+```
+
+The guest delivers **entirely black** 1600x720 frames — `mean=0` and `max=0`, so the §28 `max == 0`
+test still classifies them blank and holds them for the 1.2 s `BLANK_HOLD_NS` bound, after which the
+black frame is presented. The guest then stops committing altogether:
+
+| window | evidence |
+|---|---|
+| frozen 20 s | commits `4132 -> 4132` (**delta 0**), `1 windows open`, `IDLE-FRAMES fired=0` |
+| last perf before | `601 ticks, 21 scenes, 21 on screen` / `release … (19, 1 held)` / `0 pool drops` |
+| after `input pad b` | commits `4132 -> 4307`; screen `3c4464bb -> c3ffa6e0 -> e326c80e` |
+
+Screen evidence (vision, not hashes): the frozen frame is **black with only our own pad overlay**, HUD
+`0 fps`; immediately after the input the **full Steam sign-in UI** is back, HUD `4 fps`.
+
+**Ruled out.** Holds do not accumulate (`HELD` 1 → 0 → 0 … → 4 across 16:45-16:47), so this is not
+buffer starvation. FPS stayed 1.9-5.6 right up to the stop. Both freezes (16:12 and 16:41) end on the
+**same** screen hash `3c4464bb`, i.e. deterministic black + overlay, not a random stale frame.
+
+**Conclusion.** The compositor now withholds nothing (§28) and is not starving clients of frame
+callbacks (§29). The defect that remains is the *guest's frame content*: gamescope hands over a black
+1600x720 buffer and then goes idle, and the compositor draws what it is handed (cc3dcaab). This is the
+same guest-side WSI/swapchain lead §28 flagged, now with a reproducible trigger and a clean
+discriminator: run the guest with the PanVK/kbase path bypassed (or `PANVK_KBASE_DRI3` off) and see
+whether the black frames survive. If they vanish, the guest's write path — not gamescope's logic — is
+producing them.
+
+**Measurement trap, for whoever repeats this.** A freshly started session spends its first ~2 minutes
+delivering black frames while Steam boots. Short arms (30 s) on a fresh session measure *that*, not the
+freeze — it looks identical (black, static, single hash). Settle until the cropped mean is > 20 before
+judging anything. [E]
+
+## 30. `wayland.log` is not a per-session file — the compositor's frames live in `app.log` (2026-10-15, measured)
+
+This corrects the "separate defect" note in §28 and invalidates any harness that reads `wayland.log`
+to decide whether the compositor drew.
+
+**Two sinks, one of them stale.** The compositor emits to the app logger (logcat tag `DroidDeckWayland`,
+which the app routes to the *current* session's `app.log`) and, separately, to a file sink whose path is
+captured when that sink is opened. After a session stop/start **without restarting the app process**, the
+new session's directory gets **no `wayland.log` at all**, and every compositor line is in `app.log` only.
+
+Evidence, session `-27-steam`:
+
+| | `wayland.log` in `-27` | compositor lines in `-27/app.log` |
+|---|---|---|
+| 16:55:56 → 17:02:02 | **does not exist** (0 bytes) | 1910 `DMABUF`, 1920 `RENDER-COPY`, 18 `HOLD-BLANK`, 32 `stats`, 32 `perf` |
+
+and `-26-steam/wayland.log`, the previous session, read `5759739 -> 5759739` — static — while `-27`'s
+`app.log` was carrying live compositor output at 6 fps.
+
+**So the §28 "-24-steam defect" was not a defect.** That session reaching `READY` with no `wayland.log`
+did *not* mean "the compositor logged no frames for that whole session" — the frames were in that
+session's `app.log`, exactly as here. Nothing in the compositor failed.
+
+**Read the compositor from `app.log`**, lines tagged `[rdbg]` / `[framedbg]` / `[stats]` / `[perf]`, and
+assert on a **count of `DMABUF` lines**, never on the existence of `wayland.log`. A missing `wayland.log`
+is a log-sink artifact and carries no information about whether frames were drawn.
+
+**`#N` in `HOLD-BLANK` is not a per-session count.** It is `g_dbg_hold`, a `static` counter cumulative
+across every session inside one app process (`#494` at 17:01:58, where that window contained 18 hold
+lines). Count the lines; never read the ordinal as this session's total.
+
+**Do not gate a measurement on screen brightness.** The `-27` session sat at cropped `mean=11` for five
+minutes while committing 4-7 fps, so a "settle until mean > 20" gate never armed and the session looked
+dead when it was not. §29's advice to settle past the boot-black is right, but brightness is the wrong
+oracle. The documented one is `droiddeckctl cdp targets`: `Steam Big Picture Mode` must be at
+`https://steamloopback.host/index.html…`, not `about:blank`. Check that, then measure.
+
+**Status of the §29 discriminator.** The `PANVK_KBASE_DRI3=1` vs `=0` A/B (does the guest still deliver
+black frames with the kbase dma-buf WSI path disabled?) was **aborted, not run**: arm A's session was
+mis-instrumented by the log-sink issue above, and the device left USB at ~17:03 mid-run (`adb devices`
+empty, `lsusb` showing no MediaTek device) before arm B started. Pending env is empty and no probe
+markers were left — the device is clean. Re-run with `app.log` + the CDP oracle. [E]
+
+## 31. Arm A of the discriminator: the freeze is the *guest going silent*, and it needs no black frame (2026-10-15, measured)
+
+Arm A re-run correctly instrumented (`disc2.sh`): compositor read from `app.log` per §30, liveness =
+count of `DMABUF` commits, defect metric = the compositor's own `HOLD-BLANK ... mean=0` lines, settle
+oracle = `cdp targets` reporting `steamloopback` rather than screen brightness. Session
+`-29-steam`, 20:57:57 → 21:06 WIB.
+
+```
+active env: []       ENV GUARD: OK
+focus OK             cdp oracle: steam_ui_up
+21:04:09   FREEZE at 21:04:06 (DMABUF stuck at 1122, screen c61b1c67)
+  ARM A: freezes=1  dmabuf_commits=1122  black_commits=8  hold_lines=8
+         min_fps=0.0  max_fps=6.5  distinct_screen_states=22
+```
+
+The guest delivered 1122 frames over ~6.2 minutes at 4-6.5 fps and then **stopped delivering
+entirely** — the commit counter never advanced again — while the compositor's own `[stats]` line went
+to `0 frames on screen`. The compositor was alive throughout (its tick and the app's on-screen pad
+overlay keep changing the screen hash on every sample), which is why **a moving screen is not
+evidence of a live guest**; §29's frozen-frame analysis reached the same place from hashes alone.
+
+Two refinements to §29. First, `black_commits=8` and `hold_lines=8` — *identical*, i.e. every black
+frame in this run was a boot burst and none occurred at the freeze; the screen held at cropped
+`mean=95`, the Steam UI, not black. So §29's black frame is **one form of the freeze, not a
+precondition**: the common factor across 16:12, 16:41 and 21:04 is the guest ceasing to commit. §29's
+"run the guest with `PANVK_KBASE_DRI3` off and see whether the black frames survive" is therefore still
+the right discriminator, but the outcome to score is the commit counter going silent, not the frame
+colour.
+
+**A fourth false-positive trap, and it nearly produced the result above in the wrong direction.** An
+earlier arm printed `FREEZE# 1: commits static n=446` followed by `md5=FAIL` on every later sample. The
+harness called `logsz` (a `wc -c` on `app.log`) and mapped an **empty** reply to "no growth", so one
+stalled adb read incremented the stall counter and manufactured a freeze — the following `screencap`
+failure had the same cause. A failed read is not a measurement of "no change"; it now records
+`adb-FAIL ... not counted` and is excluded from the stall counter. Any harness that treats "could not
+measure" as "measured no change" will find freezes on demand.
+
+**Arm B is still void, not negative.** Its session `-30-steam` started correctly with
+`active env: ['PANVK_KBASE_DRI3=0']`, and the focus guard aborted six seconds later on
+`mCurrentFocus=Window{c723cd8 u0 aivoiceassistant_Window}` — the Transsion AI voice assistant took the
+foreground, the same class of theft as `settings.overlay` in §27. The harness now re-issues
+`am start -n com.droiddeck.launcher/.SessionActivity` and re-checks focus up to 8 times before
+aborting. Until arm B completes, whether the SHM present path keeps the guest committing is **open**:
+one arm is a reproduction, not a discriminator. [E]

@@ -730,16 +730,19 @@ static void on_pending_buffer_destroyed(struct wl_listener *l, void *data) {
     s->pending_buffer = NULL;
 }
 
-static void fire_frames(struct wl_list *frames) {
+static int fire_frames(struct wl_list *frames) {
     struct wl_resource *cb, *tmp;
     uint32_t t;
+    int n = 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     t = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
     wl_resource_for_each_safe(cb, tmp, frames) {
         wl_callback_send_done(cb, t);
         wl_resource_destroy(cb);
+        n++;
     }
+    return n;
 }
 
 /* Copy a committed wl_shm buffer into the surface's image and release the buffer. A re-commit of
@@ -889,12 +892,17 @@ static void frame_probe(struct surface *s, const struct dmabuf_buffer *b, struct
  * client's, so the compositor cannot fix them - but it can decline to draw the empty ones and keep
  * the last frame that had content up instead.
  *
+ * Emptiness is decided on MAX luma, not mean. On the kbase dmabuf path the real Steam UI is dark
+ * (mean 12-37 measured, vs 0 for the empty slot), so a mean threshold swallows genuine UI frames
+ * and the display stops updating. max==0 is exact: the empty slot is entirely black, and any
+ * non-black pixel means the client drew something. hi (samples > 32) is reported for the same
+ * reason.
+ *
  * Bounded by time on purpose: past BLANK_HOLD_NS with no frame carrying content, blank frames are
  * drawn again, so a scene that really is black (a fade, a loading screen, a dark game) reaches the
  * screen instead of a stale picture sitting there forever. That bound is the whole safety of this.
  * Disabled by a `<session log>.no-blank-hold` marker, so the two behaviours can be compared on one
  * build. */
-#define BLANK_MEAN 40                      /* mean luma below this is an empty frame (10/25 blank, 78 UI measured) */
 #define BLANK_HOLD_NS 1200000000LL         /* how long a real frame keeps blank commits off the screen */
 
 static int blank_hold_off(void) {
@@ -912,7 +920,7 @@ static int blank_frame_hold(struct surface *s, const struct dmabuf_buffer *b, st
     unsigned long v[4];
     if (dmabuf_sample(b, v, NULL) != 0) return 0;
     const int64_t now = now_ns();
-    if (v[0] >= BLANK_MEAN) { s->content_ns = now; return 0; }
+    if (v[1] > 0) { s->content_ns = now; return 0; }   /* any non-black pixel: the client drew */
     if (!s->content_ns || now - s->content_ns > BLANK_HOLD_NS) return 0;
     /* The client is waiting for this buffer back to reuse it: return it on the limiter's cadence,
      * exactly as a replaced buffer is returned, and leave the surface showing what it shows. */
@@ -2049,9 +2057,27 @@ static void scene_size(int *w, int *h) {
     if (*w <= 0 || *h <= 0) { *w = INPUT_SPACE_W; *h = INPUT_SPACE_H; }
 }
 
-static void fire_all_frames(void) {
+static int fire_all_frames(void) {
     struct surface *s;
-    wl_list_for_each(s, &g_surfaces, link) fire_frames(&s->frames);
+    int n = 0;
+    wl_list_for_each(s, &g_surfaces, link) n += fire_frames(&s->frames);
+    return n;
+}
+
+/* Answer pending frame callbacks on an idle vsync tick. Without this they are only fired from
+ * render_scene(), which needs g_dirty - so a client that drew, committed and is now waiting for its
+ * next wl_surface.frame before drawing again is never woken once the guest goes idle: nothing is
+ * dirty, nothing renders, the callback never comes, the client stays parked in present and nothing
+ * commits. The display then holds its last frame until an input event sets g_dirty (measured:
+ * "ping-pong, then freezes on a single frame"). Same obligation pace_without_output() meets for the
+ * no-window case. Enabled by a marker so it can be A/B'd on one build. */
+static int idle_frames_on(void) {
+    static char marker[sizeof(g_log_path) + 20];
+    if (!marker[0]) {
+        if (!g_log_path[0]) return 0;
+        snprintf(marker, sizeof(marker), "%s.idle-frames", g_log_path);
+    }
+    return access(marker, F_OK) == 0;
 }
 
 /* With no output window (the app is in the background, or the SurfaceView is being rebuilt)
@@ -2550,7 +2576,25 @@ static void on_vsync(int64_t frame_time_ns) {
     if (vkp_apply_window_request()) g_dirty = 1;
     /* A screen-effect setting changed (JNI, any thread): redraw so it shows on a static scene too. */
     if (vkp_effects_sync()) g_dirty = 1;
-    if (g_dirty && !scene_waits_for_game(now)) render_scene();
+    if (g_dirty && !scene_waits_for_game(now)) {
+        render_scene();
+    } else if (idle_frames_on()) {
+        /* Nothing to draw, but a client may be parked waiting for its next frame callback (see
+         * idle_frames_on). Answer those, and drop feedback for surfaces that are not on screen, so
+         * an idle guest can still commit when it wants to. */
+        struct surface *s;
+        const int fired = fire_all_frames();
+        wl_list_for_each(s, &g_surfaces, link)
+            if (!s->drawn) feedback_discard_all(&s->feedback);
+        if (fired) {
+            static int64_t last_log;
+            if (now - last_log > 1000000000LL) {
+                last_log = now;
+                droiddeck_log("framedbg", "IDLE-FRAMES fired=%d (clients waited on a frame callback while idle)", fired);
+            }
+        }
+        wl_display_flush_clients(g_display);
+    }
 }
 
 /* ------------------------------------------------------------------ wl_seat */
