@@ -146,6 +146,20 @@ public class LinuxPanvkDriverManager {
         return m != null ? m.optString("driverVersion", "") : "";
     }
 
+    /**
+     * The Mali architectures the runtime's own driver carries, from the meta.json it ships
+     * ("gpuArch"), empty when it says nothing.
+     */
+    public int[] getBuiltinGpuArch() {
+        JSONObject m = builtinMeta();
+        if (m == null) return new int[0];
+        JSONArray archs = m.optJSONArray("gpuArch");
+        if (archs == null) return new int[0];
+        int[] out = new int[archs.length()];
+        for (int i = 0; i < out.length; i++) out[i] = archs.optInt(i);
+        return out;
+    }
+
     private JSONObject builtinMeta() {
         try {
             File meta = new File(LinuxRuntime.rootDir(context), META_NAME);

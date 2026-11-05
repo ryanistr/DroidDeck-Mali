@@ -594,9 +594,25 @@ class SessionService : Service() {
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_BIFROST ||
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_MIDGARD ||
                      gpuInfo.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALI_UNKNOWN
+        // Which driver the guest draws with is the driver's own claim, not a constant in the app:
+        // the imported one when one is chosen, the runtime's own build otherwise. A driver that
+        // names other generations than this GPU's cannot drive it at all, so it is not used for it.
+        val panvkManager = com.droiddeck.launcher.gpu.LinuxPanvkDriverManager(this)
+        val linuxDriverId = SessionPrefs.linuxDriver(this)
+        val chosenArchs = if (linuxDriverId.isNotEmpty()) panvkManager.getGpuArch(linuxDriverId) else IntArray(0)
+        val builtinArchs = panvkManager.getBuiltinGpuArch()
+        val chosenUsable = linuxDriverId.isEmpty() ||
+                com.droiddeck.launcher.gpu.MaliArch.carries(chosenArchs, gpuInfo.arch)
+        val effectiveArchs = if (chosenUsable) {
+            com.droiddeck.launcher.gpu.MaliArch.effective(chosenArchs, builtinArchs, gpuInfo.panvkArchs)
+        } else {
+            com.droiddeck.launcher.gpu.MaliArch.effective(null, builtinArchs, gpuInfo.panvkArchs)
+        }
         // An unknown Mali (arch 0) is given the benefit of the doubt; a known generation with no
-        // backend here is not, because PanVK fails at device creation and the session never starts.
-        val maliPanvk = isMali && (gpuInfo.arch == 0 || gpuInfo.panvkBackend)
+        // backend in the driver that would be used is not, because PanVK fails at device creation
+        // and the session never starts.
+        val maliPanvk = isMali && (gpuInfo.arch == 0 ||
+                com.droiddeck.launcher.gpu.MaliArch.carries(effectiveArchs, gpuInfo.arch))
 
         if (isMali) {
             guest.add("BL_GPU_FAMILY=mali")
@@ -637,16 +653,17 @@ class SessionService : Service() {
         // VK_DRIVER_FILES, so the runtime's own driver above stays untouched and is what a bad
         // import falls back to. One driver for every session: the driver's shader cache is keyed on
         // its build, and with one per mode every emulator compiled its shaders twice.
-        val linuxDriverId = SessionPrefs.linuxDriver(this)
         if (isMali) {
             // A build that names other generations than this GPU's cannot drive it at all: say so
-            // here, where the log of a session that renders nothing gets read, not in a toast.
-            if (linuxDriverId.isNotEmpty() &&
-                !com.droiddeck.launcher.gpu.LinuxPanvkDriverManager(this).canDrive(linuxDriverId, gpuInfo.arch)) {
+            // here, where the log of a session that renders nothing gets read, not in a toast, and
+            // leave the session on the runtime's own driver rather than pointing it at one that
+            // cannot drive this GPU.
+            if (!chosenUsable) {
                 Log.w(TAG, "GPU: Mali ${gpuInfo.name} is Valhall v${gpuInfo.arch}, and the chosen PanVK " +
-                        "driver ($linuxDriverId) was built for other generations")
+                        "driver ($linuxDriverId) was built for other generations: using the runtime's own driver")
             }
-            com.droiddeck.launcher.gpu.LinuxPanvkDriver.resolveIcdPath(this, linuxDriverId)
+            val driverForSession = if (chosenUsable) linuxDriverId else ""
+            com.droiddeck.launcher.gpu.LinuxPanvkDriver.resolveIcdPath(this, driverForSession)
                 ?.let { guest.add(com.droiddeck.launcher.gpu.LinuxPanvkDriver.ENV + "=" + it) }
         } else {
             LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)

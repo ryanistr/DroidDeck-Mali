@@ -72,6 +72,12 @@ data class GpuInfo(
     /** Whether this build carries the PanVK backend this Mali GPU's architecture needs. */
     val panvkBackend: Boolean get() = arch in PANVK_ARCHS
 
+    /**
+     * The generations the runtime's own driver carries, as the app knows them. The driver's own
+     * metadata says the same thing when it is readable; this is the fallback for when it is not.
+     */
+    val panvkArchs: IntArray get() = PANVK_ARCHS
+
     /** One line for the device card and the system check, in English for the device report. */
     val supportText: String
         get() = when (support) {

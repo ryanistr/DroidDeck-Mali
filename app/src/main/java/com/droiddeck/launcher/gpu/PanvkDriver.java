@@ -47,10 +47,10 @@ public final class PanvkDriver {
     /** Bundled driver id (unpacked on demand from the matching tzst asset). */
     public static final String BUNDLED_PANVK = "panvk-android-24.3.0";
     /**
-     * The Mali architectures each bundled build carries, read from the driver's own `panvk_vN_`
-     * symbols (the one bundled build has v9 and no v11 at all). A GPU of a generation a build does
-     * not carry enumerates nothing, so this is what decides whether the compositor has a driver
-     * for this device at all - the vendor blob is what renders when it does not.
+     * The Mali architectures the bundled display driver carries. Its library also holds the v6/v7
+     * Bifrost and the v10/v12/v13/v14 CSF backends, but only the v9 Job Manager path over kbase has
+     * been run on a device from this tree, and a generation that is merely present in the binary is
+     * not one this app has measured: that GPU is left to its own driver (see [chooseByDevice]).
      */
     private static final int[] BUNDLED_ARCHS = {9};
     /** Version of the bundled asset; bumping it re-unpacks the file over a copy already on the
@@ -466,12 +466,14 @@ public final class PanvkDriver {
             Log.i(TAG, "mali v" + arch + ": " + silent + " does not say which generations it carries; using it");
             return silent;
         }
-        // Nothing carries this generation - say so rather than let a session render through a
-        // driver that cannot drive the GPU and look like a frame-handoff bug.
+        // Nothing carries this generation. The GPU's own driver is the one that can drive it, so
+        // the system Vulkan driver is used and ours is not forced onto a GPU it cannot drive: a
+        // build without the backend for this generation enumerates no physical device at all.
         int[] bundled = gpuArch(BUNDLED_PANVK);
-        if (arch > 0 && !canDrive(BUNDLED_PANVK, arch)) {
+        if (arch > 0) {
             Log.w(TAG, "no installed PanVK display driver carries a Mali v" + arch + " backend (the bundled "
-                    + BUNDLED_PANVK + " carries v" + join(bundled) + "): the compositor has no driver for this GPU");
+                    + BUNDLED_PANVK + " carries v" + join(bundled) + "): using the system Vulkan driver");
+            return null;
         }
         // A hidden bundled driver means "system Vulkan" here, as it does on Adreno.
         if (hiddenBundled().contains(BUNDLED_PANVK)) {
