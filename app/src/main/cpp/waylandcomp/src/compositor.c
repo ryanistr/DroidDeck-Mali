@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -821,6 +822,61 @@ extern void droiddeck_on_game_program(int pid, const char *program);
 
 static int g_dmabuf_import_unsupported = 0;
 
+/* ---- the guest's producer fence ----
+ * The guest renders the buffer with its own GPU and hands the fd over. Under implicit sync the
+ * producer leaves its render fence on the dma-buf, and the consumer is expected to wait for it
+ * before reading the buffer: without that wait the compositor samples the buffer before the
+ * guest's writes have landed and draws the previous content of that slot - the ping-pong
+ * (docs/development/ping-pong-frame-handoff.md).
+ *
+ * The fence comes out with DMA_BUF_IOCTL_EXPORT_SYNC_FILE (linux/dma-buf.h, which the NDK's
+ * headers do not carry). A producer that leaves no fence behind makes the ioctl fail, and then
+ * there is nothing to wait for - which is what the kbase export path does today
+ * (kbase_kmod.c bo_export_fd only dups the fd).
+ */
+struct droiddeck_dma_buf_export_sync_file { uint32_t flags; int32_t fd; };
+#define DROIDDECK_DMA_BUF_SYNC_READ 1u
+#define DROIDDECK_DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR('b', 2, struct droiddeck_dma_buf_export_sync_file)
+
+/* Which of the three sync-file ioctls this kernel answers. DMA_BUF_IOCTL_SYNC_FILE is the legacy
+ * one; GET_SYNC_FILE and EXPORT_SYNC_FILE came later, and a dma-buf that has no fence attached
+ * answers a supported ioctl with ENOENT rather than ENOTTY - so the errno tells the two apart. */
+struct droiddeck_dma_buf_sync_file { uint32_t flags; int32_t fd; };
+struct droiddeck_dma_buf_fence { uint32_t fd; uint32_t flags; };
+#define DROIDDECK_DMA_BUF_IOCTL_SYNC_FILE _IOWR('b', 0, struct droiddeck_dma_buf_sync_file)
+#define DROIDDECK_DMA_BUF_IOCTL_GET_SYNC_FILE _IOWR('b', 1, struct droiddeck_dma_buf_fence)
+
+/* 1 = the producer's fence was there and has been waited for, 0 = the producer left none,
+ * -1 = it did not signal in time. */
+static int wait_producer_fence(int fd, int timeout_ms) {
+    /* One attempt per session: a kernel without the dma-buf sync-file ioctls answers every call
+     * with ENOTTY, and a per-frame ioctl for a fence that can never exist is just overhead. */
+    static int g_unsupported;
+    static int g_nofence_logged;
+    if (fd < 0 || g_unsupported) return 0;
+    struct droiddeck_dma_buf_export_sync_file exp = {.flags = DROIDDECK_DMA_BUF_SYNC_READ, .fd = -1};
+    if (ioctl(fd, DROIDDECK_DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) != 0) {
+        if (errno == ENOTTY) g_unsupported = 1;
+        if (!g_nofence_logged) {
+            g_nofence_logged = 1;
+            droiddeck_log("framedbg", "producer fence: none on this dma-buf (%s) - the guest's writes are unsynchronised",
+                          strerror(errno));
+        }
+        return 0;
+    }
+    if (exp.fd < 0) return 0;
+    struct pollfd p = {.fd = exp.fd, .events = POLLIN};
+    int r;
+    do { r = poll(&p, 1, timeout_ms); } while (r < 0 && errno == EINTR);
+    close(exp.fd);
+    if (r <= 0) {
+        droiddeck_log("framedbg", "producer fence: not signalled in %d ms (%s)", timeout_ms,
+                      r == 0 ? "timeout" : strerror(errno));
+        return -1;
+    }
+    return 1;
+}
+
 /* ---- reading a committed frame on the CPU ----
  * The compositor advertises linear modifiers only, so the client's frames arrive as plain,
  * CPU-readable memory and no GPU readback is needed. out = {mean luma, max, count > 32, samples},
@@ -857,6 +913,41 @@ static int dmabuf_sample(const struct dmabuf_buffer *b, unsigned long out[4], ui
     return 0;
 }
 
+/* The same content read back from the GPU (the imported image the compositor draws) rather than
+ * from the CPU mapping of the fd. The two disagree when the guest's writes are not visible to the
+ * host's reader, which is what decides whether a stale frame is the guest's doing or ours. */
+static int dmabuf_sample_gpu(const struct dmabuf_buffer *b, unsigned long out[4], uint32_t *fingerprint) {
+    static uint32_t *px;
+    static int px_cap;
+    int n_px = b->width * b->height;
+    if (!b->img || n_px <= 0) return -1;
+    if (n_px > px_cap) {
+        uint32_t *np = realloc(px, (size_t)n_px * sizeof(uint32_t));
+        if (!np) return -1;
+        px = np;
+        px_cap = n_px;
+    }
+    if (vkp_image_readback(b->img, px, n_px) != 0) return -1;
+    const int sx = b->width / 64 + 1, sy = b->height / 36 + 1;
+    unsigned long sum = 0, hi = 0, max = 0, n = 0;
+    uint32_t fp = 2166136261u;
+    for (int y = 0; y < b->height; y += sy) {
+        for (int x = 0; x < b->width; x += sx) {
+            uint32_t v = px[(size_t)y * b->width + x];   /* 0xAARRGGBB */
+            unsigned r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, bl = v & 0xff;
+            unsigned l = (r * 77 + g * 151 + bl * 28) >> 8;
+            sum += l;
+            if (l > max) max = l;
+            if (l > 32) hi++;
+            n++;
+            fp = (fp ^ l) * 16777619u;
+        }
+    }
+    out[0] = n ? sum / n : 0; out[1] = max; out[2] = hi; out[3] = n;
+    if (fingerprint) *fingerprint = fp;
+    return 0;
+}
+
 /* ---- idle-alternation bring-up probe (grep the session log for "probe") ----
  * Says whether the buffer the compositor is about to draw holds content or is empty, which
  * separates "the client's ring really alternates" from "the client is fine and the compositor
@@ -880,9 +971,13 @@ static void frame_probe(struct surface *s, const struct dmabuf_buffer *b, struct
         droiddeck_log("probe", "#%u res=%p fd=%d unreadable", ++seq, (void *)buffer, b->fd[0]);
         return;
     }
-    droiddeck_log("probe", "#%u res=%p fd=%d b=%p %dx%d stride=%u mean=%lu max=%lu hi=%lu/%lu fp=%08x dmg=%d/%lld",
+    unsigned long g[4];
+    uint32_t gfp = 0;
+    int have_gpu = dmabuf_sample_gpu(b, g, &gfp) == 0;
+    droiddeck_log("probe", "#%u res=%p fd=%d b=%p %dx%d stride=%u mean=%lu max=%lu hi=%lu/%lu fp=%08x dmg=%d/%lld gpu=%s mean=%lu max=%lu hi=%lu/%lu fp=%08x",
                   ++seq, (void *)buffer, b->fd[0], (void *)b, b->width, b->height, b->stride[0],
-                  v[0], v[1], v[2], v[3], (unsigned)fp, s->damage_n, s->damage_area);
+                  v[0], v[1], v[2], v[3], (unsigned)fp, s->damage_n, s->damage_area,
+                  have_gpu ? "y" : "n", g[0], g[1], g[2], g[3], (unsigned)gfp);
 }
 
 /* ---- blank-frame hold ----
@@ -946,6 +1041,28 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
         b->import_failed = 1;
     }
     if (b->img) {
+        /* The guest renders this buffer on its own GPU. Wait for its producer fence before the
+         * buffer is sampled or drawn, or the compositor can use the previous content of the slot. */
+        wait_producer_fence(b->fd[0], 100);
+        { static int g_census_done;
+          if (!g_census_done && frame_probe_on()) {
+            g_census_done = 1;
+            struct droiddeck_dma_buf_sync_file sf = {.flags = DROIDDECK_DMA_BUF_SYNC_READ, .fd = -1};
+            int r0 = ioctl(b->fd[0], DROIDDECK_DMA_BUF_IOCTL_SYNC_FILE, &sf);
+            int e0 = errno;
+            struct droiddeck_dma_buf_fence gf = {.fd = -1};
+            int r1 = ioctl(b->fd[0], DROIDDECK_DMA_BUF_IOCTL_GET_SYNC_FILE, &gf);
+            int e1 = errno;
+            struct droiddeck_dma_buf_export_sync_file ef = {.flags = DROIDDECK_DMA_BUF_SYNC_READ, .fd = -1};
+            int r2 = ioctl(b->fd[0], DROIDDECK_DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &ef);
+            int e2 = errno;
+            droiddeck_log("framedbg", "sync-file census: SYNC_FILE r=%d fd=%d errno=%d(%s) | GET_SYNC_FILE r=%d fd=%d errno=%d(%s) | EXPORT_SYNC_FILE r=%d fd=%d errno=%d(%s)",
+                          r0, sf.fd, e0, strerror(e0), r1, gf.fd, e1, strerror(e1), r2, ef.fd, e2, strerror(e2));
+            if (r0 == 0 && sf.fd >= 0) close(sf.fd);
+            if (r1 == 0 && (int)gf.fd >= 0) close(gf.fd);
+            if (r2 == 0 && ef.fd >= 0) close(ef.fd);
+          }
+        }
         { static unsigned g_dbg_dmabuf;
           droiddeck_log("framedbg", "#%u DMABUF res=%p b=%p img=%p (%dx%d fmt=0x%08x) gen=%u",
                         ++g_dbg_dmabuf, (void *)buffer, (void *)b, (void *)b->img,
