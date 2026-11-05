@@ -27,12 +27,21 @@ stack from the ground up** from source instead of shipping the vendor blob.
 - **Reference target:** MediaTek MT6893 (Dimensity 1200/8050), **Mali-G77 MC9** (Valhall, arch 9), on a
   rooted Infinix GT 10 Pro (X6739). `GpuInfo`/`DeviceReport` special-case this SoC by name.
 - **The stack rebuilt here:**
-  - **Mesa PanVK** (the panfrost Vulkan driver), built two ways from one source tree:
-    `tools/panvk/build-panvk.sh` (glibc, for the runtime) and `tools/panvk/build-panvk-android.sh`
-    (bionic, for the app's compositor). Both apply the patches in `tools/panvk/mesa-patches/`.
+  - **Mesa PanVK** (the panfrost Vulkan driver), built three ways from two source trees:
+    - **The Mali-G57 fork** (`tools/panvk-g57/build-panvk-g57.sh` + `tools/panvk-g57/patches/0001..0008`),
+      published as `PanVK-rynx-<version>-<patch>`. This is the **glibc runtime driver the app
+      ships** (`tools/panvk/release.env` pins its tag and sha); its kbase support is compiled into
+      the driver, so no separate backend library is needed beside it.
+    - **Upstream Mesa 24.3.0** (`tools/panvk/build-panvk.sh` glibc, `tools/panvk/build-panvk-android.sh`
+      bionic) with `tools/panvk/mesa-patches/` (0002 kbase support, 0003 arch-9 JM). The **bionic**
+      half is what the compositor uses (`assets/graphics_driver/panvk-android-24.3.0.tzst`); it
+      reaches kbase through the Rust cdylib below.
   - **A kbase backend written in Rust** (`app/src/main/rust/panvk-kbase-jm/`, `libpanvk_kbase_jm.so`)
     that drives ARM's proprietary `mali_kbase` kernel module directly over `/dev/mali0`. Stock
     upstream Mesa has no way to reach this kernel driver; this is the "from the ground up" part.
+    It is what the 24.3.0 Mesa line `dlopen()`s; the shipped G57 fork has its own in-tree C backend.
+  - `tools/panvk-gs101-test/` is an **experiment only** (a foreign patch set, measured and rejected);
+    it never publishes a release and never appears in `release.env`.
 - **Compatibility layers** for Mali that upstream does not provide: DRM-node emulation for the
   KMS-only MediaTek display controller, GPU-family classification (Midgard/Bifrost/Valhall/unknown),
   and driver selection that switches the whole app onto the PanVK path for any Mali family.
@@ -126,7 +135,8 @@ used the wrong artifact. Always run Gradle online.
 
 #### Session scripts and preloads
 
-- Key scripts: `droiddeck-session` (entry), `droiddeck-clipboard` (guest clipboard bridge), `droiddeck-desktop`/`droiddeck-gpu`/`droiddeck-desktop-gpu` (desktop launchers), `steam-compatibility` (Proton environment), `droiddeck-agent` (guest agent for `droiddeckctl guest/cdp`).
+- Key scripts: `droiddeck-session` (entry), `droiddeck-agent` (guest agent for `droiddeckctl guest/cdp`), `steam-compatibility` (Proton environment), plus the many `droiddeck-*` helpers in `tools/linuxfs/overlay/usr/local/bin/`.
+- Desktop launchers (`droiddeck-desktop`, `droiddeck-gpu`, `droiddeck-desktop-gpu`) live in `tools/linuxfs/desktop/`, **not** in the overlay; the clipboard bridge is compiled from `tools/linuxfs/clipboard/clipboard.c`.
 - Preloads (`libblsession.so`): `dircache`, `drm`, `fsync`, `inputudev`, `kgslid`, `kgslpoll`, `links`, `lock`, `net`, `netif`, `ntsync`, `opens`, `pathcache`, `perms`, `robust`, `space`, `storage`, `sysv`, `tracefs`, `tracer`, `udevmon`, `xmode`. They intercept glibc syscalls to translate paths, emulate fstat, handle storage binds, and manage fake evdev input.
 - `libfakeinput.so` (built from `fakeinput_steam.cpp`): provides virtual evdev devices (keyboard, mouse, touchpad, gamepad) for the guest; rings in `files/session/fakeinput/`.
 - `libblfastpath.so` + `libblaudit.so`: proot fast-path trampoline (`PROOT_FASTPATH=1`); bypasses seccomp stops for translated syscalls. See `docs/development/proot-performance.md`.
@@ -140,6 +150,8 @@ used the wrong artifact. Always run Gradle online.
   - **Post-processing shaders** (`shaders/`): CAS, FSR, FXAA, NIS, CRT, deband, toon, NTSC, SGsr, color grading, HDR encode. Compiled to SPIR-V headers (`*_frag.h`, `*_vert.h`).
   - **Device info** (`deviceinfo/`): `vkinfo` for GPU enumeration.
   - **Termux PTY helper** (`termux/termux.c`): PTY for the secondary-display Linux shell.
+  - **sdnative** (`sdnative/sdnative.c`): the release fence the fake-input ring writer needs.
+  - **Direct scanout** (`scanout/ScanoutContext.h`): renderer-neutral SurfaceControl scanout plan; header only so far.
   - **adrenotools** (`adrenotools/`): Adreno GPU driver loader (bionic side), hook for Vulkan ICD selection.
   - **fakeinput_steam.cpp**: Built separately as glibc aarch64 preload (`libfakeinput.so`), not by CMake.
 - The compositor's generated Wayland protocol stubs live in `waylandcomp/generated/` from XML in `waylandcomp/protocols/`; regenerate rather than hand-editing (see `waylandcomp/ZERO_COPY_SPIKE.md` for zero-copy dmabuf design).
@@ -148,6 +160,7 @@ used the wrong artifact. Always run Gradle online.
 ### Rust store engines
 
 - `app/src/main/rust/stores` cross-compiles `libdroiddeckstores.so` via cargo-ndk (Gradle task `buildRustStores`). Ported from Bannerlator's `bl-steam-client`; the exact JNI contract (symbol names, listener signatures, threading, handle lifetime) is `app/src/main/rust/stores/JNI.md`.
+- A second crate, `app/src/main/rust/panvk-kbase-jm/`, builds `libpanvk_kbase_jm.so` (Gradle task `buildPanvkKbaseJm`) — the kbase Job Manager backend behind the 24.3.0 Mesa line. It has no host tests; only `stores` does.
 - The library is optional: with `-PskipRust=true` it is absent, so **every call site must catch `UnsatisfiedLinkError` and degrade to "store unavailable"**.
 - `tools/release/check_android_libraries.py` verifies the exported JNI symbols and the ELF dependency closure in the actual APK.
 
@@ -163,7 +176,7 @@ used the wrong artifact. Always run Gradle online.
 
 ### Pinned components (fetched, never committed)
 
-Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esync packs, uruntime, mangoapp, the msitools binaries, and the Mali **PanVK** driver are pinned by checksummed `release.env` / `packages.txt` files under `tools/` and downloaded from GitHub releases during the build (cached by checksum). Component build workflows (`build-gamescope.yml`, `build-desktop-kde.yml`, `build-aaudio-sink.yml`, `build-panvk.yml`) produce those release assets on arm64 runners; they are separate from the APK build.
+Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esync packs, uruntime, mangoapp, the msitools binaries, and the Mali **PanVK** driver are pinned by checksummed `release.env` / `packages.txt` files under `tools/` and downloaded from GitHub releases during the build (cached by checksum). Component build workflows (`build-gamescope.yml`, `build-desktop-kde.yml`, `build-aaudio-sink.yml`, `build-panvk-g57.yml`) produce those release assets on arm64 runners; they are separate from the APK build. `build-panvk-gs101-test.yml` is an experiment-only workflow (artifacts, never a release).
 
 #### Component details
 
@@ -173,10 +186,10 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 | desktop-kde | KDE Plasma + Vapor theme (`tools/desktop-kde/overlay/`) | Linux desktop environment |
 | droiddeck-esync | `tools/droiddeck-esync/release.env` | esync/fastsync packs for Proton |
 | DirectAudio relay | `tools/directaudio/` | PulseAudio → AAudio sink (`module-aaudio-sink`) |
-| uruntime | VHSgunzo/uruntime | AppImage runtime (x86 AppImages) |
+| uruntime | VHSgunzo/uruntime (`tools/linuxfs/uruntime.env`) | AppImage runtime (x86 AppImages) |
 | mangoapp | `tools/mangoapp/` | MangoHud overlay |
 | msitools | `tools/msitools/` | MSI installer extraction (Windows components) |
-| PanVK (Mesa) | `tools/panvk/` (release.env + build scripts + Mesa patches) | Mali Vulkan driver, glibc (runtime) and bionic (compositor); see the Mali/GPU sections |
+| PanVK (Mesa) | `tools/panvk-g57/` + `tools/panvk/release.env` (glibc runtime driver), `tools/panvk/` (24.3.0 bionic half + Mesa patches) | Mali Vulkan driver; see the Mali/GPU sections |
 
 ### Runtime input attestation
 
@@ -210,7 +223,9 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 - **Comments explain *why*, one short line, and are omitted when the code is self-evident.** Do not narrate the code or talk to the reader through comments.
 - **Commits:** conventional-ish prefixes (`feat:`, `fix:`, `perf:`, or a plain capitalized summary), often with the PR number (`(#NNN)`). No `Co-Authored-By` / agent attribution lines, ever.
 - **`droiddeckctl` gating:** `run`, `guest`, `cdp`, `env` mutations, `override`, and `prefs` require **Setup → Session → Debugging tools** (off by default, exit code 7 when refused). The bridge provider answers commands as JSON over `content://com.droiddeck.launcher.agent` and requires `android.permission.DUMP`. See `docs/agent-control.md` for commands, exit codes, and limits.
-- **Every new Mali/PanVK/device finding updates `docs/development/panvk-mali-g77-bringup.md` in the same commit/change that produced it.** If a discovery is left only in chat or session logs it is effectively lost; the doc is the durable memory. This covers driver builds, CI gotchas, on-device measurements, dead ends, and fixes.
+- **Every new Mali/PanVK/device finding updates `docs/development/panvk-mali-g77-bringup.md` in the same commit/change that produced it.** If a discovery is left only in chat or session logs it is effectively lost; the doc is the durable memory. This covers driver builds, CI gotchas, on-device measurements, dead ends, and fixes. `docs/development/ping-pong-frame-handoff.md` holds the compositor frame ping-pong investigation.
+- **A Mesa checkout at the repo root (`/mesa/`) is gitignored scratch**, never source; the driver builds clone their own tree.
+- **The compositor's frames are logged in the session `app.log`, not `wayland.log`** — `wayland.log` is not a per-session file.
 - **Never work in `/tmp`** (host machine rule: it is RAM-backed; use the repo or `~/` for scratch).
 
 ### Storage and paths
@@ -223,11 +238,14 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 
 ### GPU driver system
 
+- **PanvkReleases** (`gpu/PanvkReleases.kt`) and **TurnipReleases** (`gpu/TurnipReleases.kt`): the in-app
+  driver release lists. Every published PanVK build is an option; the pick is by Mali generation.
+  `tools/release/update_catalog.py` builds the one-file update catalog the app reads.
 - **DriverBundle** (`gpu/DriverBundle.kt`): matched pairs of Android (bionic) + Linux (glibc) Turnip drivers in one zip with `manifest.json`. Both halves installed together; selecting one sets both.
-- **TurnipDriver** (`gpu/TurnipDriver.kt`): manages Android-side `libvulkan_freedreno.so` in app's native lib dir; `meta.json` with build info.
-- **LinuxVulkanDriverManager** (`gpu/LinuxVulkanDriverManager.kt`): manages Linux-side driver in rootfs `usr/share/vulkan/icd.d/`.
+- **TurnipDriver** (`gpu/TurnipDriver.java`): manages Android-side `libvulkan_freedreno.so` in app's native lib dir; `meta.json` with build info.
+- **LinuxVulkanDriverManager** (`gpu/LinuxVulkanDriverManager.java`): manages Linux-side driver in rootfs `usr/share/vulkan/icd.d/`.
 - **SessionPrefs** stores active `androidDriver` and `linuxDriver` IDs; `DriverBundle.active(context)` returns the matching bundle if both halves are set.
-- Default drivers shipped in `assets/graphics_driver/` (`adrenotools-turnip*.tzst`).
+- Default drivers shipped in `assets/graphics_driver/` (`adrenotools-turnip*.tzst`, `panvk-android-24.3.0.tzst`).
 - **Mali / PanVK** (this fork's focus) uses the same two-halves split, but on PanVK instead of Turnip:
   - `PanvkDriver` (`gpu/PanvkDriver.java`): the **bionic** driver the app's compositor runs to put a
     finished frame on screen. Bundled zips live in `assets/graphics_driver/` (`panvk-android-*.tzst`);
@@ -239,10 +257,10 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
     only after checking the manifest and its library are readable.
   - `DriverMenus.kt`, `SessionService.kt`, `SessionActivity.kt` and `DeviceReport.kt` branch on
     `GpuInfo`'s `MALI_*` families and use these PanVK classes in place of the Turnip ones.
-- Pinning: `tools/panvk/release.env` (`PANVK_REPO`/`PANVK_TAG`/`PANVK_SHA256`) names the glibc PanVK
-  release; `tools/build_local.sh` fetches it and unpacks it into the staged `linuxfs/`.
-- CI: `.github/workflows/build-panvk.yml` builds that driver on `ubuntu-24.04-arm` (with a Rust
-  toolchain for the kbase cdylib) and publishes the release tag.
+- Pinning: `tools/panvk/release.env` (`PANVK_REPO`/`PANVK_TAG`/`PANVK_SHA256`, plus `PANVK_SOURCE`/`PANVK_WORKFLOW`)
+  names the glibc PanVK release; `tools/build_local.sh` fetches it and unpacks it into the staged `linuxfs/`.
+- CI: `.github/workflows/build-panvk-g57.yml` builds the shipped driver on `ubuntu-24.04-arm` and
+  publishes the release tag; `tools/panvk/release.env` names the tag and sha the APK build fetches.
 
 #### Mali / PanVK gotchas
 
@@ -255,14 +273,18 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
   would otherwise free an interior pointer (that mismatch was a glibc heap-corruption crash).
 - `droiddeck-session` sets `XWAYLAND_NO_GLAMOR=1` (Xwayland cannot use Gallium 3D on a display-only DRM
   node) plus `PANVK_DEBUG=startup`/`VK_LOADER_DEBUG=all`/`WAYLAND_DEBUG=1` as bring-up instrumentation.
-- The Mesa patch makes `libvulkan_panvk.so` `dlopen("libpanvk_kbase_jm.so")`. If that cdylib is not
+- The 24.3.0 Mesa line makes `libvulkan_panvk.so` `dlopen("libpanvk_kbase_jm.so")`; if that cdylib is not
   beside the driver, `CreateInstance` falls through to `VK_ERROR_INCOMPATIBLE_DRIVER` and gamescope
-  reports "failed to find physical device".
+  reports "failed to find physical device". **The shipped G57 driver does not use this path**: its
+  kbase backend is compiled in (`strings | grep -c libpanvk_kbase_jm` = 0), so a missing cdylib is
+  not the bug — do not "fix" its absence.
 - Stock Mesa 24.3 only enables PanVK on arches 6, 7 and 10; **arch 9 (Valhall)** comes from
   `tools/panvk/mesa-patches/0003-panvk-v9-jm.patch`. Without it a Valhall device enumerates no GPU.
-- The kbase backend is Rust on **both** halves: `build-panvk.sh` uses a host rustup toolchain for the
-  glibc cdylib, and Gradle's `buildPanvkKbaseJm` task cross-compiles it with cargo-ndk for Android. A
-  Rust toolchain is required to build either driver.
+- The G57 fork carries its own v9 JM backend and its CSF v10/v11 backends
+  (`tools/panvk-g57/patches/0003-enable-valhall-gen3-arch-11.patch`); it declares `gpuArch` [9, 10, 11].
+- The Rust kbase cdylib is built two ways: `tools/panvk/build-panvk.sh` uses a host rustup toolchain
+  for the glibc 24.3.0 driver, and Gradle's `buildPanvkKbaseJm` task cross-compiles it with
+  cargo-ndk for the bionic half. A Rust toolchain is required for either.
 
 ## Docs map
 
@@ -272,8 +294,9 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 | `docs/progress-log.md` | Running engineering log, newest first, with lessons and backlog |
 | `docs/agent-control.md` | `droiddeckctl` commands, state schema, test tags, scenarios |
 | `docs/releases/*.md` | Per-version release notes (first line is the release title) |
-| `docs/development/*.md` | Deep dives: stores, proot performance, Steam focus/display/touch, added games, flatpak, game environment, Windows components, storage |
+| `docs/development/*.md` | Deep dives: stores, proot performance, Steam focus/display/touch, added games, flatpak, game environment, Windows components, storage, GameHub GPU passthrough, SD-card storage |
 | `docs/development/panvk-mali-g77-bringup.md` | Live PanVK/Mali bring-up knowledge: driver pipeline/pins, dma-heap, CEF GPU, WSI dead-ends, hashes. **Update it in the same change as any new Mali/device finding** — never let a discovery live only in session history |
+| `docs/development/ping-pong-frame-handoff.md` | The compositor frame ping-pong investigation: what is PROVEN and which claims were withdrawn |
 | `docs/testing/*.md` | Device validation notes for specific features |
 | `tools/*/PATCHES.md` | What each patch to proot / gamescope does |
 
@@ -285,8 +308,8 @@ Gamescope, the KDE Plasma desktop package, the DirectAudio relay, droiddeck-esyn
 | Modify on-screen controls | `input/OnScreenControls.kt`, `input/PadBridge.kt`, `input/PadState.kt`, `ui/DeckControlsPanel.kt` |
 | Change session lifecycle | `session/SessionService.kt`, `session/SessionState.kt`, `session/SessionSuspendController.kt` |
 | Add frame generation effect | `framegen/lsfg/`, `framegen/winfg/`, `gpu/FrameGen.kt`, `ui/FrameGenMenu.kt` |
-| Modify GPU driver handling | `gpu/DriverBundle.kt`, `gpu/TurnipDriver.kt`, `gpu/LinuxVulkanDriverManager.java` |
-| Work on Mali / PanVK | `tools/panvk/` (build scripts, `mesa-patches/`, `release.env`), `app/src/main/rust/panvk-kbase-jm/`, `gpu/PanvkDriver.java`, `gpu/LinuxPanvkDriver*.java`, `tools/linuxfs/preload/drm.c` |
+| Modify GPU driver handling | `gpu/DriverBundle.kt`, `gpu/TurnipDriver.java`, `gpu/LinuxVulkanDriverManager.java` |
+| Work on Mali / PanVK | `tools/panvk-g57/` (shipped fork driver + patches), `tools/panvk/` (24.3.0 Mesa line, `mesa-patches/`, `release.env`), `app/src/main/rust/panvk-kbase-jm/`, `gpu/PanvkDriver.java`, `gpu/PanvkReleases.kt`, `gpu/LinuxPanvkDriver*.java`, `tools/linuxfs/preload/drm.c` |
 | Add Compose screen | `ui/` + `Modifier.exposeTestTags()` at root, add tags to `docs/agent-control.md` |
 | Modify proot behavior | `tools/proot/patches/`, `tools/proot/fastpath/`, `runtime/ProotFastPath.kt`, `runtime/LinuxRuntime.java` |
 | Update session scripts | `tools/linuxfs/overlay/usr/local/bin/droiddeck-*`, then `tools/build_local.sh` |

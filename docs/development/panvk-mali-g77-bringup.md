@@ -1835,3 +1835,78 @@ foreground, the same class of theft as `settings.overlay` in §27. The harness n
 `am start -n com.droiddeck.launcher/.SessionActivity` and re-checks focus up to 8 times before
 aborting. Until arm B completes, whether the SHM present path keeps the guest committing is **open**:
 one arm is a reproduction, not a discriminator. [E]
+
+---
+
+## 2026-11-05: what the ping-pong is *not*, measured on the device
+
+Three measurements on the connected G77 (`mt6893`, `102562537K104189`, kernel 5.10.270, Android 15),
+each taken with the compositor rebuilt and hot-swapped, so they are the compositor's own view of the
+guest's buffers rather than a screenshot diff.
+
+### 1. There is no producer fence to wait for on this kernel [E]
+
+The host never consumed the guest's producer fence. The consumer half is
+`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` on the guest's dma-buf, so the compositor now tries it (and logs the
+outcome once per session). The census of all three dma-buf sync-file ioctls, on a live guest buffer:
+
+```
+SYNC_FILE      r=-1 errno=25 (ENOTTY)
+GET_SYNC_FILE  r=-1 errno=25 (ENOTTY)
+EXPORT_SYNC_FILE r=-1 errno=25 (ENOTTY)
+```
+
+ENOTTY, not ENOENT: this kernel's dma-buf core implements none of them, so no fence can be exported
+from that buffer **or attached to it**. A host-side "wait for the producer" fix cannot exist on this
+device - the primitive is not there. Anything that needs the guest's writes to be ordered against the
+host's read has to be carried by the guest's driver instead. [E]
+
+### 2. The compositor does not invent the stale frame [E]
+
+The probe now samples each guest buffer twice: once through the CPU mapping of the fd, and once by
+reading the imported image back off the GPU (`vkp_image_readback`). Over 207 consecutive samples of
+the live guest ring the two views agreed **exactly** - same mean, same max, same fingerprint, 207/207.
+The CPU mapping is therefore not lying about what the compositor draws: whatever the host puts on
+screen is the content of the guest's buffer. The "2 of 3 slots identical, 1 slot a phase behind"
+shape is the guest's own ring, not the host's sampling. [E]
+
+This also retires the hypothesis that the blank-frame hold gate (`blank_frame_hold`, max-luma based)
+is picking the wrong frame because it read stale memory: the CPU and GPU views of the same buffer
+never disagreed.
+
+### 3. The guest's ring rotates three slots period-3, holding two contents [E]
+
+`fd 363 / 364 / 359` arrive in strict rotation (seq 1,2,3,4,5,6 ... = 363,364,359,363,364,359),
+each fd's content stable across its 69 samples (1-3 distinct fingerprints each), and the three
+contents are different from each other (mean 92 / 35 / 6). The compositor draws each commit as it
+arrives, so the screen cycles through the guest's ring by construction.
+
+### Where this leaves the fix
+
+Layers 1-2 are now closed on the host side: the host reads the guest's buffer coherently and has no
+fence primitive to wait with. The alternation is a property of the buffers the guest commits, so the
+remaining candidate is the producer: the guest's Mesa (the G57 fork, `kbase_kmod_bo_wait` returns true
+unconditionally, `kbase_kmod_bo_export_fd` only dups the fd) hands over shared BOs with no
+inter-process ordering, and the fork's own comment says as much - "For shared / exported BOs proper
+inter-process synchronisation must be handled at a higher level (e.g. via sync_file / Android fence)".
+This kernel offers no such channel (measurement 1), so the fix has to be the guest's own
+write-visibility, or the guest's ring has to stop holding stale content.
+
+That is the fork's own tree (`tools/panvk-g57/patches/`, driver built by
+`.github/workflows/build-panvk-g57.yml` on an arm64 runner), not this repo's compositor.
+
+### The bundled bionic asset's name and version are both stale
+
+`assets/graphics_driver/panvk-android-24.3.0.tzst` does not hold stock Mesa 24.3.0. The binary
+inside identifies as `Mesa 26.3.0-devel (git-850c82c6ab)`, and the asset's own `meta.json` names it
+"Mesa PanVK 1.2.0 (Mali-G57 fork, v9 JM kbase, AHB)" with `driverVersion 1.2.0`. It carries the fork's
+in-tree kbase backend (272 `kbase` strings, **zero** references to `libpanvk_kbase_jm`), so it does
+not use the Rust cdylib at all, and its `panvk_vN_` symbols are `v6 v7 v9 v10 v12 v13 v14` - **no
+`panvk_v11`**. Read the asset's `meta.json`, not its filename. [E]
+
+### Driver selection (the other half of the ask)
+
+`MaliArch` + `PanvkDriver`/`SessionService` now take the driver's generations from the driver's own
+metadata: an installed driver that does not name this GPU's generation is not used for it, and the
+GPU is left to its own driver instead of ours being forced onto it. Unit-tested in `MaliArchTest`,
+full `testReleaseUnitTest` green, built and installed on the device.
