@@ -1,0 +1,30 @@
+kbase: dump the native swapchain BOs of the real image size
+
+The bring-up dump only inspected 640x480x4 BOs, so on a session whose
+swapchain images are 1600x720 (4608000 bytes) it never printed the
+guest's own view of the buffer the compositor samples.  Widen the filter
+to the swapchain size actually in use so the guest-side ground truth
+exists.
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 09caa7d..f558d55 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1663,11 +1663,13 @@ kbase_kmod_debug_dump_native_bos(struct pan_kmod_dev *dev)
+       uint64_t size = kbase_dev->debug_bo_sizes[i];
+ 
+       /*
+-       * PANVKDBG: only touch the 640x480x4 native swapchain-image BOs.
+-       * Large grow-on-fault/heap mappings can SIGBUS on CPU access when
+-       * pages are not committed.
++       * PANVKDBG: only touch the native swapchain-image BOs.  Large
++       * grow-on-fault/heap mappings can SIGBUS on CPU access when pages are
++       * not committed, so skip anything that is not one of the known
++       * swapchain image sizes.
+        */
+-      if (!p || size != 640ull * 480ull * 4ull)
++      if (!p || (size != 640ull * 480ull * 4ull &&
++                 size != 1600ull * 720ull * 4ull))
+          continue;
+ 
+       /*

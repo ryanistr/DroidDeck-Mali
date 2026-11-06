@@ -1,0 +1,25 @@
+panfrost: add the Mali-G77 model row
+
+The MT6893's GPU reports gpu_id 0x90800011, which pan_prod_id() decodes
+as PAN_PROD_ID(9, 0, 0) (arch major 9, arch minor 0, product major 0).
+Neither this fork nor upstream Mesa has a row for that product id, so the
+device fell back to the conservative "Mali (unknown Valhall)" model: no
+anisotropic filtering, zero clock rates and a wrong marketing name.  The
+G57 is the same Valhall v9 core in a smaller configuration, so the G77
+reuses the G57 tile buffer sizes and rates.
+
+diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
+index 41d3fcc..ab11201 100644
+--- a/src/panfrost/model/pan_model.c
++++ b/src/panfrost/model/pan_model.c
+@@ -81,6 +81,10 @@ const struct pan_model pan_model_list[] = {
+    BIFROST_MODEL(PAN_PROD_ID(7, 2, 2),    "G52",    "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192)),
+    BIFROST_MODEL(PAN_PROD_ID(7, 4, 2),    "G52 r1", "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192)),
+ 
++   /* Mali-G77 (kbase TTRX, GPU_ID 0x9080): the same Valhall v9 core as
++    * the G57, so reuse the G57 tile buffer sizes and rates. */
++   VALHALL_MODEL(PAN_PROD_ID(9, 0, 0), 0, "G77",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
++                                              MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 1), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 3), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),

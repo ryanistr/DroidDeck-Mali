@@ -1910,3 +1910,53 @@ not use the Rust cdylib at all, and its `panvk_vN_` symbols are `v6 v7 v9 v10 v1
 metadata: an installed driver that does not name this GPU's generation is not used for it, and the
 GPU is left to its own driver instead of ours being forced onto it. Unit-tested in `MaliArchTest`,
 full `testReleaseUnitTest` green, built and installed on the device.
+
+## 2026-11-05: the G77 has no model row, and the fork's own dump never read the real swapchain BO
+
+Both are defects in the fork we ship (`tools/panvk-g57/patches/`, driver built by
+`.github/workflows/build-panvk-g57.yml` on an arm64 runner).
+
+### The G77 is not in the model table (measured)
+
+The device's GPU reports `gpu_id 0x90800011`. `pan_prod_id()` decodes that as
+`PAN_PROD_ID(9, 0, 0)` - arch major 9, arch minor 0, product major 0 - and **neither this fork nor
+upstream Mesa main has a row for it** (both tables stop at `(9,0,1)` and `(9,0,3)`, which upstream
+names "G57"/"G77" but whose *product major* is 1 and 3). The driver therefore logged, on every
+device:
+
+```
+panvk: unknown gpu_id (0x90800011) or variant (0); continuing with conservative
+"Mali (unknown Valhall)" defaults - expect issues
+```
+
+The fallback model is the smallest of the architecture: no anisotropic filtering, zero clock rates,
+and the wrong marketing name - so the device ran a driver that never claimed to know it. `0x9080` is
+kbase's `TTRX` model, which Arm's own tables name "Mali-G77", and the G57 is the same Valhall v9 core
+in a smaller configuration, so the G77 row reuses the G57 tile buffer sizes (16384/8192) and rates
+(`MODEL_RATES_X(2, 4, 8, 32, 32, 8)`).
+
+The community fork `zenithblue-oss/panvk-kbase-android` carries the same row
+(`patches/jm-v9/006-add-the-mali-g77-model-row.patch`), with the same `0x90800011` reasoning, for a
+POCO MT6891 that hit exactly this. We take it as `0009-add-mali-g77-model-row.patch`.
+
+### The guest's own view of the presented buffer was never dumped
+
+`kbase_kmod_debug_dump_native_bos()` only inspected BOs of exactly `640*480*4` bytes, so on a
+session whose swapchain images are 1600x720 the guest never printed its own post-CSYNC view of the
+buffer the compositor samples. The fork's registered BO sizes in a live session were `4608000`
+(= 1600x720x4, the real swapchain images), `2097152`, `8294400`, `134217728` and `144003072` - the
+filter matched none of them. `0010-dump-the-real-swapchain-bo-size.patch` widens it to the swapchain
+size actually in use, so the guest-side ground truth exists.
+
+### What that leaves
+
+With the guest's own view available the producer-side question becomes a direct comparison again:
+if the guest's CSYNC'd bytes of a buffer differ from the host's CPU *and* GPU reads of the same fd,
+the guest's writes are not visible to the host and the repair is the guest's write-visibility; if
+they agree, the guest is genuinely handing over the three different contents and the repair is the
+guest's ring.
+
+### Device state
+
+The device dropped off USB during this work (`adb devices` empty, no Android device in `lsusb`),
+so the two patches are written and verified to apply but not yet built and run on the phone.
