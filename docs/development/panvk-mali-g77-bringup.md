@@ -1960,3 +1960,59 @@ guest's ring.
 
 The device dropped off USB during this work (`adb devices` empty, no Android device in `lsusb`),
 so the two patches are written and verified to apply but not yet built and run on the phone.
+
+## 2026-11-06: p7 ships the G77 row; the census had probed the wrong ioctl
+
+### p7 is published and on the device
+
+`PanVK-rynx-1.2.0-p7` (sha256 `85a6935490d00876925945404cf6135bad3cf1d640c3fa96d8217df252b798c3`)
+carries 0009 and 0010: the G77 model row and the widened swapchain BO dump.
+`tools/panvk/release.env` is repinned to it, the apk was rebuilt locally
+(`app/build/outputs/apk/release/app-release.apk`, sha256 of the staged
+`assets/linuxfs/usr/lib/libvulkan_panvk.so`
+`626e2f92f982b63f67c36c2ddcbae6e20f7a5c3c382f54eadc65c79828d6731f`, with
+`Mali-G77` in its strings) and installed. `SessionFiles.stage` runs at every
+session start, so the new driver lands in `files/linuxfs/usr/lib` without
+re-downloading the runtime.
+
+The ping-pong still reproduces in a fresh READY session (20 screenshots at
+~120 ms: three distinct frame hashes, 8/7/5 occurrences), so the model row is
+not the repair.
+
+### The ioctl census probed a number no kernel implements
+
+`linux/dma-buf.h` in the 5.10 uapi defines exactly one sync ioctl:
+
+```c
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+```
+
+with `struct dma_buf_sync { __u64 flags; }` - a *flags* word, not a fence.
+`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`_IOWR('b', 2, ...)`) only exists from 6.1
+on, and `DMA_BUF_IOCTL_SYNC_FILE` / `GET_SYNC_FILE` were never upstream at
+all. So the census in `compositor.c` was calling:
+
+| probe | number | what the 5.10 uapi has there |
+|---|---|---|
+| `SYNC_FILE` (`_IOWR('b', 0)`) | 0xc0086202 | `DMA_BUF_IOCTL_SYNC` is 0x40086200 - a different ioctl |
+| `GET_SYNC_FILE` (`_IOWR('b', 1)`) | 0xc0086203 | `DMA_BUF_SET_NAME` |
+| `EXPORT_SYNC_FILE` (`_IOWR('b', 2)`) | 0xc0086204 | nothing (6.1+ only) |
+
+All three answered `ENOTTY (25)`, which is consistent with the kernel simply
+not having those numbers - it says nothing about the ioctl that *does* exist.
+`DMA_BUF_IOCTL_SYNC` was never probed: the legacy ioctl that asks the
+producer to make its writes visible, and the only one in this uapi that can.
+
+The census now also calls `DMA_BUF_IOCTL_SYNC` with `flags = DMA_BUF_SYNC_READ`
+and logs its errno. If it answers 0, the host can make the guest's writes
+visible with a bracketed START/END pair and the producer-side gap closes
+without touching the guest driver.
+
+### Device state
+
+The phone reboots under the Steam session (several times this session) and
+then locks its credential storage with a pattern the agent cannot draw, so
+the app's data directory is unreadable until a human unlocks it. The
+`su` domain cannot read `/data/user/0/<pkg>/files` while it is locked, and
+`adb pull` fails on it for the same reason.

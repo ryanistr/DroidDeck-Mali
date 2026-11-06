@@ -846,6 +846,16 @@ struct droiddeck_dma_buf_fence { uint32_t fd; uint32_t flags; };
 #define DROIDDECK_DMA_BUF_IOCTL_SYNC_FILE _IOWR('b', 0, struct droiddeck_dma_buf_sync_file)
 #define DROIDDECK_DMA_BUF_IOCTL_GET_SYNC_FILE _IOWR('b', 1, struct droiddeck_dma_buf_fence)
 
+/* The legacy dma-buf sync ioctl (linux/dma-buf.h): DMA_BUF_IOCTL_SYNC is _IOW('b', 0), not the
+ * _IOWR('b', 0) the sync-file census above uses - a different ioctl number, so that census says
+ * nothing about this one. It takes a flags word and is the only ioctl in the 5.10 uapi that can
+ * ask the *producer* to make its writes visible, so it is the one that matters here. */
+struct droiddeck_dma_buf_sync { uint64_t flags; };
+#define DROIDDECK_DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct droiddeck_dma_buf_sync)
+#define DROIDDECK_DMA_BUF_SYNC_READ 1u
+#define DROIDDECK_DMA_BUF_SYNC_WRITE 2u
+#define DROIDDECK_DMA_BUF_SYNC_END (1u << 2)
+
 /* 1 = the producer's fence was there and has been waited for, 0 = the producer left none,
  * -1 = it did not signal in time. */
 static int wait_producer_fence(int fd, int timeout_ms) {
@@ -1056,8 +1066,14 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
             struct droiddeck_dma_buf_export_sync_file ef = {.flags = DROIDDECK_DMA_BUF_SYNC_READ, .fd = -1};
             int r2 = ioctl(b->fd[0], DROIDDECK_DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &ef);
             int e2 = errno;
-            droiddeck_log("framedbg", "sync-file census: SYNC_FILE r=%d fd=%d errno=%d(%s) | GET_SYNC_FILE r=%d fd=%d errno=%d(%s) | EXPORT_SYNC_FILE r=%d fd=%d errno=%d(%s)",
-                          r0, sf.fd, e0, strerror(e0), r1, gf.fd, e1, strerror(e1), r2, ef.fd, e2, strerror(e2));
+            /* The legacy sync ioctl, which the sync-file census above never touches: it asks the
+             * producer to make its writes visible to this reader. */
+            struct droiddeck_dma_buf_sync sync = {.flags = DROIDDECK_DMA_BUF_SYNC_READ};
+            int r3 = ioctl(b->fd[0], DROIDDECK_DMA_BUF_IOCTL_SYNC, &sync);
+            int e3 = errno;
+            droiddeck_log("framedbg", "sync-file census: SYNC_FILE r=%d fd=%d errno=%d(%s) | GET_SYNC_FILE r=%d fd=%d errno=%d(%s) | EXPORT_SYNC_FILE r=%d fd=%d errno=%d(%s) | DMA_BUF_IOCTL_SYNC r=%d errno=%d(%s)",
+                          r0, sf.fd, e0, strerror(e0), r1, gf.fd, e1, strerror(e1), r2, ef.fd, e2, strerror(e2),
+                          r3, e3, strerror(e3));
             if (r0 == 0 && sf.fd >= 0) close(sf.fd);
             if (r1 == 0 && (int)gf.fd >= 0) close(gf.fd);
             if (r2 == 0 && ef.fd >= 0) close(ef.fd);
