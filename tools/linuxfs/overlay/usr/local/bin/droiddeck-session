@@ -118,14 +118,23 @@ export PANVK_FD_INTEROP=1
 # the guest on the MIT-SHM copy path. On MediaTek the `system` node exists but does not serve
 # kbase; the `mtk_mm` heaps do. Prefer those, then fall back to `system` for devices where it
 # works. Harmless on Adreno: nothing but PanVK reads the variable.
-for _panvk_heap in /dev/dma_heap/mtk_mm /dev/dma_heap/mtk_mm-uncached /dev/dma_heap/system; do
-  if [ -r "$_panvk_heap" ]; then
-    export PANVK_KBASE_DMA_HEAP="$_panvk_heap"
-    echo "== panvk dma-heap: $PANVK_KBASE_DMA_HEAP"
-    break
-  fi
-done
-unset _panvk_heap
+#
+# A caller-set value wins, so a session can pick the heap: `mtk_mm` is cached and `mtk_mm-uncached`
+# is not, and which one the guest renders through decides whether the guest's GPU writes are
+# visible to the host's GPU without an explicit flush. The cached heap is the default because it
+# is the faster of the two; a caller that needs uncached memory asks for it by name.
+if [ -z "${PANVK_KBASE_DMA_HEAP:-}" ]; then
+  for _panvk_heap in /dev/dma_heap/mtk_mm /dev/dma_heap/mtk_mm-uncached /dev/dma_heap/system; do
+    if [ -r "$_panvk_heap" ]; then
+      export PANVK_KBASE_DMA_HEAP="$_panvk_heap"
+      echo "== panvk dma-heap: $PANVK_KBASE_DMA_HEAP"
+      break
+    fi
+  done
+  unset _panvk_heap
+else
+  echo "== panvk dma-heap: $PANVK_KBASE_DMA_HEAP (from the session env)"
+fi
 # kbase_dmabuf also needs this non-empty and not "0": without it the WSI keeps its MIT-SHM blit
 # path even on a driver that reports its DRM device, and the screen never leaves the startup
 # movie's last frame. Measured on session 2026-10-14-35-steam with the p6 driver: unset ->
