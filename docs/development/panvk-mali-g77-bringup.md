@@ -2016,3 +2016,124 @@ then locks its credential storage with a pattern the agent cannot draw, so
 the app's data directory is unreadable until a human unlocks it. The
 `su` domain cannot read `/data/user/0/<pkg>/files` while it is locked, and
 `adb pull` fails on it for the same reason.
+
+## 2026-11-06: p7 on the device - the G77 row works, and the legacy sync ioctl is answered
+
+### The G77 is now recognised
+
+`session.log` from session `2026-11-06-07-steam` (p7 driver, `PANVK_VERBOSE=1`):
+
+```
+PANVKDBG NATIVEBO REGISTER gpu=0000007051200000 cpu=0x7051200000 size=4608000 count=4
+```
+
+and the driver's own name in the log is `Mali-G77` - twice - with no
+`Mali (unknown Valhall)` and no `unknown gpu_id` line anywhere. The fallback
+is gone; the device runs the G77 row's tile buffer sizes (16384/8192, same
+as the G57 row it reuses) and its clock rates.
+
+The 1600x720 swapchain BO (`4608000` bytes) is now registered by the
+bring-up dump, which the old 640x480-only filter could never match.
+
+### The legacy dma-buf sync ioctl is answered (this is the new result)
+
+The census now also calls `DMA_BUF_IOCTL_SYNC` - `_IOW('b', 0, struct
+dma_buf_sync)`, the only synchronization ioctl the 5.10 uapi defines
+(`linux/dma-buf.h`: `DMA_BUF_BASE 'b'`, `DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE,
+0, struct dma_buf_sync)` with `struct dma_buf_sync { __u64 flags; }`). The
+driver's `dma_buf_ioctl` handles it by calling
+`dma_buf_begin_cpu_access(dmabuf, DMA_FROM_DEVICE)` / `end_cpu_access`, which
+is the exporter's own cache-maintenance hook - the one ioctl that can ask the
+producer to make its writes visible to this reader.
+
+```
+sync-file census: SYNC_FILE r=-1 fd=-1 errno=25(Inappropriate ioctl for device)
+ | GET_SYNC_FILE r=-1 fd=-1 errno=25(Inappropriate ioctl for device)
+ | EXPORT_SYNC_FILE r=-1 fd=-1 errno=25(Inappropriate ioctl for device)
+ | DMA_BUF_IOCTL_SYNC r=0 errno=25(Inappropriate ioctl for device)
+```
+
+`DMA_BUF_IOCTL_SYNC r=0` - it succeeded. The errno in that line is stale from
+the previous failed call, not from this one.
+
+That is the first synchronization primitive this device has answered for the
+guest's buffer. The three sync-file ioctls are not in the 5.10 uapi at all
+(`EXPORT_SYNC_FILE` only arrives in 6.1), so their ENOTTY says nothing about
+the kernel's dma-buf support; the census had simply never asked the one
+ioctl that exists.
+
+### What this makes possible
+
+`DMA_BUF_IOCTL_SYNC` with `DMA_BUF_SYNC_READ` bracketing the host's read of
+the guest's buffer is a producer-side visibility request, not a host-side
+workaround: the exporter's `begin_cpu_access` is where the guest's GPU cache
+is cleaned before the host samples it. The next step is to bracket the
+compositor's sample/draw of a committed dma-buf with it and measure whether
+the three-state ring collapses.
+
+### Device state
+
+The phone's USB link drops every few minutes and `adb` then needs a daemon
+restart to re-enumerate it; it was off USB for ~10 minutes at one point (the
+init-retry signature). `locksettings set-disabled true` does not clear the
+"Password is required after phone restarts" gate, so the app's credential
+storage has to be unlocked by hand after each reboot, and until it is the
+app cannot start and `su` cannot read `files/`.
+
+### The sync hook answers on the guest's own buffer
+
+With the bracket in place (session `2026-11-06-12-steam`, the marker file
+`<session log>.dmabuf-sync` next to the log turning it on for that session):
+
+```
+15:10:39.768  framedbg  dma-buf sync: the exporter's cache hook answered
+```
+
+So the guest's dma-buf has an exporter that implements the cache hook, and
+the compositor can ask it to make its writes visible before sampling. The
+switch is a marker file rather than only an environment variable, because the
+environment variable reaches the guest, not the compositor's own process -
+the first attempt to switch it on with `droiddeckctl env set` changed
+nothing in the compositor.
+
+### What the ring looks like with the sync on
+
+250 probe rows from that session, three fds (362, 363, 365), each sampled 83
+times:
+
+| fd | n | distinct cpu fingerprints | distinct gpu fingerprints | cpu mean | gpu mean |
+|---|---|---|---|---|---|
+| 362 | 83 | 1 | 1 | 6..6 | 6..6 |
+| 363 | 83 | 1 | 1 | 6..6 | 6..6 |
+| 365 | 84 | 1 | 1 | 6..6 | 6..6 |
+
+Every buffer reads `fp=a95cd0a9`, mean 6, and the CPU and the GPU views
+agree on every sample - the same agreement the earlier runs showed. But the
+guest is *not* animating in that session (`vtc=Y frag=N` in the guest log:
+vertex jobs only, no fragment work), so a uniform near-black frame is what a
+static UI looks like, and this measurement does not separate "the sync
+fixed the ring" from "there was nothing moving to ping-pong".
+
+The compositor log for the same session also shows it rendering on the
+device's own GPU with the *bundled* bionic driver:
+
+```
+gpu  compositor renders on Mali-G77 MC9 with libvulkan_panvk.so
+```
+
+so the host side sees the same GPU generation - and the bundled bionic asset
+is a G57-fork build that predates 0009, so the host's driver still runs on
+the "Mali (unknown Valhall)" fallback. That is the second half of the fix
+and it is not done: the bundled asset has to be rebuilt from the same fork
+with the G77 row in it.
+
+### Still open
+
+- The A/B on the *animating* Big Picture UI: the ring with the sync on and
+  the ring with it off, in the same session, while Steam is actually
+  animating.
+- The guest-side ground truth: `NATIVEBO CSYNC` never prints even though
+  the widened filter is in the shipped driver (the 4608000 constant is in
+  the binary as `movk x24, #0x46, lsl #16`), so the guest's own view of the
+  swapchain is still not available.
+- The bundled bionic driver needs the G77 row as well.

@@ -856,6 +856,50 @@ struct droiddeck_dma_buf_sync { uint64_t flags; };
 #define DROIDDECK_DMA_BUF_SYNC_WRITE 2u
 #define DROIDDECK_DMA_BUF_SYNC_END (1u << 2)
 
+/* The guest renders the buffer on its own GPU, so the compositor can sample it before those
+ * writes have reached the memory it reads. DMA_BUF_IOCTL_SYNC with DMA_BUF_SYNC_READ is the
+ * exporter's own cache-maintenance hook (dma_buf_begin_cpu_access in the 5.10 dma-buf core):
+ * asking the producer to make its writes visible before this reader looks at them.
+ *
+ * DROIDDECK_WAYLAND_DMABUF_SYNC=1 in the container's environment turns it on; a marker file
+ * next to this session's log, `<log>.dmabuf-sync`, turns it on for one session without a
+ * rebuild, the same way the frame probe is switched on. The marker wins, so a session can be
+ * turned off again while it runs. It costs one ioctl per committed frame. */
+static int dmabuf_sync_enabled(void) {
+   static char marker[sizeof(g_log_path) + 24];
+   if (!marker[0]) {
+      if (!g_log_path[0]) return 0;
+      snprintf(marker, sizeof(marker), "%s.dmabuf-sync", g_log_path);
+   }
+   if (access(marker, F_OK) == 0) return 1;
+   const char *v = getenv("DROIDDECK_WAYLAND_DMABUF_SYNC");
+   return (v && !strcmp(v, "1")) ? 1 : 0;
+}
+
+/* Bracket the compositor's read of the guest's buffer with the exporter's cache maintenance:
+ * a START pair before the buffer is sampled or drawn and an END pair after. The kernel answers
+ * DMA_BUF_IOCTL_SYNC with ENOTTY on a dma-buf whose exporter has no such hook, which is why a
+ * failure here is logged once and then left alone. */
+static void dmabuf_sync_read(int fd, int end) {
+   if (!dmabuf_sync_enabled() || fd < 0) return;
+   struct droiddeck_dma_buf_sync sync = {
+      .flags = DROIDDECK_DMA_BUF_SYNC_READ | (end ? DROIDDECK_DMA_BUF_SYNC_END : 0)};
+   if (ioctl(fd, DROIDDECK_DMA_BUF_IOCTL_SYNC, &sync) != 0) {
+      static int logged;
+      if (!logged) {
+         logged = 1;
+         droiddeck_log("framedbg", "dma-buf sync: %s (%s)", strerror(errno),
+                       errno == ENOTTY ? "the exporter has no cache hook" : "failed");
+      }
+   } else {
+      static int logged;
+      if (!logged) {
+         logged = 1;
+         droiddeck_log("framedbg", "dma-buf sync: the exporter's cache hook answered");
+      }
+   }
+}
+
 /* 1 = the producer's fence was there and has been waited for, 0 = the producer left none,
  * -1 = it did not signal in time. */
 static int wait_producer_fence(int fd, int timeout_ms) {
@@ -1054,6 +1098,8 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
         /* The guest renders this buffer on its own GPU. Wait for its producer fence before the
          * buffer is sampled or drawn, or the compositor can use the previous content of the slot. */
         wait_producer_fence(b->fd[0], 100);
+        /* Ask the producer to make its writes visible before this reader samples them. */
+        dmabuf_sync_read(b->fd[0], 0);
         { static int g_census_done;
           if (!g_census_done && frame_probe_on()) {
             g_census_done = 1;
@@ -1086,6 +1132,8 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
         }
         if (frame_probe_on()) frame_probe(s, b, buffer);
         const int hold = blank_frame_hold(s, b, buffer);
+        /* The buffer has been sampled: close the producer's read bracket. */
+        dmabuf_sync_read(b->fd[0], 1);
         if (!hold && (s->dmabuf != buffer || s->dmabuf_buf != b)) {
             drop_dmabuf(s, 1);
             s->dmabuf = buffer;
