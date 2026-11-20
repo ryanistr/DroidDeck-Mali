@@ -1,0 +1,92 @@
+name: Monitor PanVK-rynx releases
+
+# Watches ryanistr/PanVK-rynx for a newer PanVK-rynx-<version>-p<n> component release.
+# When one appears, opens a PR that updates the tag/sha256 pin in tools/panvk/release.env.
+# It never builds or publishes a driver itself, and never bumps to a prerelease/draft.
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: ryanistr/PanVK-rynx
+      PIN_FILE: tools/panvk/release.env
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find newest published patch release upstream
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM_REPO}/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | grep -E '^PanVK-rynx-[0-9]+\.[0-9]+\.[0-9]+-p[0-9]+$' \
+            | sort -t- -k4,4V \
+            | tail -1 > /tmp/upstream-tag
+          TAG=$(cat /tmp/upstream-tag)
+          test -n "$TAG" || { echo "no published patch release found" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          gh release download "$TAG" -R "$UPSTREAM_REPO" \
+            -p '*.tzst.sha256' --dir /tmp/panvk-sha
+          SHA=$(awk 'NR==1 {print $1}' /tmp/panvk-sha/*.tzst.sha256)
+          case "$SHA" in
+            [0-9a-f]* | [A-Fa-f0-9]*) ;;
+            *) echo "bad sha256 for $TAG: $SHA" >&2; exit 1 ;;
+          esac
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with pinned release
+        id: pin
+        run: |
+          set -euo pipefail
+          CUR_TAG=$(sed -n 's/^PANVK_TAG=//p' "$PIN_FILE" | head -1)
+          CUR_SHA=$(sed -n 's/^PANVK_SHA256=//p' "$PIN_FILE" | head -1)
+          echo "current=$CUR_TAG $CUR_SHA"
+          if [ "$CUR_TAG" = "${{ steps.upstream.outputs.tag }}" ] && \
+             [ "$CUR_SHA" = "${{ steps.upstream.outputs.sha }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open pin-update PR
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.upstream.outputs.tag }}
+          NEW_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BRANCH="bot/panvk-pin-${NEW_TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          python3 - "$PIN_FILE" "$NEW_TAG" "$NEW_SHA" <<'PY'
+          import re, sys
+          path, tag, sha = sys.argv[1:4]
+          s = open(path).read()
+          s = re.sub(r'^PANVK_TAG=.*$', f'PANVK_TAG={tag}', s, flags=re.M)
+          s = re.sub(r'^PANVK_SHA256=.*$', f'PANVK_SHA256={sha}', s, flags=re.M)
+          open(path, 'w').write(s)
+          PY
+          git add "$PIN_FILE"
+          git commit -m "chore(panvk): pin $NEW_TAG"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "branch $BRANCH already exists on origin; leaving it untouched"
+            exit 0
+          fi
+          git push origin "$BRANCH"
+          gh pr create --base "${{ github.ref_name }}" --head "$BRANCH" \
+            --title "chore(panvk): pin $NEW_TAG" \
+            --body "Automated update from $UPSTREAM_REPO.\n\n- tag: \`$NEW_TAG\`\n- sha256: \`$NEW_SHA\`\n\nVerify the upstream CI run, then merge to re-run the DroidDeck build with this driver."
