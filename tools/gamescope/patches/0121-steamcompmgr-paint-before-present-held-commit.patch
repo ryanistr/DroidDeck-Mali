@@ -1,0 +1,39 @@
+From: DroidDeck
+Date: 2026-11-20
+Subject: steamcompmgr: paint before presenting a held rotation buffer
+
+A client commit that selects a rotation buffer must be painted before it is
+presented. When a held base commit arrives without any repaint flag, the normal
+path presents the slot without painting it and stale content reaches the
+display. This is the same "catch-up frame without repaint" bug fixed for KWin by
+Droidspaces-Mali's anland patch 0002 (119 commits without a render out of ~3000
+frames before, 2396 frames from 2396 renders after). Marking these commits as
+needing a paint makes present follow render rather than substituting an
+unpainted buffer.
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -10566,6 +10566,14 @@ steamcompmgr_main(int argc, char **argv)
+ 			else
+ 				eFlipType = FlipType::Normal;
+ 
++			// DroidDeck: a client commit that selects a rotation buffer must be painted before it
++			// is presented. When a held base commit arrives without any repaint flag, the normal
++			// path below presents the slot without painting it and stale content reaches the
++			// display (the same "catch-up frame without repaint" bug fixed in Droidspaces-Mali's
++			// anland patch 0002). Marking these commits as needing a paint makes present follow
++			// render rather than substituting an unpainted buffer.
++			const bool bHasHeldBaseCommit = pPaintFocus && pPaintFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr;
++
+ 			bool bShouldPaint = false;
+ 
+ 			//if ( GetBackend()->IsVisible() )
+@@ -10575,7 +10583,7 @@ steamcompmgr_main(int argc, char **argv)
+ 				{
+ 					case FlipType::Normal:
+ 					{
+-						bShouldPaint = vblank && ( hasRepaint || hasRepaintNonBasePlane || bForceSyncFlip );
++						bShouldPaint = vblank && ( hasRepaint || hasRepaintNonBasePlane || bForceSyncFlip || bHasHeldBaseCommit );
+ 						break;
+ 					}
+ 
